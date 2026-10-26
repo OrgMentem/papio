@@ -283,6 +283,12 @@ var allowed = map[string]map[string]bool{
 // transition is not allowed).
 var ErrConflict = errors.New("job state conflict")
 
+// ErrLeaseLost marks a processor context canceled because its lease moved on
+// while it was still working: another worker holds the job now. Unlike an
+// ordinary cancellation it tells WithoutCancel cleanup paths to stand down
+// rather than settle the attempt against the winner's job.
+var ErrLeaseLost = errors.New("job lease lost")
+
 // ErrHumanActionNotFound reports a human action id that names no row. It is a
 // missing record, not a job-state conflict.
 var ErrHumanActionNotFound = errors.New("no such review action")
@@ -469,6 +475,15 @@ type Store struct {
 
 	oldestMu      sync.Mutex
 	oldestCursors map[string]oldestListCursor
+
+	// held tracks the job IDs this process has leased and not yet
+	// released, by lease owner. A wall-clock jump (laptop sleep, NTP
+	// step) can make a live holder's lease read as expired while its
+	// heartbeat ticker is still parked: without this set a second local
+	// worker would steal the job and run it twice. ClaimNext and Claim
+	// never hand a held job to another owner regardless of lease text.
+	heldMu sync.Mutex
+	held   map[string]string
 }
 
 type oldestListCursor struct {
@@ -668,9 +683,20 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		jobID, requestID, string(polJSON), nullable(who.Consumer), now, now); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting job: %w", err)
 	}
-	createdDetail := fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())
+	// Event detail is real JSON, built with encoding/json like RecordEvent:
+	// Go %q quoting emits \x escapes for non-printable bytes, which JSON
+	// rejects, so a hand-built detail can store invalid JSON.
+	createdJSON, err := json.Marshal(map[string]any{"request_id": requestID, "work": w.Describe()})
+	if err != nil {
+		return CreateResult{}, fmt.Errorf("encoding job.created detail: %w", err)
+	}
+	createdDetail := string(createdJSON)
 	if recheckOf != "" {
-		createdDetail = fmt.Sprintf(`{"request_id":%q,"work":%q,"recheck_of":%q}`, requestID, w.Describe(), recheckOf)
+		createdJSON, err = json.Marshal(map[string]any{"request_id": requestID, "work": w.Describe(), "recheck_of": recheckOf})
+		if err != nil {
+			return CreateResult{}, fmt.Errorf("encoding job.created detail: %w", err)
+		}
+		createdDetail = string(createdJSON)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.created', ?)`,
@@ -678,9 +704,13 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		return CreateResult{}, err
 	}
 	if recheckOf != "" {
+		recheckJSON, err := json.Marshal(map[string]any{"new_job_id": jobID, "window_days": recheckWindowDays})
+		if err != nil {
+			return CreateResult{}, fmt.Errorf("encoding unavailable.recheck detail: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'unavailable.recheck', ?)`,
-			recheckOf, now, fmt.Sprintf(`{"new_job_id":%q,"window_days":%d}`, jobID, recheckWindowDays)); err != nil {
+			recheckOf, now, string(recheckJSON)); err != nil {
 			return CreateResult{}, err
 		}
 	}
@@ -709,9 +739,16 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			// The durable trace that this verdict was withdrawn, and by what.
 			// A terminal papio record is not necessarily final, and a consumer
 			// that cached the old outcome has no other way to learn that.
+			// Event detail is real JSON, built with encoding/json like
+			// RecordEvent: Go %q quoting emits \x escapes for non-printable
+			// bytes, which JSON rejects.
+			supersededJSON, err := json.Marshal(map[string]any{"superseded_by": jobID, "work": w.Describe()})
+			if err != nil {
+				return CreateResult{}, fmt.Errorf("encoding job.superseded detail: %w", err)
+			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.superseded', ?)`,
-				oldID, now, fmt.Sprintf(`{"superseded_by":%q,"work":%q}`, jobID, w.Describe())); err != nil {
+				oldID, now, string(supersededJSON)); err != nil {
 				return CreateResult{}, err
 			}
 		}
@@ -773,9 +810,13 @@ func (js *Store) RecordDuplicateWork(ctx context.Context, jobID string, w work.W
 	if err != nil || other == "" {
 		return "", err
 	}
+	duplicateJSON, err := json.Marshal(map[string]any{"duplicate_of": other, "work": w.Describe()})
+	if err != nil {
+		return "", fmt.Errorf("encoding job.duplicate_work_detected detail: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.duplicate_work_detected', ?)`,
-		jobID, store.Now(), fmt.Sprintf(`{"duplicate_of":%q,"work":%q}`, other, w.Describe())); err != nil {
+		jobID, store.Now(), string(duplicateJSON)); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1119,6 +1160,15 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Whoever holds the durable lease now is the only hold this transition
+	// may release: a claimant that registers between commit and unhold must
+	// keep its entry.
+	var txOwner sql.NullString
+	if releaseLease {
+		if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM jobs WHERE id = ?`, jobID).Scan(&txOwner); err != nil {
+			return err
+		}
+	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET state = ?, updated_at = ?,
 		        retry_at = ?,
@@ -1167,7 +1217,13 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if releaseLease && txOwner.Valid {
+		js.unholdJobIfHolder(jobID, txOwner.String)
+	}
+	return nil
 }
 
 // closeTerminalHumanActions is the one transaction-local closure used by all
@@ -1331,8 +1387,14 @@ func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionID
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL,
+	// Whoever holds the durable lease now is the only hold this repair may
+	// release (see transition).
+	var txOwner sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM jobs WHERE id = ?`, jobID).Scan(&txOwner); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL,
 		        lease_owner = NULL, lease_expires_at = NULL
 		 WHERE id = ? AND state = ?
 		   AND (lease_owner IS NULL OR lease_expires_at < ?)`,
@@ -1396,7 +1458,13 @@ func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionID
 		jobID, now, string(detailJSON)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if txOwner.Valid {
+		js.unholdJobIfHolder(jobID, txOwner.String)
+	}
+	return nil
 }
 
 // ParkWithHumanAction is RepairAwaitingHuman's inverse: it opens (or
@@ -1486,6 +1554,13 @@ func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to strin
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Whoever holds the durable lease now is the only hold this repair may
+	// release (see transition).
+	var txOwner sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM jobs WHERE id = ?`, jobID).Scan(&txOwner); err != nil {
+		return err
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL,
@@ -1588,7 +1663,13 @@ func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to strin
 		jobID, now, string(detailJSON)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if txOwner.Valid {
+		js.unholdJobIfHolder(jobID, txOwner.String)
+	}
+	return nil
 }
 
 type transitionCfg struct {
@@ -1623,27 +1704,59 @@ func WithCandidate(id int64) TransitionOpt {
 
 // ClaimNext leases the oldest runnable job: queued always; retry_wait when
 // due. Mid-flight stages are claimable when unowned (the durable result of
-// RecoverStale) or when their prior lease expired.
+// RecoverStale) or when their prior lease expired. A job this process holds
+// for a live worker is never re-handed to another owner: after a wall-clock
+// jump its durable lease text can read as expired while the holder is still
+// alive. The hold check consults the durable owner too, so a hold left
+// behind by a completed attempt (its transition cleared the lease) never
+// blocks the job's next claim.
 func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duration) (*Row, error) {
-	now := store.Now()
-	expires := store.FormatTime(time.Now().Add(lease))
 	db := js.S.DB()
+	// One local claimant at a time from select through register: two workers
+	// must not act on one expired-looking row, and the timestamps below are
+	// computed after any stall, not before it.
+	js.heldMu.Lock()
+	defer js.heldMu.Unlock()
+	now := store.Now()
 
-	var id string
-	err := db.QueryRowContext(ctx, `
-		SELECT id FROM jobs
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, lease_owner FROM jobs
 		WHERE (
 		        (state = 'queued' AND (lease_owner IS NULL OR lease_expires_at < ?))
 		     OR (state = 'retry_wait' AND retry_at <= ? AND (lease_owner IS NULL OR lease_expires_at < ?))
 		     OR (state IN ('resolving','fetching','validating') AND (lease_owner IS NULL OR lease_expires_at < ?))
 		      )
-		ORDER BY created_at ASC LIMIT 1`, now, now, now, now).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		ORDER BY created_at ASC LIMIT 32`, now, now, now, now)
 	if err != nil {
 		return nil, err
 	}
+	var id string
+	for rows.Next() {
+		var candidate string
+		var leaseOwner sql.NullString
+		if err := rows.Scan(&candidate, &leaseOwner); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if holder, ok := js.held[candidate]; ok && holder != owner && leaseOwner.Valid && leaseOwner.String == holder {
+			continue // live local holder; the durable text may lie after a wall-clock jump
+		}
+		id = candidate
+		break
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, nil
+	}
+	// Recompute after any stall so the decisive update judges expiry as of
+	// now and the new lease is born valid.
+	now = store.Now()
+	expires := store.FormatTime(time.Now().Add(lease))
 	res, err := db.ExecContext(ctx,
 		`UPDATE jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ? AND (lease_owner IS NULL OR lease_expires_at < ?)`,
 		owner, expires, id, now)
@@ -1653,16 +1766,68 @@ func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duratio
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, nil // lost the race; caller loops
 	}
-	return js.claimedRow(ctx, id, owner)
+	row, err := js.claimedRow(ctx, id, owner)
+	if err != nil {
+		return nil, err
+	}
+	if js.held == nil {
+		js.held = make(map[string]string)
+	}
+	js.held[id] = owner
+	return row, nil
+}
+
+// unholdLease forgets a local hold when its owner releases or loses it. Only
+// the recorded owner clears the entry, so a steal by another worker (local or
+// remote) never resurrects the loser as a holder.
+func (js *Store) unholdLease(jobID, owner string) {
+	js.heldMu.Lock()
+	defer js.heldMu.Unlock()
+	if cur, ok := js.held[jobID]; ok && cur == owner {
+		delete(js.held, jobID)
+	}
+}
+
+// unholdJobIfHolder forgets the local hold on jobID, but only if holder is
+// still the recorded owner. A transition that cleared the durable lease
+// reads the owner inside its own transaction and passes it here after
+// commit: a claimant that registered between commit and this call keeps its
+// entry, since the recorded owner no longer matches.
+func (js *Store) unholdJobIfHolder(jobID, holder string) {
+	js.heldMu.Lock()
+	defer js.heldMu.Unlock()
+	if cur, ok := js.held[jobID]; ok && cur == holder {
+		delete(js.held, jobID)
+	}
 }
 
 // Claim leases one specific runnable job using the same durable lease
 // predicates as ClaimNext. Maintenance callers use this when a secondary
 // durable table points at a job and must not accidentally claim another job.
+// A job this process holds for a live worker is never re-handed to another
+// owner; a hold left behind by a completed attempt (its transition cleared
+// the lease) never blocks the next claim.
 func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Duration) (*Row, error) {
+	db := js.S.DB()
+	// One local claimant at a time from check through register, as in
+	// ClaimNext.
+	js.heldMu.Lock()
+	defer js.heldMu.Unlock()
+	if holder, ok := js.held[jobID]; ok && holder != owner {
+		var dbOwner sql.NullString
+		serr := db.QueryRowContext(ctx, `SELECT lease_owner FROM jobs WHERE id = ?`, jobID).Scan(&dbOwner)
+		if serr != nil && !errors.Is(serr, sql.ErrNoRows) {
+			return nil, serr
+		}
+		if serr == nil && dbOwner.Valid && dbOwner.String == holder {
+			return nil, nil // held by a live local worker; never steal it
+		}
+	}
+	// Recompute after any stall so the decisive update judges expiry as of
+	// now and the new lease is born valid.
 	now := store.Now()
 	expires := store.FormatTime(time.Now().Add(lease))
-	res, err := js.S.DB().ExecContext(ctx, `
+	res, err := db.ExecContext(ctx, `
 		UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
 		WHERE id = ? AND (
 			(state = 'queued' AND (lease_owner IS NULL OR lease_expires_at < ?))
@@ -1675,7 +1840,15 @@ func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Dura
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, nil
 	}
-	return js.claimedRow(ctx, jobID, owner)
+	row, err := js.claimedRow(ctx, jobID, owner)
+	if err != nil {
+		return nil, err
+	}
+	if js.held == nil {
+		js.held = make(map[string]string)
+	}
+	js.held[jobID] = owner
+	return row, nil
 }
 
 // claimedRow reads a job this owner has just leased. A failed read releases
@@ -1712,13 +1885,20 @@ func (js *Store) Heartbeat(ctx context.Context, jobID, owner string, lease time.
 		return err
 	}
 	if releasesLease(state) {
+		js.unholdLease(jobID, owner)
 		return nil
 	}
+	// The lease moved on (a wall-clock jump let another worker steal it, or
+	// recovery rewound it). This process no longer holds the job, so forget
+	// the local hold; the scheduler abandons the attempt quietly instead of
+	// treating a lost lease as a daemon-fatal error.
+	js.unholdLease(jobID, owner)
 	return fmt.Errorf("%w: lease on %s not held by %s", ErrConflict, jobID, owner)
 }
 
 // Release drops a lease without changing state (job becomes claimable).
 func (js *Store) Release(ctx context.Context, jobID, owner string) error {
+	js.unholdLease(jobID, owner)
 	_, err := js.S.DB().ExecContext(ctx,
 		`UPDATE jobs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?`, jobID, owner)
 	return err
@@ -1859,6 +2039,12 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 // candidate set, which re-ranks deterministically. Content addressing makes
 // re-fetches duplicate-free. Returns the rewound job IDs.
 func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
+	// Recovery runs before any worker starts, so no local holder is alive:
+	// drop local holds left by a previous run in this process (a scheduler
+	// that stops mid-attempt skips Release on its way out).
+	js.heldMu.Lock()
+	js.held = nil
+	js.heldMu.Unlock()
 	now := store.Now()
 	rows, err := js.S.DB().QueryContext(ctx,
 		`SELECT id, state FROM jobs WHERE state IN ('resolving','fetching','validating') AND (lease_expires_at IS NULL OR lease_expires_at < ?)`, now)
@@ -3259,6 +3445,13 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	}
 
 	now := store.Now()
+
+	// Whoever holds the durable lease now is the only hold this resolution
+	// may release (see transition).
+	var txOwner sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM jobs WHERE id = ?`, action.JobID).Scan(&txOwner); err != nil {
+		return ReviewResolution{}, normalizeReviewBusy(err)
+	}
 	query := `UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`
 	args := []any{now, action.ID}
 	if !legacy {
@@ -3368,6 +3561,9 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	}
 	if err := tx.Commit(); err != nil {
 		return ReviewResolution{}, normalizeReviewBusy(err)
+	}
+	if txOwner.Valid {
+		js.unholdJobIfHolder(action.JobID, txOwner.String)
 	}
 	return ReviewResolution{Outcome: ReviewApplied, JobID: action.JobID, State: to}, nil
 }
@@ -4120,7 +4316,10 @@ func (js *Store) RecordEvent(ctx context.Context, jobID, kind string, detail map
 }
 
 // RecheckOrigin returns the unavailable job that caused this replacement.
-// An empty result identifies an ordinary submission.
+// An empty result identifies an ordinary submission. A job.created detail
+// that does not parse (rows written before details were real JSON) also
+// reports empty: failing here drops the terminal outcome notification for a
+// job that did complete, while the empty result still delivers one.
 func (js *Store) RecheckOrigin(ctx context.Context, jobID string) (string, error) {
 	var detailJSON string
 	err := js.S.DB().QueryRowContext(ctx,
@@ -4136,7 +4335,7 @@ func (js *Store) RecheckOrigin(ctx context.Context, jobID string) (string, error
 		RecheckOf string `json:"recheck_of"`
 	}
 	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
-		return "", err
+		return "", nil
 	}
 	return detail.RecheckOf, nil
 }

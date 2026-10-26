@@ -8,6 +8,7 @@ package work
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNormalizeDOI(t *testing.T) {
@@ -152,6 +153,19 @@ func TestDescribe(t *testing.T) {
 				t.Fatalf("Describe() = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestDescribeTruncatesOnRuneBoundary(t *testing.T) {
+	// The two-byte rune starts at byte 59, so a 60-byte cut would split it.
+	title := strings.Repeat("a", 59) + "é" + strings.Repeat("b", 10)
+	got := Work{Title: title}.Describe()
+	if !utf8.ValidString(got) {
+		t.Fatalf("Describe() = %q, want valid UTF-8", got)
+	}
+	want := "title:" + strings.Repeat("a", 59) + "…"
+	if got != want {
+		t.Fatalf("Describe() = %q, want %q", got, want)
 	}
 }
 

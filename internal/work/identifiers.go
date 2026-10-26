@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // Work is the normalized identity a resolver receives.
@@ -69,7 +70,14 @@ func (w Work) Describe() string {
 		return "isbn:" + w.ISBN
 	case w.Title != "":
 		if len(w.Title) > 60 {
-			return "title:" + w.Title[:60] + "…"
+			// Cut on a rune boundary: a byte cut can split a multi-byte
+			// rune, and a split rune in an event detail breaks the JSON
+			// encoding downstream.
+			cut := 60
+			for cut > 0 && !utf8.RuneStart(w.Title[cut]) {
+				cut--
+			}
+			return "title:" + w.Title[:cut] + "…"
 		}
 		return "title:" + w.Title
 	default:

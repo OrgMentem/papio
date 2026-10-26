@@ -522,8 +522,8 @@ func (s *Scheduler) worker(ctx context.Context, owner string) error {
 }
 
 func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string) error {
-	jobCtx, cancelJob := context.WithCancel(ctx)
-	defer cancelJob()
+	jobCtx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(nil)
 	heartbeatErr := make(chan error, 1)
 	stopped := make(chan struct{})
 	go func() {
@@ -542,11 +542,18 @@ func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string
 					if jobCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 						return
 					}
+					if errors.Is(err, job.ErrConflict) {
+						// The lease moved on: mark the cause so WithoutCancel
+						// cleanup paths in the processor stand down instead
+						// of settling against the winner's job.
+						cancelCause(job.ErrLeaseLost)
+					} else {
+						cancelCause(nil)
+					}
 					select {
 					case heartbeatErr <- err:
 					default:
 					}
-					cancelJob()
 					return
 				}
 			}
@@ -554,11 +561,18 @@ func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string
 	}()
 
 	processErr := s.Processor.Process(jobCtx, row)
-	cancelJob()
+	cancelCause(nil)
 	<-stopped
 	select {
 	case err := <-heartbeatErr:
-		if processErr == nil || (errors.Is(processErr, context.Canceled) && ctx.Err() == nil) {
+		// A lost lease is not a daemon failure: after a wall-clock jump the
+		// lease text can expire under a live holder and another local
+		// worker takes the job. The loser abandons its attempt quietly so
+		// the winner runs it once; anything else (a dead store) still
+		// stops the daemon.
+		if errors.Is(err, job.ErrConflict) {
+			processErr = nil
+		} else if processErr == nil || (errors.Is(processErr, context.Canceled) && ctx.Err() == nil) {
 			processErr = fmt.Errorf("heartbeat job %s: %w", row.ID, err)
 		}
 	default:
