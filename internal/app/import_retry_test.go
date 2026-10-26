@@ -95,6 +95,41 @@ func pastImportBackoff(svc *Service) {
 	svc.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
 }
 
+// An archive committed after autoImportReady claims the job but before it
+// re-reads the disposition must still stop the import: the hook lands the
+// archive deterministically inside the claim window, so the test cannot pass
+// by scheduling luck. On the old code the disposition was read before the
+// claim, so the archive landed too late and one unwanted import ran.
+func TestAutoImportReadySkipsJobArchivedInsideClaimWindow(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	svc.AutoImporter = &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("transient"))}
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_import_archive_race")
+	pastImportBackoff(svc)
+	importer := &fakeAutoImporter{status: "applied", parentKey: "PARENT01", attachmentKey: "ATTACH01"}
+	svc.AutoImporter = importer
+	archived := make(chan error, 1)
+	svc.afterClaimImport = func(jobID string) {
+		_, err := jobs.Archive(ctx, jobID, true)
+		archived <- err
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.autoImportReady(ctx, row); got != importNotAttempted {
+		t.Fatalf("autoImportReady on archived job = %v, want importNotAttempted", got)
+	}
+	if err := <-archived; err != nil {
+		t.Fatalf("archiving inside the claim window: %v", err)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("importer calls = %d, want 0: archived job must not import", importer.calls)
+	}
+}
+
 func TestImportRetrierRunDueRetriesOnlyDueJobs(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)

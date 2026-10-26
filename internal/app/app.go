@@ -191,6 +191,11 @@ type Service struct {
 	// a time: the inline import after `ready` does not take importPassMu.
 	importMu       sync.Mutex
 	importInFlight map[string]struct{}
+	// afterClaimImport, when non-nil, runs after autoImportReady claims the
+	// job's import and before it re-reads the disposition. Tests use it to
+	// land an archive deterministically inside the claim window; production
+	// leaves it nil.
+	afterClaimImport func(jobID string)
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -5314,10 +5319,6 @@ const (
 // at a time and skips a job whose import another call settled or just tried
 // since its caller looked. A skipped job records nothing and spends nothing.
 func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutcome {
-	disposition, dispositionErr := s.Jobs.Disposition(ctx, row.ID)
-	if dispositionErr != nil || disposition.Disposition == job.DispositionArchived {
-		return importNotAttempted
-	}
 	if s.Config.Zotio.AutoImportPaused || !row.Policy.AutoImport {
 		// A pause leaves no import outcome: the ready job remains eligible
 		// for the retry sweep when automatic imports resume.
@@ -5335,6 +5336,14 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 		return importNotAttempted // the import that holds the job records its outcome
 	}
 	defer s.releaseImport(row.ID)
+	if hook := s.afterClaimImport; hook != nil {
+		hook(row.ID)
+	}
+	// The disposition read moves inside the claim: an archive committed
+	// between an earlier read and the claim would otherwise still import.
+	if disposition, dispositionErr := s.Jobs.Disposition(ctx, row.ID); dispositionErr != nil || disposition.Disposition == job.DispositionArchived {
+		return importNotAttempted
+	}
 	if events, err := s.Jobs.Events(eventCtx, row.ID); err == nil && (!importNeedsRetry(events) || !importRetryDue(events, s.Now())) {
 		return importNotAttempted
 	}

@@ -744,9 +744,17 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	// papers whose item carried papio's own artifact — the attachment filename
 	// byte-equal to the job's artifact SHA-256 — were re-attached and refused
 	// on every pass, indefinitely, because ready is terminal.
+	// A transient `items get` failure on an item that already holds the PDF
+	// must not plan a second `attachments add`: itemsConfirmedHoldingPDF
+	// reports confirmed holders only, so an unknown item defers for the
+	// retrier instead of mutating. A deleted or merged parent reports
+	// definite not-found and the job plans normally.
 	if key := strings.TrimSpace(row.ZotioItemKey); key != "" {
 		holding, known := s.itemsConfirmedHoldingPDF(ctx, []string{key})
-		if !known || !holding[key] {
+		if !known {
+			return "", "", false, fmt.Errorf("zotio could not confirm item %s still holds its PDF", key)
+		}
+		if !holding[key] {
 			return "", "", false, nil
 		}
 		result := &ApplyResult{JobID: jobID, Status: "duplicate", ParentKey: key}
@@ -761,7 +769,7 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	}
 	lookup, err := s.LookupWorks(ctx, LookupWorksRequest{Works: []LookupWork{lookupWork}})
 	if err != nil {
-		return "", "", false, nil
+		return "", "", false, fmt.Errorf("zotio could not check library ownership for job %s: %w", jobID, err)
 	}
 	if len(lookup.Works) != 1 || lookup.Works[0].Status != OwnershipOwnedWithPDF {
 		return "", "", false, nil

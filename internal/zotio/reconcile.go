@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"papio/internal/bundle"
 	"papio/internal/job"
 )
 
@@ -36,7 +38,11 @@ import (
 //     outlasts the desktop-to-Web-API sync lag (webAPINotSyncedHint), so a save
 //     that landed has reached the mirror by then; a connector plan also needs
 //     Zotero desktop to answer (desktopEvidenceGap), since a mirror sync alone
-//     does not show what the desktop saved;
+//     does not show what the desktop saved. When the installed zotio can
+//     never report desktop presence, no answer can ever arrive: the row
+//     holds for ambiguousPresenceHoldMax and then settles into a countable
+//     human-action error instead of reopening, because a desktop save may
+//     have succeeded locally and reopening it could duplicate the item;
 //   - anything else, including a lookup that failed: the row stays ambiguous
 //     and Apply reports zotio_apply_unconfirmed.
 
@@ -179,8 +185,11 @@ func (s *Service) settleAmbiguousApply(ctx context.Context, plan *Plan, key stri
 		Error:     "an earlier attempt left no trace in the refreshed Zotero library",
 	}
 	if planUsesConnector(plan) {
-		if reason := s.desktopEvidenceGap(ctx); reason != "" {
-			return nil, unconfirmedApplyError(plan.ID, recorded, reason)
+		if gap, unsupported := s.desktopEvidenceGap(ctx); gap != "" {
+			if unsupported && ambiguousPresenceHoldElapsed(s.now(), recorded) {
+				return nil, unsupportedPresenceError(ctx, s.Bundle, plan)
+			}
+			return nil, unconfirmedApplyError(plan.ID, recorded, gap)
 		}
 	}
 	if err := s.replaceAmbiguousApply(ledgerCtx, key, reopened); err != nil {
@@ -207,26 +216,86 @@ func planUsesConnector(plan *Plan) bool {
 	return false
 }
 
-// desktopEvidenceGap returns why an empty mirror cannot yet prove that a
-// connector save never landed, or "" when it can. A successful mirror sync
-// proves nothing about the desktop: the desktop may be closed or may not have
-// synced the item it saved. The mirror reads the desktop local API only
-// while the desktop answers, so a desktop that answers now is the evidence;
-// without it the apply stays ambiguous and a retry cannot duplicate the item.
-func (s *Service) desktopEvidenceGap(ctx context.Context) string {
+// ambiguousPresenceHoldMax bounds how long an ambiguous connector apply waits
+// on a zotio that can never report desktop presence. Past it, reconciliation
+// returns a countable human-action error instead of another unconfirmed
+// outcome, so the import budget ends the loop instead of retrying every five
+// minutes forever. A day leaves room to upgrade zotio mid-hold, which
+// restores the evidence and reconciles normally.
+const ambiguousPresenceHoldMax = 24 * time.Hour
+
+// desktopEvidenceGap reports why an empty mirror cannot yet prove that a
+// connector save never landed. The second result is false when the installed
+// zotio can still supply that evidence by answering presence later; it is
+// true for an older zotio without the presence commands, whose gap can never
+// close by waiting. A successful mirror sync proves nothing about the
+// desktop: the desktop may be closed or may not have synced the item it
+// saved. The mirror reads the desktop local API only while the desktop
+// answers, so a desktop that answers now is the evidence; without it the
+// apply stays ambiguous and a retry cannot duplicate the item.
+func (s *Service) desktopEvidenceGap(ctx context.Context) (string, bool) {
 	reader, ok := s.CLI.(desktopStatusReader)
 	if !ok {
-		return "Zotero desktop cannot be asked whether it holds the earlier attempt"
+		return "Zotero desktop cannot be asked whether it holds the earlier attempt", true
 	}
 	status, err := reader.DesktopStatus(ctx)
 	if err != nil {
-		return "Zotero desktop cannot be asked whether it holds the earlier attempt"
+		if errors.Is(err, ErrDesktopPresenceUnsupported) {
+			return "Zotero desktop cannot be asked whether it holds the earlier attempt", true
+		}
+		return "Zotero desktop cannot be asked whether it holds the earlier attempt", false
 	}
 	if !status.Ready() {
-		return "Zotero desktop is not answering, so the empty library does not show the earlier attempt"
+		return "Zotero desktop is not answering, so the empty library does not show the earlier attempt", false
 	}
-	return ""
+	return "", false
 }
+
+// ambiguousPresenceHoldElapsed reports whether an ambiguous record predates
+// the presence hold: past it, an uncloseable evidence gap stops buying time.
+// An unreadable timestamp never counts as elapsed, so a corrupt record keeps
+// holding instead of settling either way.
+func ambiguousPresenceHoldElapsed(now time.Time, recorded *ApplyResult) bool {
+	if recorded == nil {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, recorded.AppliedAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(at) > ambiguousPresenceHoldMax
+}
+
+// unsupportedPresenceError settles an ambiguous connector apply whose
+// evidence gap can never close: the installed zotio cannot report desktop
+// presence, the mirror stayed empty past the hold, and reopening the plan
+// could duplicate an item the desktop saved but never synced. Unlike the
+// unconfirmed error it spends the import budget, so repeated outcomes end
+// the retry loop and leave the job with an explicit operator instruction
+// instead of a fresh unconfirmed error every five minutes. The earlier
+// attempt's recorded error is left out on purpose: its words ("timed out",
+// "canceled") would steer ClassifyError to a class that names the old
+// interruption instead of the action the operator must take now.
+func unsupportedPresenceError(ctx context.Context, bundle *bundle.Exporter, plan *Plan) error {
+	title := ""
+	if bundle != nil && bundle.Jobs != nil {
+		if row, err := bundle.Jobs.Get(ctx, plan.JobID); err == nil && row != nil {
+			title = strings.TrimSpace(row.Work.Title)
+		}
+	}
+	if title == "" {
+		title = plan.JobID
+	}
+	return &ClassifiedError{
+		cause: fmt.Errorf("papio cannot verify the earlier Zotero import of %q: the installed zotio cannot report whether Zotero desktop holds it and it never appeared in the library; check Zotero for the paper and upgrade zotio to restore automatic reconciliation", title),
+		info:  safeErrorInfo(ErrorClassUnknown, unverifiableImportHint, 0),
+	}
+}
+
+// unverifiableImportHint is the stored instruction for an import papio can
+// never verify. Stored hints are cut at maxErrorHintBytes, so the action leads
+// and the whole sentence fits; the long cause keeps the paper's title.
+const unverifiableImportHint = "Import unverifiable: check Zotero for this paper, then upgrade zotio"
 
 // supersedeCommittedCreate records that an interrupted create saved the item
 // but not its PDF, then retires the create plan. The committed record comes
