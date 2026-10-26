@@ -40,6 +40,16 @@ func NewSecureHTTPClientWithPOST(policy Policy, resolver Resolver, transport htt
 	return newSecureHTTPClient(policy, resolver, transport, true, true)
 }
 
+// WithPOST returns a separate client that permits GET and POST while retaining
+// this client's transport, DNS/IP checks, redirect policy, and response bounds.
+// It does not enable POST on the original metadata client.
+func (c *SecureHTTPClient) WithPOST() *SecureHTTPClient {
+	if c == nil {
+		return nil
+	}
+	return &SecureHTTPClient{downloader: c.downloader, allowPost: true}
+}
+
 func newSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper, allowPost bool, followRedirects bool) (*SecureHTTPClient, error) {
 	d, err := newDownloader(policy, resolver, transport, followRedirects)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"papio/internal/fetch"
 	"papio/internal/resolver"
 )
 
@@ -162,6 +163,13 @@ func (c *ClientCredentials) exchange(ctx context.Context) (string, time.Duration
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		// Secure-client policy errors are permanent and already redacted.
+		// Invalid responses, including oversized error pages, remain temporary.
+		var fetchErr *fetch.Error
+		if errors.As(err, &fetchErr) && (fetchErr.Class == fetch.ClassBlocked ||
+			(fetchErr.Class == fetch.ClassInvalid && (fetchErr.FailureKind() == fetch.FetchKindLocal || fetchErr.Msg == "redirects are not followed for non-GET requests"))) {
+			return "", 0, fmt.Errorf("openaire: token request refused: %w", fetchErr)
+		}
 		return "", 0, &resolver.TemporaryError{Err: errors.New("openaire: token request failed")}
 	}
 	if resp == nil {
