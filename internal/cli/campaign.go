@@ -531,6 +531,13 @@ func campaignReport(ctx context.Context, opt *options, cfg config.Config, manife
 		}
 		for i, item := range stored.Works {
 			outcome := campaignOutcome{Outcome: item.Status, JobID: item.JobID, Reason: item.Error}
+			if item.JobID == "" && chunk.State == "inflight" && item.Status == "submitted" {
+				// The batch manifest is an intent record: every work is pre-marked
+				// submitted before any RPC. A job-less row in an inflight chunk
+				// is an unsubmitted row, matching batch report's failed/missing_job.
+				outcome.Outcome = "failed"
+				outcome.Reason = "missing_job"
+			}
 			if item.JobID != "" {
 				var detail api.JobDetail
 				if err := opt.call(ctx, "jobs.get", map[string]any{"job_id": item.JobID}, &detail); err != nil {

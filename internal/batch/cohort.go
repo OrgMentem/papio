@@ -300,6 +300,18 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 		if err != nil {
 			return ChunkResult{}, err
 		}
+		if req.FinalChunk && out.CohortTotal == nil {
+			// Older partial replays persisted final results without a total.
+			// Recover the wire-required total from durable members, never submit.
+			var total int
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM acquisition_batch_members WHERE batch_id=?`, batchID).Scan(&total); err != nil {
+				return ChunkResult{}, err
+			}
+			if total != expected || total != out.PersistedMembers {
+				return ChunkResult{}, errors.New("stored final cohort membership is incomplete")
+			}
+			out.CohortTotal = &total
+		}
 		return out, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -330,6 +342,15 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ChunkResult{}, err
 	}
+	// Persist the batch identity before submission. Until membership commits,
+	// partial prevents a crash from leaving a falsely complete cohort.
+	// A successful membership commit promotes this row, including on replay.
+	if expected == 0 {
+		createdRow := store.FormatTime(now)
+		if _, err := db.ExecContext(ctx, `INSERT INTO acquisition_batches(id,cohort_id,source_kind,source_label,source_detector,source_scan_id,expected_total,created_at,updated_at,membership_state) VALUES(?,?,?,?,?,?,?,?,?,?)`, batchID, req.CohortID, req.Source.Kind, req.Source.Label, nullable(req.Source.Detector), nullable(req.Source.ScanID), req.CohortTotal, createdRow, createdRow, "partial"); err != nil {
+			return ChunkResult{}, fmt.Errorf("persist cohort batch: %w", err)
+		}
+	}
 	outcomes, err := submit(ctx, append([]string(nil), req.CanonicalKeys...))
 	if err != nil {
 		return ChunkResult{}, err
@@ -339,14 +360,9 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 		return ChunkResult{}, err
 	}
 	res := ChunkResult{BatchID: batchID, Membership: "open", PersistedMembers: next*chunkSize + len(req.CanonicalKeys), Submitted: counts["submitted"], Joined: counts["joined"], AlreadyOwned: counts["already_owned"], Invalid: counts["invalid"]}
-	if membership == "partial" {
-		// A failed membership write leaves the domain submission durable but no
-		// trustworthy denominator. The page-bulk submitter is idempotent on
-		// canonical work identity, so replay may legitimately call submit again
-		// and receive joined/already_owned instead of submitted.
-		res.Membership = "partial"
-	}
-	if membership != "partial" && req.FinalChunk {
+	// All earlier chunks are durable and these outcomes cover the next chunk.
+	// Promote membership only in the transaction that persists these members.
+	if req.FinalChunk {
 		res.Membership = "complete"
 		n := req.CohortTotal
 		res.CohortTotal = &n
@@ -361,11 +377,7 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 		return ChunkResult{}, err
 	}
 	created := store.FormatTime(now)
-	if expected == 0 {
-		_, err = tx.ExecContext(ctx, `INSERT INTO acquisition_batches(id,cohort_id,source_kind,source_label,source_detector,source_scan_id,expected_total,created_at,updated_at,membership_state) VALUES(?,?,?,?,?,?,?,?,?,?)`, batchID, req.CohortID, req.Source.Kind, req.Source.Label, nullable(req.Source.Detector), nullable(req.Source.ScanID), req.CohortTotal, created, created, res.Membership)
-	} else {
-		_, err = tx.ExecContext(ctx, `UPDATE acquisition_batches SET updated_at=?,membership_state=? WHERE id=?`, created, res.Membership, batchID)
-	}
+	_, err = tx.ExecContext(ctx, `UPDATE acquisition_batches SET updated_at=?,membership_state=? WHERE id=?`, created, res.Membership, batchID)
 	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO acquisition_batch_chunks(batch_id,chunk_index,request_id,final_chunk,canonical_keys_json,result_json,created_at) VALUES(?,?,?,?,?,?,?)`, batchID, req.ChunkIndex, req.RequestID, boolInt(req.FinalChunk), keysBytes, resultBytes, created)
 	}

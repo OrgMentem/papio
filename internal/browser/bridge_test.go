@@ -10202,6 +10202,32 @@ func TestPageBulkSubmitOpenAlexCanonicalKeyCreatesJob(t *testing.T) {
 	}
 }
 
+// V1 keeps its legacy accounting when the daemon refuses a submit: the
+// failed key counts invalid with a log line and the remaining keys still
+// submit. Only the V2 cohort path fails the whole chunk.
+func TestPageBulkSubmitV1DaemonFailureCountsInvalidAndContinues(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	runSync(t, b, hello())
+	cfg.AccessMode = ""
+	b.cfg = cfg
+	b.svc.Config = cfg
+	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-v1-daemon-fail", ScanID: "scan-bulk-v1-daemon-fail",
+		CanonicalKeys: []string{"doi:10.1000/v1.daemon.1", "doi:10.1000/v1.daemon.2"},
+		Source: protocol.PageBulkSubmitSource{
+			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_submit_result in %v", msgs)
+	}
+	if payload := result.Payload.(*protocol.PageBulkSubmitResultPayload); payload.Submitted != 0 || payload.Invalid != 2 {
+		t.Fatalf("counts = %+v, want {submitted:0 invalid:2}: V1 folds daemon failures into invalid and continues", payload)
+	}
+}
+
 // TestPageBulkSubmitCanonicalKeysCapRejectedByDecode pins that the 50-key cap
 // is enforced by protocol decode (ADR-0019 Decision 5), not the handler: a
 // 51-key frame never reaches pageBulkSubmit and fails the whole Sync call
@@ -14660,6 +14686,103 @@ func TestPageBulkSubmitV2PersistsReplayAndConflict(t *testing.T) {
 		t.Fatalf("conflict mutated domain: jobs %d/%d members %d/%d", jobsAfter, jobsBefore, membersAfter, membersBefore)
 	}
 }
+
+// A daemon-side submit failure (for instance unset access mode) must fail the
+// chunk instead of persisting an invalid outcome: nothing is cached, and the
+// same request id replays the submission once the cause is fixed.
+func TestPageBulkSubmitV2DaemonFailureFailsChunkWithoutCaching(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	runSync(t, b, hello())
+	cfg.AccessMode = ""
+	b.cfg = cfg
+	b.svc.Config = cfg
+	req := protocol.PageBulkSubmitV2RequestPayload{
+		RequestID: "cohort-daemon-fail-1", ScanID: "scan-daemon-fail-1", CohortID: "cohort-daemon-fail-1",
+		Source:      protocol.PageBulkSubmitSource{Kind: "browser_page", Origin: "https://reader.example.edu", Detector: "detector/1"},
+		CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: []string{"doi:10.1000/daemon.1"},
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req))
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	if errMsg == nil {
+		t.Fatalf("daemon failure = %v, want structured unavailable", msgs)
+	}
+	if errMsg.Payload.(*protocol.ErrorPayload).Code != "page_bulk_cohort_unavailable" {
+		t.Fatalf("daemon failure payload = %+v, want unavailable", errMsg.Payload)
+	}
+	if got := firstOfType(msgs, protocol.MsgPageBulkSubmitV2Result); got != nil {
+		t.Fatalf("daemon failure cached a result: %v", got.Payload)
+	}
+	var members int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM acquisition_batch_members`).Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if members != 0 {
+		t.Fatalf("members = %d, want 0: a failed submit persists nothing", members)
+	}
+	var membership string
+	if err := jobs.S.DB().QueryRow(`SELECT membership_state FROM acquisition_batches`).Scan(&membership); err != nil {
+		t.Fatalf("batch row is missing after daemon failure: %v", err)
+	}
+	if membership != "partial" {
+		t.Fatalf("membership = %q, want partial: membership is not yet durable", membership)
+	}
+	cfg.AccessMode = config.ModeDelegated
+	b.cfg = cfg
+	b.svc.Config = cfg
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req))
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitV2Result)
+	if result == nil {
+		t.Fatalf("replay after fix missing result: %v", msgs)
+	}
+	if got := result.Payload.(*protocol.PageBulkSubmitV2ResultPayload); got.Submitted != 1 || got.Invalid != 0 || got.Membership != "complete" || got.CohortTotal == nil || *got.CohortTotal != 1 {
+		t.Fatalf("replay = %+v, want one submitted work and complete membership with total 1", got)
+	}
+}
+
+func TestPageBulkSubmitV2UnknownDefaultResolverRetriesAfterRepair(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprintf("configured_profiles_%t", configured), func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			runSync(t, b, hello())
+			if configured {
+				b.svc.Config.Browser.Resolvers = map[string]config.Institution{
+					"available": {OpenURLBase: "https://resolver.example.edu"},
+				}
+			} else {
+				b.svc.Config.Browser.Resolvers = nil
+			}
+			b.svc.Config.Browser.DefaultResolver = "missing"
+			req := protocol.PageBulkSubmitV2RequestPayload{
+				RequestID: "default-resolver-request", ScanID: "default-resolver-scan", CohortID: "default-resolver-cohort",
+				Source:      protocol.PageBulkSubmitSource{Kind: "browser_page", Origin: "https://reader.example.edu", Detector: "detector/1"},
+				CohortTotal: 2, FinalChunk: true, CanonicalKeys: []string{"not-a-canonical-key", "doi:10.1000/default-resolver"},
+			}
+			msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req))
+			refusal := firstOfType(msgs, protocol.MsgError)
+			if refusal == nil || refusal.Payload.(*protocol.ErrorPayload).Code != "page_bulk_cohort_unavailable" {
+				t.Fatalf("unknown default resolver response = %v, want cohort unavailable", msgs)
+			}
+			var chunks int
+			if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM acquisition_batch_chunks`).Scan(&chunks); err != nil {
+				t.Fatal(err)
+			}
+			if chunks != 0 {
+				t.Fatalf("cached chunks = %d, want no cached configuration failure", chunks)
+			}
+			b.svc.Config.Browser.DefaultResolver = ""
+			msgs, _ = runSync(t, b, inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req))
+			result := firstOfType(msgs, protocol.MsgPageBulkSubmitV2Result)
+			if result == nil {
+				t.Fatalf("repaired default resolver response = %v, want a cohort result", msgs)
+			}
+			got := result.Payload.(*protocol.PageBulkSubmitV2ResultPayload)
+			if got.Submitted != 1 || got.Invalid != 1 || got.Membership != "complete" || got.CohortTotal == nil || *got.CohortTotal != 2 {
+				t.Fatalf("replay = %+v, want one submitted work and one invalid input", got)
+			}
+		})
+	}
+}
+
 func mappedFamilyJob(t *testing.T, jobs *job.Store, reqID string) string {
 	t.Helper()
 	id := park(t, jobs, reqID, handoffWork())
