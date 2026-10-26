@@ -329,9 +329,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	entries := resolverEntries(cfg, budgets, metadataClient, credentials)
 	service := app.New(cfg, jobs, artifacts, budgets)
 	service.Credentials = credentials
-	// ILLiad is the only POST caller. It uses the same policy as metadata:
-	// submission responses need no distinct timeout or byte bound today, while
-	// the separate constructor keeps metadata and discovery GET-only.
+	// ILLiad submissions use the same policy as metadata. Like OpenAIRE's
+	// token exchange, they opt into POST on a separate client so metadata
+	// and discovery remain GET-only.
 	illiadClient, err := fetch.NewSecureHTTPClientWithPOST(metadataPolicy, nil, http.DefaultTransport)
 	if err != nil {
 		return nil, err
@@ -854,7 +854,7 @@ func openAIRETokens(cfg config.Config, client *fetch.SecureHTTPClient, views ...
 		return nil
 	}
 	return openaire.NewClientCredentials(openaire.ClientCredentialsOptions{
-		Client:       client,
+		Client:       client.WithPOST(),
 		ClientID:     source.ClientID,
 		ClientSecret: source.ClientSecret,
 	})
