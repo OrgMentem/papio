@@ -300,13 +300,13 @@ func writeRIS(b *strings.Builder, tag, value string) {
 // terminal. (CSL-JSON is exempt by construction — encoding/json escapes
 // control bytes.)
 func singleLine(value string) string {
-	return strings.Join(strings.Fields(store.StripTerminalControls(value)), " ")
+	return store.StripTerminalControls(strings.Join(strings.Fields(value), " "))
 }
 
 var bibtexEscaper = strings.NewReplacer(
 	"\\", "\\textbackslash{}",
-	"{", "\\{",
-	"}", "\\}",
+	"{", "\\textbraceleft{}",
+	"}", "\\textbraceright{}",
 	"%", "\\%",
 	"&", "\\&",
 	"$", "\\$",
@@ -332,8 +332,11 @@ func bibTeXAuthors(authors []string) string {
 	return strings.Join(names, " and ")
 }
 
-// verbatimBibTeX keeps a verbatim field's bytes, falling back to full escaping
-// only when its braces are unbalanced and would close the field early.
+var bibtexVerbatimBraceEscaper = strings.NewReplacer("{", "%7B", "}", "%7D")
+
+// verbatimBibTeX keeps a verbatim field's bytes unless its braces are unbalanced.
+// BibTeX counts even backslash-escaped braces, so percent-encode braces in that
+// case without LaTeX-escaping the rest of the identifier.
 func verbatimBibTeX(value string) string {
 	depth := 0
 	for _, r := range value {
@@ -343,12 +346,12 @@ func verbatimBibTeX(value string) string {
 		case '}':
 			depth--
 			if depth < 0 {
-				return escapeBibTeX(value)
+				return bibtexVerbatimBraceEscaper.Replace(singleLine(value))
 			}
 		}
 	}
 	if depth != 0 {
-		return escapeBibTeX(value)
+		return bibtexVerbatimBraceEscaper.Replace(singleLine(value))
 	}
 	return singleLine(value)
 }
