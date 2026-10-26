@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/resolver"
 	"papio/internal/store"
 )
 
@@ -129,6 +131,210 @@ func TestUnavailableRecheck(t *testing.T) {
 		}
 		if len(rows) != 2 || len(recheckEvents(t, jobs, oldID)) != 1 {
 			t.Fatalf("second pass produced jobs=%d events=%d, want 2 and 1", len(rows), len(recheckEvents(t, jobs, oldID)))
+		}
+	})
+
+	t.Run("removed resolver records one durable refusal", func(t *testing.T) {
+		ctx := context.Background()
+		svc, jobs := newService(t)
+		institution := config.Institution{OpenURLBase: "https://gone.example.edu/openurl"}
+		svc.Config.Browser.Resolvers = map[string]config.Institution{"gone": institution}
+		wr := request("wr_recheck_removed_resolver", "10.1000/recheck-removed-resolver")
+		wr.Resolver = "gone"
+		oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+		delete(svc.Config.Browser.Resolvers, "gone")
+		runner := svc.UnavailableRechecker()
+		for range 2 {
+			if err := runner.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		events, err := jobs.Events(ctx, oldID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refusals := 0
+		for _, event := range events {
+			if event["kind"] != "unavailable.recheck_refused" {
+				continue
+			}
+			refusals++
+			detail, _ := event["detail"].(map[string]any)
+			reason, _ := detail["reason"].(string)
+			if !strings.Contains(reason, `unknown resolver "gone"`) || detail["resolver"] != "gone" || detail["window_days"] != float64(windowDays) || detail["resolver_missing"] != true {
+				t.Fatalf("refusal detail = %#v, want the removed resolver and recheck window", detail)
+			}
+		}
+		if refusals != 1 {
+			t.Fatalf("durable refusals after two passes = %d, want 1", refusals)
+		}
+		if len(recheckEvents(t, jobs, oldID)) != 0 {
+			t.Fatal("a refused request must not record a successful recheck")
+		}
+		// Restoring the profile makes the old snapshot valid again without
+		// discarding its refusal history, even after a runner restart.
+		svc.Config.Browser.Resolvers["gone"] = institution
+		if err := svc.UnavailableRechecker().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := jobs.List(ctx, "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || len(recheckEvents(t, jobs, oldID)) != 1 {
+			t.Fatalf("jobs after resolver restoration = %d, rechecks = %d; want 2 and 1", len(rows), len(recheckEvents(t, jobs, oldID)))
+		}
+		events, err = jobs.Events(ctx, oldID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refusals = 0
+		for _, event := range events {
+			if event["kind"] == "unavailable.recheck_refused" {
+				refusals++
+			}
+		}
+		if refusals != 1 {
+			t.Fatalf("refusal history after recovery = %d, want the one original refusal", refusals)
+		}
+	})
+
+	t.Run("new unavailable outcome supersedes an old refusal", func(t *testing.T) {
+		ctx := context.Background()
+		svc, jobs := newService(t)
+		svc.Config.Browser.Resolvers = map[string]config.Institution{
+			"gone": {OpenURLBase: "https://gone.example.edu/openurl"},
+		}
+		wr := request("wr_recheck_refusal_epoch", "10.1000/recheck-refusal-epoch")
+		wr.Resolver = "gone"
+		oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+		delete(svc.Config.Browser.Resolvers, "gone")
+		runner := svc.UnavailableRechecker()
+		if err := runner.RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Retry(ctx, oldID); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(ctx, oldID, job.StateResolving, job.StateUnavailable, nil,
+			job.WithTerminalReason(job.TerminalReasonNoEntitlement)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			store.FormatTime(now.AddDate(0, 0, -windowDays-1)), oldID); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := runner.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		events, err := jobs.Events(ctx, oldID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refusals := 0
+		for _, event := range events {
+			if event["kind"] == "unavailable.recheck_refused" {
+				refusals++
+			}
+		}
+		if refusals != 2 {
+			t.Fatalf("refusals for two unavailable outcomes = %d, want one per outcome", refusals)
+		}
+	})
+
+	t.Run("replacement cancels the superseded advisory", func(t *testing.T) {
+		ctx := context.Background()
+		svc, jobs := newService(t)
+		svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+		svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+			t.Fatal("no candidate should reach fetch")
+			return fetch.Result{}, nil
+		}
+		svc.Validate = passValidation()
+		oldID, err := svc.Submit(ctx, request("wr_recheck_advisory", "10.1000/recheck-advisory"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldRow, err := jobs.Get(ctx, oldID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Process(ctx, oldRow); err != nil {
+			t.Fatal(err)
+		}
+		actions, err := jobs.ListHumanActions(ctx, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 1 || actions[0].JobID != oldID || actions[0].Kind != job.InformationalActionKind {
+			t.Fatalf("initial actions = %+v, want one original advisory", actions)
+		}
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			store.FormatTime(now.AddDate(0, 0, -windowDays-1)), oldID); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.UnavailableRechecker().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		events := recheckEvents(t, jobs, oldID)
+		if len(events) != 1 {
+			t.Fatalf("recheck events = %d, want 1", len(events))
+		}
+		detail := events[0]["detail"].(map[string]any)
+		freshID, _ := detail["new_job_id"].(string)
+		fresh, err := jobs.Get(ctx, freshID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Process(ctx, fresh); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err = jobs.Get(ctx, freshID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fresh.State != job.StateUnavailable {
+			t.Fatalf("replacement state = %s, want unavailable", fresh.State)
+		}
+		actions, err = jobs.ListHumanActions(ctx, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cancelled, open int
+		for _, action := range actions {
+			if action.Kind != job.InformationalActionKind {
+				t.Fatalf("unexpected action: %+v", action)
+			}
+			switch {
+			case action.JobID == oldID && action.Status == "cancelled":
+				cancelled++
+			case action.JobID == freshID && action.Status == "open":
+				open++
+			default:
+				t.Fatalf("stale or unexpected advisory: %+v", action)
+			}
+		}
+		if cancelled != 1 || open != 1 {
+			t.Fatalf("advisories = %d cancelled, %d open; want one superseded and one current", cancelled, open)
+		}
+		history, err := jobs.Events(ctx, oldID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		superseded := 0
+		for _, event := range history {
+			if event["kind"] == "job.superseded" {
+				superseded++
+				detail, _ := event["detail"].(map[string]any)
+				if detail["superseded_by"] != freshID {
+					t.Fatalf("superseded detail = %#v, want replacement %s", detail, freshID)
+				}
+			}
+		}
+		if superseded != 1 {
+			t.Fatalf("superseded events = %d, want 1", superseded)
 		}
 	})
 
