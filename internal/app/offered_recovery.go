@@ -27,8 +27,8 @@ const (
 var offeredRecoveryRunID atomic.Uint64
 
 // OfferedDeliveryRecovery retries durable offered rows through the ordinary
-// deliveryRoute gate. It is a daemon maintenance runner: startup and the
-// scheduler's existing maintenance cadence both call RunDue.
+// deliveryRoute gate and orphans live requests left by cancelled jobs. It runs
+// at startup and on the scheduler's existing maintenance cadence.
 type OfferedDeliveryRecovery struct {
 	svc   *Service
 	owner string
@@ -88,6 +88,9 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 	if row == nil {
 		log.Printf("papio: offered delivery recovery row %d skipped: job %q is missing", request.ID, request.JobID)
 		return nil
+	}
+	if row.State == job.StateCancelled {
+		return r.svc.orphanDeliveryIfLive(ctx, row.ID, "job_cancelled")
 	}
 	if row.RetryAt != "" {
 		if retryAt, parseErr := time.Parse(time.RFC3339Nano, row.RetryAt); parseErr == nil && r.now().Before(retryAt) {

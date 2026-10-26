@@ -365,8 +365,8 @@ func (s *Service) bindJobToRequestTx(ctx context.Context, tx *sql.Tx, jobID stri
 	return nil
 }
 
-// ListRecoverable returns the first page of durably-offered rows that have
-// never reached the provider.
+// ListRecoverable returns the first page of offered rows and live requests
+// whose cancelled owner can no longer poll them.
 func (s *Service) ListRecoverable(ctx context.Context, limit int) ([]*Request, error) {
 	return s.ListRecoverableAfter(ctx, 0, limit)
 }
@@ -381,8 +381,14 @@ func (s *Service) ListRecoverableAfter(ctx context.Context, afterID int64, limit
 	rows, err := s.store.DB().QueryContext(ctx,
 		`SELECT `+requestColumns+`
 		 FROM delivery_requests
-		 WHERE state = ? AND provider_reference = '' AND id > ?
-		 ORDER BY id ASC LIMIT ?`, string(StateOffered), afterID, limit)
+		 WHERE id > ? AND (
+		   (state = ? AND provider_reference = '')
+		   OR (state IN ('submitted','pending') AND EXISTS (
+		     SELECT 1 FROM jobs
+		     WHERE jobs.id = delivery_requests.job_id AND jobs.state = 'cancelled'
+		   ))
+		 )
+		 ORDER BY id ASC LIMIT ?`, afterID, string(StateOffered), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -662,12 +668,11 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 
 // ReserveSubmissionAttempt durably records that a provider POST for row id is
 // about to be sent, and is the gate that POST must pass. It stamps the
-// submitted_at attempt marker only while the row is still `offered` with no
-// provider reference AND its owning job is still `resolving` — the exact
-// predicate RecordSubmission applies after the POST. The caller MUST NOT POST
-// when it returns false: the request was cancelled, resolved, or lost its
-// resolving owner, and a POST would create a provider request papio can
-// neither record nor track.
+// submitted_at attempt marker only while it is unset, the row is still
+// `offered` with no provider reference, and its owning job is still
+// `resolving`. The caller MUST NOT POST when it returns false: another
+// caller reserved the attempt, the request was cancelled or resolved, or
+// it lost its resolving owner.
 //
 // The marker is what lets cancel and orphan checks treat an offered row as
 // possibly live without reading the owning job's event stream, and what makes
@@ -676,8 +681,8 @@ func (s *Service) ReserveSubmissionAttempt(ctx context.Context, id int64) (bool,
 	now := store.FormatTime(s.now())
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
-		SET submitted_at = COALESCE(submitted_at, ?), updated_at = ?
-		WHERE id = ? AND state = ? AND provider_reference = ''
+		SET submitted_at = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = '' AND submitted_at IS NULL
 		  AND EXISTS (
 			SELECT 1 FROM jobs
 			WHERE jobs.id = delivery_requests.job_id
@@ -1048,12 +1053,11 @@ func (r *Request) SubmissionMayBeLive() bool {
 // The orphan write is a compare-and-swap following the same discipline
 // persistPollSuccess documents in poll.go ("the UPDATE only applies WHERE
 // state/next_check_at still match what this call originally read"): the
-// UPDATE only applies WHERE state IN ('submitted','pending') or the row is an
-// attempted offered row. The orphaned
-// event appends inside the same transaction, so a lost CAS (zero rows
-// affected — the poller already settled the row between the read and this
-// write) leaves no duplicate event behind and returns nil as a successful
-// no-op.
+// UPDATE requires the expected owner to remain terminal and the request to
+// remain submitted, pending, or attempted offered. Reassignment, owner revival,
+// or settlement between the read and write therefore leaves the request
+// untouched. The orphaned event appends inside the same transaction, so a
+// lost CAS leaves no duplicate event and returns nil as a successful no-op.
 func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	req, err := s.GetByJobID(ctx, jobID)
 	if err != nil || req == nil {
@@ -1075,9 +1079,14 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE delivery_requests SET state = ?, updated_at = ?
-		 WHERE id = ? AND (state IN ('submitted','pending')
-		                   OR (state = 'offered' AND provider_reference = '' AND submitted_at IS NOT NULL))`,
-		string(StateUnknownOutcome), now, req.ID)
+		 WHERE id = ? AND job_id = ?
+		   AND (state IN ('submitted','pending')
+		        OR (state = 'offered' AND provider_reference = '' AND submitted_at IS NOT NULL))
+		   AND EXISTS (
+		     SELECT 1 FROM jobs WHERE jobs.id = delivery_requests.job_id
+		       AND jobs.state IN ('ready','imported','unavailable','failed','cancelled')
+		   )`,
+		string(StateUnknownOutcome), now, req.ID, jobID)
 	if err != nil {
 		return err
 	}
@@ -1086,7 +1095,7 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 		return err
 	}
 	if n == 0 {
-		// Already settled by a concurrent poller — nothing to orphan.
+		// The request or its owner changed — nothing to orphan.
 		return nil
 	}
 	data, err := json.Marshal(map[string]any{

@@ -3711,6 +3711,15 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 		return created, err
 	}
 	if !reserved {
+		currentRequest, err := s.Delivery.Get(ctx, created.ID)
+		if err != nil {
+			return created, err
+		}
+		if currentRequest != nil && currentRequest.SubmissionMayBeLive() {
+			// The winning caller still needs its resolving owner to record
+			// the POST response. A loser must not park that job underneath it.
+			return currentRequest, nil
+		}
 		current, err := s.Jobs.Get(ctx, row.ID)
 		if err != nil {
 			return created, err

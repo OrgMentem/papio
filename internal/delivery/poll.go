@@ -84,10 +84,13 @@ const (
 // to resolve quickly (ADR-0017 Decision 4).
 const requestFinishedReconciliationDelay = 15 * time.Minute
 
-// notFoundPropagationDelay is the short, fixed retry wait for a 404 seen
-// before this row has ever had a successful poll — ILLiad has simply not
-// indexed the transaction yet.
-const notFoundPropagationDelay = 15 * time.Minute
+// A new transaction may take time to appear in ILLiad. Allow three
+// increasingly spaced propagation retries, then reconcile the missing
+// reference rather than treating an unobserved request as pending forever.
+const (
+	notFoundPropagationDelay      = 15 * time.Minute
+	notFoundPropagationMaxRetries = 3
+)
 
 // notFoundReconciliationRecheckDelay is the short, fixed wait before the
 // one delayed recheck a 404-after-success gets after UserRequests also
@@ -318,15 +321,14 @@ func (s *Service) handlePollError(ctx context.Context, req *Request, now time.Ti
 
 func (s *Service) handleNotFound(ctx context.Context, req *Request, now time.Time, deps PollDeps) (PollResult, error) {
 	switch {
-	case req.LastSuccessfulPollAt == "":
-		// Shortly after submit: ILLiad has not indexed the transaction
-		// yet. Propagation delay, not a reconciliation case.
-		return s.recordPollFailureAt(ctx, req, now, PollErrorClassNotFoundPropagationDelay, now.Add(notFoundPropagationDelay))
 	case req.LastPollErrorClass == PollErrorClassNotFoundReconciling:
 		// The one delayed recheck already ran (see the default branch
 		// below) and the transaction is still absent: settle, but only
 		// through this explicit reconciliation path.
 		return s.persistUnknownOutcome(ctx, req, now)
+	case req.LastSuccessfulPollAt == "" && req.ConsecutivePollFailures < notFoundPropagationMaxRetries:
+		nextCheck := s.backoffWithJitter(now, req.ConsecutivePollFailures, int(notFoundPropagationDelay/time.Minute))
+		return s.recordPollFailureAt(ctx, req, now, PollErrorClassNotFoundPropagationDelay, nextCheck)
 	default:
 		matched, findErr := s.reconcileViaUserRequests(ctx, deps, req)
 		if findErr != nil {
@@ -397,9 +399,8 @@ func (s *Service) recordPollFailure(ctx context.Context, req *Request, now time.
 	return PollResult{State: req.State, NextCheckAt: nextCheck}, nil
 }
 
-// recordPollFailureAt is recordPollFailure with a caller-supplied fixed
-// delay (the 404 propagation-delay and reconciliation-recheck cases,
-// which use a short fixed wait instead of exponential backoff).
+// recordPollFailureAt is recordPollFailure with a caller-supplied delay
+// (the bounded 404 propagation retries and fixed reconciliation recheck).
 func (s *Service) recordPollFailureAt(ctx context.Context, req *Request, now time.Time, class string, nextCheck time.Time) (PollResult, error) {
 	failures := req.ConsecutivePollFailures + 1
 	applied, err := s.persistPollFailure(ctx, req, now, class, failures, nextCheck)
