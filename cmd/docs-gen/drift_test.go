@@ -103,8 +103,9 @@ func TestExtensionPermissionsAreDocumented(t *testing.T) {
 // looks at these three files.
 func TestInjectedSurfacesAreDisclosed(t *testing.T) {
 	const route = "renderPageToast"
-	if !strings.Contains(mustRead(t, "extension/src/background.ts"), route) {
-		t.Skipf("no %s in background.ts: the in-page route is gone, so these "+
+	extensionSrc := mustRead(t, "extension/src/background.ts") + mustRead(t, "extension/src/toast-delivery.ts")
+	if !strings.Contains(extensionSrc, route) {
+		t.Skipf("no %s in extension/src: the in-page route is gone, so these "+
 			"disclosures are free to say the surface never injects", route)
 	}
 
