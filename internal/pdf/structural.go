@@ -42,6 +42,19 @@ func DefaultStructuralOptions() StructuralOptions {
 	}
 }
 
+// CheckerInfrastructureError means a checker could not run to completion.
+// It says nothing about the PDF's validity, so callers must retain the file.
+type CheckerInfrastructureError struct {
+	Tool string
+	Err  error
+}
+
+func (e *CheckerInfrastructureError) Error() string {
+	return fmt.Sprintf("%s checker unavailable: %v", e.Tool, e.Err)
+}
+
+func (e *CheckerInfrastructureError) Unwrap() error { return e.Err }
+
 type workerRequest struct {
 	Path     string `json:"path"`
 	MaxPages int    `json:"max_pages"`
@@ -139,16 +152,26 @@ func runStructuralWorker(ctx context.Context, binary string, req workerRequest, 
 		report.Reason = err.Error()
 		return report, nil
 	}
+	// Poppler gets its own bounded budget; a successful worker must not spend
+	// the time needed for the independent checks. Parent cancellation still wins.
+	checkCtx, cancelChecks := context.WithTimeout(ctx, opt.Timeout)
+	defer cancelChecks()
 	if req.SanitizeTo == "" && !report.Valid &&
 		strings.HasPrefix(report.Reason, "pdfcpu inspection:") &&
 		strings.Contains(strings.ToLower(report.Reason), "invalid filter") && strings.Contains(report.Reason, "Crypt") &&
 		!report.Encrypted && !report.HasJavaScript && !report.HasEmbeddedFiles {
-		if fallback, ok := inspectCryptFilterWithPoppler(workerCtx, reportPath, opt); ok {
+		if fallback, ok, err := inspectCryptFilterWithPoppler(checkCtx, reportPath, opt); err != nil {
+			return report, err
+		} else if ok {
 			slog.Debug("PDF structural fallback used", "parser", "pdfinfo", "filter", "Crypt")
 			return fallback, nil
 		}
 	}
-	if err := crossCheckPDFInfo(workerCtx, opt.PDFInfoPath, reportPath, &report, opt.MaxOutputBytes); err != nil {
+	if err := crossCheckPDFInfo(checkCtx, opt.PDFInfoPath, reportPath, &report, opt.MaxOutputBytes); err != nil {
+		var infrastructure *CheckerInfrastructureError
+		if errors.As(err, &infrastructure) {
+			return report, err
+		}
 		report.Valid = false
 		report.Reason = err.Error()
 	}
@@ -368,17 +391,17 @@ func validateWorkerReport(report *StructuralReport, maxPages int) error {
 
 // inspectCryptFilterWithPoppler is limited to pdfcpu's unsupported Crypt filter.
 // All checks must succeed before the worker rejection can become an acceptance.
-// The shared worker deadline and output caps also bound these three processes.
-func inspectCryptFilterWithPoppler(ctx context.Context, path string, opt StructuralOptions) (StructuralReport, bool) {
+// A separate Poppler deadline and output caps bound these three processes.
+func inspectCryptFilterWithPoppler(ctx context.Context, path string, opt StructuralOptions) (StructuralReport, bool, error) {
 	if opt.PDFInfoPath == "" || opt.PDFDetachPath == "" {
-		return StructuralReport{}, false
+		return StructuralReport{}, false, nil
 	}
 	// Poppler can warn about an Identity Crypt stream on stderr while returning
 	// complete metadata successfully. Keep the warning bounded, but require
 	// clean output from the JavaScript and attachment checks.
-	info, ok := runStructuralTool(ctx, opt.PDFInfoPath, opt.MaxOutputBytes, true, path)
-	if !ok {
-		return StructuralReport{}, false
+	info, ok, err := runStructuralTool(ctx, opt.PDFInfoPath, opt.MaxOutputBytes, true, path)
+	if err != nil || !ok {
+		return StructuralReport{}, false, err
 	}
 	var pages int
 	seenPages, seenEncrypted := false, false
@@ -390,36 +413,36 @@ func inspectCryptFilterWithPoppler(ctx context.Context, path string, opt Structu
 		switch strings.TrimSpace(fields[0]) {
 		case "Pages":
 			if seenPages {
-				return StructuralReport{}, false
+				return StructuralReport{}, false, nil
 			}
 			seenPages = true
 			var err error
 			pages, err = strconv.Atoi(strings.TrimSpace(fields[1]))
 			if err != nil || pages < 1 || pages > opt.MaxPages {
-				return StructuralReport{}, false
+				return StructuralReport{}, false, nil
 			}
 		case "Encrypted":
 			if seenEncrypted || strings.TrimSpace(fields[1]) != "no" {
-				return StructuralReport{}, false
+				return StructuralReport{}, false, nil
 			}
 			seenEncrypted = true
 		}
 	}
 	if !seenPages || !seenEncrypted {
-		return StructuralReport{}, false
+		return StructuralReport{}, false, nil
 	}
-	js, ok := runStructuralTool(ctx, opt.PDFInfoPath, opt.MaxOutputBytes, false, "-js", path)
-	if !ok || js != "" {
-		return StructuralReport{}, false
+	js, ok, err := runStructuralTool(ctx, opt.PDFInfoPath, opt.MaxOutputBytes, false, "-js", path)
+	if err != nil || !ok || js != "" {
+		return StructuralReport{}, false, err
 	}
-	attachments, ok := runStructuralTool(ctx, opt.PDFDetachPath, opt.MaxOutputBytes, false, "-list", path)
-	if !ok || strings.TrimSpace(attachments) != "0 embedded files" {
-		return StructuralReport{}, false
+	attachments, ok, err := runStructuralTool(ctx, opt.PDFDetachPath, opt.MaxOutputBytes, false, "-list", path)
+	if err != nil || !ok || strings.TrimSpace(attachments) != "0 embedded files" {
+		return StructuralReport{}, false, err
 	}
-	return StructuralReport{Valid: true, Pages: pages}, true
+	return StructuralReport{Valid: true, Pages: pages}, true, nil
 }
 
-func runStructuralTool(ctx context.Context, binary string, limit int64, allowStderr bool, args ...string) (string, bool) {
+func runStructuralTool(ctx context.Context, binary string, limit int64, allowStderr bool, args ...string) (string, bool, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	configureProcessTree(cmd)
 	var out cappedBuffer
@@ -427,10 +450,25 @@ func runStructuralTool(ctx context.Context, binary string, limit int64, allowStd
 	var stderr cappedBuffer
 	stderr.limit = 8 << 10
 	cmd.Stdout, cmd.Stderr = &out, &stderr
-	if err := cmd.Run(); err != nil || ctx.Err() != nil || out.exceeded || stderr.exceeded || (!allowStderr && stderr.Len() != 0) {
-		return "", false
+	err := cmd.Run()
+	if infrastructure := checkerInfrastructureError(ctx, binary, err); infrastructure != nil {
+		return "", false, infrastructure
 	}
-	return out.String(), true
+	if err != nil || out.exceeded || stderr.exceeded || (!allowStderr && stderr.Len() != 0) {
+		return "", false, nil
+	}
+	return out.String(), true, nil
+}
+
+func checkerInfrastructureError(ctx context.Context, binary string, err error) error {
+	if ctx.Err() != nil {
+		return &CheckerInfrastructureError{Tool: binary, Err: ctx.Err()}
+	}
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		return &CheckerInfrastructureError{Tool: binary, Err: err}
+	}
+	return nil
 }
 
 func crossCheckPDFInfo(ctx context.Context, binary, path string, report *StructuralReport, limit int64) error {
@@ -447,10 +485,11 @@ func crossCheckPDFInfo(ctx context.Context, binary, path string, report *Structu
 	var stderr cappedBuffer
 	stderr.limit = 8 << 10
 	cmd.Stdout, cmd.Stderr = &out, &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("pdfinfo timed out: %w", ctx.Err())
-		}
+	err := cmd.Run()
+	if infrastructure := checkerInfrastructureError(ctx, binary, err); infrastructure != nil {
+		return infrastructure
+	}
+	if err != nil {
 		return fmt.Errorf("pdfinfo cross-check failed: %s", strings.TrimSpace(stderr.String()))
 	}
 	if out.exceeded {

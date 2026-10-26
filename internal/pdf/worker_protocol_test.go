@@ -3,6 +3,7 @@ package pdf
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -183,18 +184,8 @@ func TestCrossCheckPDFInfo(t *testing.T) {
 }
 
 func TestCrossCheckPDFInfoTimeout(t *testing.T) {
-	// ValidateStructural shares a single deadline (workerCtx) between the worker
-	// and pdfinfo, so a short Timeout would kill the worker before pdfinfo ever
-	// runs (worker cold-start is ~0.4-1s on this platform). To isolate the
-	// pdfinfo timeout branch without flakiness or multi-second wall time,
-	// exercise crossCheckPDFInfo directly with a tight context — sleep is
-	// 500ms but the context cancels after ~120ms, so wall time stays well under
-	// 300ms (measured ~130ms). A pdfinfo timeout via the end-to-end
-	// ValidateStructural path would require a deadline long enough for the worker
-	// cold-start plus the pdfinfo sleep — covered reliably here; adding it as
-	// an end-to-end test would add multi-second wall time, so it is skipped by
-	// design (see assignment rule: if timeout is hardcoded >200ms, skip rather
-	// than slow the suite).
+	// Exercise the deadline directly so this test does not depend on worker
+	// startup time. The parent-path tests cover propagation of this error.
 	pdfinfo := fakeTool(t, `sleep 0.5; printf 'Pages: 1\n'`)
 	report := StructuralReport{Valid: true, Pages: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
@@ -202,11 +193,118 @@ func TestCrossCheckPDFInfoTimeout(t *testing.T) {
 	start := time.Now()
 	err := crossCheckPDFInfo(ctx, pdfinfo, writeTempPDF(t), &report, 64<<10)
 	elapsed := time.Since(start)
-	if err == nil || !strings.Contains(err.Error(), "pdfinfo timed out") {
-		t.Fatalf("err=%v want pdfinfo timed out", err)
+	var infrastructure *CheckerInfrastructureError
+	if !errors.As(err, &infrastructure) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want checker infrastructure error wrapping deadline", err)
 	}
 	if elapsed > 300*time.Millisecond {
 		t.Fatalf("timeout test took %v, exceeds 300ms budget (sleep should be interrupted by context)", elapsed)
+	}
+}
+
+func TestStructuralPDFInfoInfrastructureFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		script        string
+		wantCause     error
+		timeout       time.Duration
+		parentTimeout time.Duration
+	}{
+		{name: "cannot exec", wantCause: os.ErrNotExist},
+		{name: "timeout", script: `sleep 5; printf 'Pages: 2\n'`, wantCause: context.DeadlineExceeded, timeout: 2 * time.Second},
+		{name: "parent deadline", script: `sleep 5; printf 'Pages: 2\n'`, wantCause: context.DeadlineExceeded, parentTimeout: 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
+			pdfinfo := t.TempDir() + "/missing-pdfinfo"
+			if tc.script != "" {
+				pdfinfo = fakeTool(t, tc.script)
+			}
+			ctx := t.Context()
+			if tc.parentTimeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tc.parentTimeout)
+				defer cancel()
+			}
+			report, err := ValidateStructural(ctx, worker, writeTempPDF(t), StructuralOptions{
+				PDFInfoPath: pdfinfo, Timeout: tc.timeout,
+			})
+			var infrastructure *CheckerInfrastructureError
+			if !errors.As(err, &infrastructure) || !errors.Is(err, tc.wantCause) {
+				t.Fatalf("report=%+v err=%v, want checker infrastructure error wrapping %v", report, err, tc.wantCause)
+			}
+			if infrastructure.Tool != pdfinfo {
+				t.Fatalf("checker=%q, want pdfinfo %q", infrastructure.Tool, pdfinfo)
+			}
+		})
+	}
+}
+
+func TestStructuralPDFInfoParentCancellation(t *testing.T) {
+	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
+	marker := t.TempDir() + "/pdfinfo-started"
+	pdfinfo := fakeTool(t, `touch "`+marker+`"; sleep 5; printf 'Pages: 2\n'`)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type result struct {
+		report StructuralReport
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		report, err := ValidateStructural(ctx, worker, "unused.pdf", StructuralOptions{PDFInfoPath: pdfinfo})
+		done <- result{report, err}
+	}()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		select {
+		case got := <-done:
+			t.Fatalf("validation finished before cancellation: report=%+v err=%v", got.report, got.err)
+		case <-deadline.C:
+			t.Fatal("pdfinfo did not start")
+		case <-tick.C:
+		}
+	}
+	cancel()
+	got := <-done
+	var infrastructure *CheckerInfrastructureError
+	if !errors.As(got.err, &infrastructure) || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("report=%+v err=%v, want checker infrastructure error wrapping cancellation", got.report, got.err)
+	}
+}
+
+func TestCryptFilterFallbackInfrastructureFailure(t *testing.T) {
+	for _, stage := range []string{"pdfinfo", "pdfdetach", "JavaScript timeout"} {
+		t.Run(stage, func(t *testing.T) {
+			worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"`+cryptFilterReason+`"}'`)
+			pdfinfo := fakeTool(t, `if [ "$1" = "-js" ]; then exit 0; fi; printf 'Pages: 2\nEncrypted: no\n'`)
+			pdfdetach := fakeTool(t, `printf '0 embedded files\n'`)
+			wantCause := os.ErrNotExist
+			var timeout time.Duration
+			switch stage {
+			case "pdfinfo":
+				pdfinfo = t.TempDir() + "/missing-pdfinfo"
+			case "pdfdetach":
+				pdfdetach = t.TempDir() + "/missing-pdfdetach"
+			case "JavaScript timeout":
+				pdfinfo = fakeTool(t, `if [ "$1" = "-js" ]; then sleep 5; exit 0; fi; printf 'Pages: 2\nEncrypted: no\n'`)
+				wantCause = context.DeadlineExceeded
+				timeout = 2 * time.Second
+			}
+			report, err := ValidateStructural(t.Context(), worker, writeTempPDF(t), StructuralOptions{
+				PDFInfoPath: pdfinfo, PDFDetachPath: pdfdetach, Timeout: timeout,
+			})
+			var infrastructure *CheckerInfrastructureError
+			if !errors.As(err, &infrastructure) || !errors.Is(err, wantCause) {
+				t.Fatalf("report=%+v err=%v, want checker infrastructure error wrapping %v", report, err, wantCause)
+			}
+		})
 	}
 }
 
