@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -619,6 +620,83 @@ func TestRouterPingIncludesBrowserSession(t *testing.T) {
 	}
 	if !status.ExtensionConnected || status.ExtensionVersion != "1.2.3" {
 		t.Fatalf("connected ping = %+v", status)
+	}
+}
+
+func TestPingAnswersWhileBrowserHandlerHoldsSessionLock(t *testing.T) {
+	system := testSystem(t)
+	system.Updates = nil
+	ctx := context.Background()
+	const holder = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const pending = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"hello-ping-lock","seq":0,"payload":{"extension_version":"1.2.3"}}`)
+	for _, session := range []string{holder, pending} {
+		if _, err := system.Browser.Sync(ctx, session, false, []json.RawMessage{hello}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grabID := seedAPIGrab(t, system, "ping-lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	system.App.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		close(entered)
+		<-release
+		return pdf.ValidationReport{}, errors.New("validation unavailable")
+	}
+	request, err := json.Marshal(map[string]any{
+		"protocol": protocol.BrowserProtocolVersion, "type": protocol.MsgPdfGrabSuggestRequest,
+		"msg_id": "suggest-ping-lock", "seq": 1,
+		"payload": protocol.PdfGrabSuggestRequestPayload{RequestID: "suggest-ping-lock", GrabID: grabID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		close(release)
+		workers.Wait()
+	})
+	syncResult := make(chan error, 1)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		_, err := system.Browser.Sync(ctx, pending, false, []json.RawMessage{request})
+		syncResult <- err
+	}()
+	select {
+	case <-entered:
+	case err := <-syncResult:
+		t.Fatalf("browser handler returned before validation: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("browser handler never entered validation")
+	}
+
+	type response struct {
+		body []byte
+		err  *ipc.RPCError
+	}
+	answer := make(chan response, 1)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		body, err := ping(ctx, json.RawMessage(`{}`), system, &atomic.Bool{})
+		answer <- response{body, err}
+	}()
+	select {
+	case got := <-answer:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		var status statusResult
+		if err := json.Unmarshal(got.body, &status); err != nil {
+			t.Fatal(err)
+		}
+		if status.Status != "ok" || status.Version != Version || !status.ExtensionConnected ||
+			status.ExtensionVersion != "1.2.3" || status.PendingBrowserSessions != 1 || status.BrowserSessionDenied != 1 {
+			t.Fatalf("ping while the bridge is locked = %+v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("version ping waits for the browser handler's session lock")
 	}
 }
 

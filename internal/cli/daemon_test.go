@@ -197,3 +197,59 @@ func TestDaemonControlSurfacesUnreachableSocketErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestDaemonStopSkipsBlockedVersionHandshake(t *testing.T) {
+	dataDir := shortSocketDir(t)
+	var out, errOut bytes.Buffer
+	root := newRoot(&options{
+		out:          &out,
+		errOut:       &errOut,
+		configLoader: func(string) (config.Config, error) { return config.Config{DataDir: dataDir}, nil },
+		rpcCall: func(ctx context.Context, _, method string, _, result any) error {
+			switch method {
+			case "ping":
+				<-ctx.Done()
+				return ctx.Err()
+			case "daemon.shutdown":
+				*result.(*map[string]bool) = map[string]bool{"stopping": true}
+				return nil
+			default:
+				return fmt.Errorf("unexpected method %q", method)
+			}
+		},
+	})
+	root.SetArgs([]string{"daemon", "stop"})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatalf("daemon stop waited for the blocked version ping: %v", err)
+	}
+	if out.String() != "Daemon stopped\n" {
+		t.Fatalf("daemon stop output = %q, want a successful shutdown", out.String())
+	}
+}
+
+func TestDaemonStatusTimesOutWithLogRemediation(t *testing.T) {
+	dataDir := shortSocketDir(t)
+	socket := filepath.Join(dataDir, "papio.sock")
+	var out, errOut bytes.Buffer
+	root := newRoot(&options{
+		out:          &out,
+		errOut:       &errOut,
+		configLoader: func(string) (config.Config, error) { return config.Config{DataDir: dataDir}, nil },
+		rpcCall: func(ctx context.Context, _, _ string, _, _ any) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+				return errors.New("the command did not bound its diagnostic call")
+			}
+		},
+	})
+	root.SetArgs([]string{"daemon", "status", "--socket", socket})
+	err := root.ExecuteContext(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), filepath.Join(dataDir, "daemon.log")) ||
+		!strings.Contains(err.Error(), "SIGQUIT") {
+		t.Fatalf("stalled daemon status error = %v, want a bounded timeout with log and dump guidance", err)
+	}
+}

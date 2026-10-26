@@ -135,7 +135,7 @@ func newDaemonCommand(opt *options) *cobra.Command {
 		if socket == "" {
 			return opt.callExisting(ctx, method, struct{}{}, result)
 		}
-		return callSocket(ctx, socket, method, struct{}{}, result)
+		return opt.socketCall(ctx, socket, method, struct{}{}, result)
 	}
 	stop := &cobra.Command{
 		Use:   "stop",

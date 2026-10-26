@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +42,31 @@ type sessionArbitration struct {
 	reservedFor   string
 	reservedUntil time.Time
 	nextEpoch     func() (int64, error)
+	status        atomic.Pointer[sessionStatus]
+}
+
+// sessionStatus contains only the counters needed by the diagnostic ping.
+// Publishing on transitions keeps that RPC independent of the bridge mutex.
+type sessionStatus struct {
+	extensionVersion string
+	connected        bool
+	pending          int
+	denied           int
+}
+
+func (a *sessionArbitration) publishStatus() {
+	next := sessionStatus{
+		extensionVersion: a.holderVersion(),
+		connected:        a.holder != nil,
+		pending:          len(a.pending),
+		denied:           a.deniedHellos,
+	}
+	if previous := a.status.Load(); previous != nil && *previous == next {
+		return
+	}
+	snapshot := new(sessionStatus)
+	*snapshot = next
+	a.status.Store(snapshot)
 }
 
 type arbitrationTransition struct {
@@ -98,6 +124,7 @@ func (a *sessionArbitration) holderVersion() string {
 }
 
 func (a *sessionArbitration) hello(session *browserSession, now time.Time, refreshGeneration bool) helloDecision {
+	defer a.publishStatus()
 	holderAlive := a.holder != nil && now.Sub(a.holder.LastSyncAt) <= sessionStaleAfter
 	sameSession := a.isHolder(session.ID)
 	legacyInvolved := session.ID == legacySessionID || (a.holder != nil && a.holder.ID == legacySessionID)
@@ -203,6 +230,7 @@ func (a *sessionArbitration) claim(prefix string) (string, arbitrationTransition
 }
 
 func (a *sessionArbitration) promote(session *browserSession, dropPrevious bool) arbitrationTransition {
+	defer a.publishStatus()
 	previous := a.holder
 	if previous != nil && previous.ID != session.ID {
 		previous.demotedNotice = !dropPrevious
@@ -233,6 +261,7 @@ func (a *sessionArbitration) promote(session *browserSession, dropPrevious bool)
 }
 
 func (a *sessionArbitration) release(sessionID string) (*browserSession, bool) {
+	defer a.publishStatus()
 	delete(a.pending, sessionID)
 	if !a.isHolder(sessionID) {
 		return nil, false
@@ -310,6 +339,7 @@ func (a *sessionArbitration) clearReloadReservation() {
 }
 
 func (a *sessionArbitration) prune(now time.Time) {
+	defer a.publishStatus()
 	for id, session := range a.pending {
 		if now.Sub(session.LastSyncAt) > pendingExpireAfter {
 			delete(a.pending, id)

@@ -9,9 +9,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
@@ -137,6 +140,76 @@ func TestCheckAdoptionRootMissingDirIsHealthy(t *testing.T) {
 	}
 	if c := checks[0]; c.Name != "adoption_root" || c.Status != Pass || !strings.Contains(c.Detail, root) {
 		t.Fatalf("check = %#v, want a Pass adoption_root check for the absent %q", c, root)
+	}
+}
+
+func TestRepeatedAdoptionTimeoutsKeepOneProbePerRoot(t *testing.T) {
+	adoptionHome(t)
+	cfg := config.Config{
+		DataDir: t.TempDir(),
+		Browser: config.Browser{AdoptionRoot: filepath.Join(t.TempDir(), config.AdoptionDirName)},
+	}
+	previousDeadline := browser.AdoptionScanDeadline
+	browser.AdoptionScanDeadline = 100 * time.Millisecond
+	original := adoptionRootReadDir
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var workers sync.WaitGroup
+	var rootCalls, legacyCalls, outstanding atomic.Int32
+	fixture := t.TempDir()
+	adoptionRootReadDir = func(path string) ([]os.DirEntry, error) {
+		workers.Add(1)
+		defer workers.Done()
+		outstanding.Add(1)
+		defer outstanding.Add(-1)
+		if path == cfg.EffectiveAdoptionRoot() {
+			rootCalls.Add(1)
+		} else if path == cfg.LegacyAdoptionRoot() {
+			legacyCalls.Add(1)
+		} else {
+			return nil, fmt.Errorf("unexpected adoption path %q", path)
+		}
+		<-release
+		return os.ReadDir(fixture)
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		workers.Wait()
+		adoptionRootReadDir = original
+		browser.AdoptionScanDeadline = previousDeadline
+	})
+	for i := range 5 {
+		checks := collectChecks(t, func(add func(string, string, string, string)) {
+			checkAdoptionRoot(cfg, add)
+			checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
+		})
+		if len(checks) != 1 || checks[0].Name != "adoption_root" || checks[0].Status != Fail ||
+			!strings.Contains(checks[0].Remediation, "System Settings") {
+			t.Fatalf("doctor attempt %d = %+v, want the folder health failure and grant steps", i, checks)
+		}
+		if rootCalls.Load() != 1 || legacyCalls.Load() != 1 || outstanding.Load() != 2 {
+			t.Fatalf("doctor attempt %d: root=%d legacy=%d outstanding=%d, want one blocked operation per root",
+				i, rootCalls.Load(), legacyCalls.Load(), outstanding.Load())
+		}
+	}
+
+	// Once the actual syscalls return, a later doctor run must retry rather
+	// than preserving a timeout forever.
+	releaseOnce.Do(func() { close(release) })
+	workers.Wait()
+	deadline := time.Now().Add(time.Second)
+	for {
+		checks := collectChecks(t, func(add func(string, string, string, string)) { checkAdoptionRoot(cfg, add) })
+		if len(checks) == 1 && checks[0].Status != Fail {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("doctor did not recover after the directory listing returned: %+v", checks)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if rootCalls.Load() < 2 {
+		t.Fatal("doctor reported recovery without probing the root again")
 	}
 }
 
@@ -377,4 +450,80 @@ func TestCheckLegacyAdoptionRootCancelledJobNeverDrains(t *testing.T) {
 	if !strings.Contains(c.Remediation, "Acquire this page") {
 		t.Fatalf("remediation = %q, want the re-acquire recovery path", c.Remediation)
 	}
+
+	t.Run("blocked listing stays bounded and single flight", func(t *testing.T) {
+		previousDeadline := browser.AdoptionScanDeadline
+		browser.AdoptionScanDeadline = 100 * time.Millisecond
+		original := adoptionRootReadDir
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		var workers sync.WaitGroup
+		var calls, outstanding atomic.Int32
+		landing := filepath.Join(legacy, jobID)
+		adoptionRootReadDir = func(path string) ([]os.DirEntry, error) {
+			if path != landing {
+				return os.ReadDir(path)
+			}
+			workers.Add(1)
+			defer workers.Done()
+			calls.Add(1)
+			outstanding.Add(1)
+			defer outstanding.Add(-1)
+			<-release
+			return os.ReadDir(path)
+		}
+		t.Cleanup(func() {
+			releaseOnce.Do(func() { close(release) })
+			workers.Wait()
+			adoptionRootReadDir = original
+			browser.AdoptionScanDeadline = previousDeadline
+		})
+		for i := range 5 {
+			answer := make(chan []Check, 1)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				var checks []Check
+				checkLegacyAdoptionRoot(ctx, cfg, db, func(name, status, detail, remediation string) {
+					checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
+				})
+				answer <- checks
+			}()
+			select {
+			case checks := <-answer:
+				if len(checks) != 1 || checks[0].Name != "adoption_root_legacy" || checks[0].Status != Warn ||
+					!strings.Contains(checks[0].Detail, legacy) {
+					t.Fatalf("doctor attempt %d lost the legacy-folder warning: %+v", i, checks)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("a blocked legacy landing listing hung doctor")
+			}
+			if calls.Load() != 1 || outstanding.Load() != 1 {
+				t.Fatalf("doctor attempt %d: calls=%d outstanding=%d, want one blocked legacy listing",
+					i, calls.Load(), outstanding.Load())
+			}
+		}
+
+		releaseOnce.Do(func() { close(release) })
+		workers.Wait()
+		deadline := time.Now().Add(time.Second)
+		for {
+			checks := collectChecks(t, func(add func(string, string, string, string)) {
+				checkLegacyAdoptionRoot(ctx, cfg, db, add)
+			})
+			if len(checks) == 1 && strings.Contains(checks[0].Detail, "will not drain on its own") {
+				if !strings.Contains(checks[0].Detail, title) || !strings.Contains(checks[0].Remediation, "Send PDF to papio") {
+					t.Fatalf("recovered legacy listing lost the paper or its recovery steps: %+v", checks[0])
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("doctor did not recover after the legacy listing returned: %+v", checks)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if calls.Load() < 2 || outstanding.Load() != 0 {
+			t.Fatalf("recovered legacy listings: calls=%d outstanding=%d", calls.Load(), outstanding.Load())
+		}
+	})
 }
