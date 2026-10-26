@@ -3344,8 +3344,7 @@ func TestRefileJobRejectsConcurrentRun(t *testing.T) {
 	case <-time.After(time.Second):
 		unblock()
 		err := <-second
-		<-first
-		t.Fatalf("second refile waited instead of returning conflict: %v", err)
+		t.Fatalf("second refile waited instead of returning conflict: %v (first refile: %v)", err, <-first)
 	}
 	unblock()
 	if err := <-first; err != nil {
