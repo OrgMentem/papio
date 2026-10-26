@@ -654,7 +654,8 @@ func (s *Service) reuseAcceptedReview(ctx context.Context, row *job.Row) (bool, 
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateValidating,
 		map[string]any{"reason": "review_accepted_reuse", "candidate_id": stored.ID, "source": stored.Source},
 		job.WithCandidate(stored.ID)); err != nil {
-		return false, err
+		err = s.settleFetchConflict(ctx, row.ID, 0, err)
+		return err == nil, err
 	}
 	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
 	if err != nil {
@@ -1048,11 +1049,20 @@ func (s *Service) rederivableLandingSeeds(ctx context.Context, row *job.Row, liv
 			continue
 		}
 		id, err := s.Jobs.CandidateIDByKey(ctx, row.ID, derivedKey)
-		if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			continue // row is gone; nothing to revive
 		}
+		if err != nil {
+			return nil, nil, err
+		}
 		derived, err := s.Jobs.GetCandidate(ctx, id)
-		if err != nil || (derived.Status != "pending" && derived.Status != "retryable") {
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if derived.Status != "pending" && derived.Status != "retryable" {
 			continue // already acquired, invalid, or skipped: settled, not our concern
 		}
 		pendingDerived[derivedKey] = true
@@ -1787,10 +1797,36 @@ func (s *Service) settleCancelledAttempt(ctx context.Context, attempt int64, out
 	}
 }
 
+// A concurrent cancellation wins over a fetch-phase transition, including
+// exhaustion and parking. Other conflicts and store failures remain errors.
+func (s *Service) settleFetchConflict(ctx context.Context, jobID string, attempt int64, err error) error {
+	if !errors.Is(err, job.ErrConflict) {
+		return err
+	}
+	current, readErr := s.Jobs.Get(ctx, jobID)
+	if readErr != nil {
+		return readErr
+	}
+	if !job.Terminal(current.State) {
+		return err
+	}
+	if attempt != 0 {
+		return s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "cancelled", 0, "job_cancelled")
+	}
+	return nil
+}
+
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) (err error) {
+	var lastAttempt int64
 	var deferredReview *conclusiveIdentityReview
 	defer func() {
+		conflict := errors.Is(err, job.ErrConflict)
+		err = s.settleFetchConflict(ctx, row.ID, lastAttempt, err)
 		if deferredReview == nil {
+			return
+		}
+		if conflict && err == nil {
+			err = s.discardDeferredIdentityReview(context.WithoutCancel(ctx), deferredReview)
 			return
 		}
 		materializeErr := s.materializeDeferredIdentityReview(context.WithoutCancel(ctx), row.ID, deferredReview)
@@ -1828,7 +1864,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	// a permanent failure would have left, so the OA recovery routes survive
 	// the skip. It makes no retryPlan observation.
 	recordSuppressedSkip := func(attempt int64, stored *job.Candidate, candidate resolver.Candidate, host string) error {
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "suppressed", 0, suppressedDetail(candidate.URL, host))
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "suppressed", 0, suppressedDetail(candidate.URL, host)); err != nil {
+			return err
+		}
 		skips.add(host)
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 			return err
@@ -1937,7 +1975,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				continue
 			}
 			// A prior bearer URL survived only in redacted form; never reconstruct it.
-			_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+			if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
+				return err
+			}
 			continue
 		}
 		if !candidate.Direct {
@@ -1965,7 +2005,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 					return err
 				}
 			}
-			_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+			if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
+				return err
+			}
 			continue
 		}
 		// Host suppression (ADR-0031) sits before ReserveCost and
@@ -1990,6 +2032,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			if err != nil {
 				return err
 			}
+			lastAttempt = attempt
 			if err := recordSuppressedSkip(attempt, stored, candidate, verdict.host); err != nil {
 				return err
 			}
@@ -2000,7 +2043,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			// A refusal before any request spends no probe: hand it back.
 			s.releaseUnspentProbe(verdict, passProbes)
 			if errors.As(err, &exceeded) {
-				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
+					return err
+				}
 				continue
 			}
 			return err
@@ -2052,6 +2097,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			s.releaseUnspentProbe(verdict, passProbes)
 			return err
 		}
+		lastAttempt = attempt
 		qdir, err := s.Artifacts.QuarantineDir(row.ID)
 		if err != nil {
 			s.releaseUnspentProbe(verdict, passProbes)
@@ -2101,7 +2147,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 					probed = pass.probed
 				}
 				detail := withProbeMarker(fetchAttemptDetail(err, candidate.URL), probed)
-				_ = s.Jobs.FinishAttempt(ctx, attempt, fetch.ClassRetryable, 0, detail)
+				if err := s.Jobs.FinishAttempt(ctx, attempt, fetch.ClassRetryable, 0, detail); err != nil {
+					return err
+				}
 				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
 					return err
 				}
@@ -2110,7 +2158,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			}
 			class, status, delay := fetchFailure(err)
 			detail := withProbeMarker(fetchAttemptDetail(err, candidate.URL), probed)
-			_ = s.Jobs.FinishAttempt(ctx, attempt, class, status, detail)
+			if err := s.Jobs.FinishAttempt(ctx, attempt, class, status, detail); err != nil {
+				return err
+			}
 			s.observeFetchAttempt(ctx, class, detail)
 			s.observeRateLimit(ctx, err)
 			if oaBrowserURL == "" && isOABrowserBlocked(candidate, err) {
@@ -2125,15 +2175,21 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			}
 			switch class {
 			case fetch.ClassRetryable:
-				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
+					return err
+				}
 				sourceRetry := plan.observeCandidateTemporary(s.Now(), delay, s.RetryDelay)
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, stored.Source, policy, sourceRetry)
 				}
 			case fetch.ClassBlocked:
-				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
+					return err
+				}
 			default:
-				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "invalid"); err != nil {
+					return err
+				}
 				// The candidate is dead, but its own landing page (Landing on
 				// this live candidate, LandingRedacted on the persisted row) may
 				// still advertise a working PDF via citation_pdf_url — worth a
@@ -2156,7 +2212,10 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			result.TempPath = temp
 		}
 		successDetail := withProbeMarker(fmt.Sprintf("bytes=%d mime=%s host=%s", result.SizeBytes, result.SniffedMIME, result.FinalHost), probed)
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", result.HTTPStatus, successDetail)
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "success", result.HTTPStatus, successDetail); err != nil {
+			_ = os.Remove(result.TempPath)
+			return err
+		}
 		s.observeFetchAttempt(ctx, "success", successDetail)
 		if err := s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateValidating,
 			map[string]any{"candidate_id": stored.ID, "source": stored.Source}, job.WithCandidate(stored.ID)); err != nil {
