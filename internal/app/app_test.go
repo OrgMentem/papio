@@ -4054,6 +4054,187 @@ func TestDrainHooksCancelsManualRefileAndRecordsOutcome(t *testing.T) {
 	}
 }
 
+// An admitted automatic run must already be registered when DrainHooks starts:
+// the old beginReadyHook admitted under hookMu but registered with hookWG
+// after the unlock, so a drain could observe a zero counter and return true
+// while the admitted hook still ran. Admitting directly (no hook body runs)
+// isolates the contract: the admission alone must hold the drain, and only
+// the paired release lets it go. On the old code the drain returns true
+// immediately because nothing registered the admission.
+func TestDrainHooksWaitsForAdmittedHook(t *testing.T) {
+	svc, _ := newTestService(t)
+	const id = "job_hook_admit_drain"
+	if !svc.beginReadyHook(id) {
+		t.Fatal("beginReadyHook refused the first admission")
+	}
+	if svc.DrainHooks(100 * time.Millisecond) {
+		t.Fatal("drain returned true for an admitted but unreleased hook")
+	}
+	svc.endReadyHook(id)
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("drain did not observe the released admission")
+	}
+}
+
+// Shutdown closes admission before it drains: after CloseHookAdmission no new
+// filing run may start, while an admission from before the close still holds
+// the drain until it is released. On the old Close (drain before cancel, no
+// admission close) a run admitted in that gap could outlive the store close.
+func TestCloseHookAdmissionStopsNewRunsButDrainsInflight(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	if !svc.beginReadyHook("job_hook_closing_inflight") {
+		t.Fatal("beginReadyHook refused the first admission")
+	}
+	svc.CloseHookAdmission()
+	svc.CloseHookAdmission()
+	if svc.beginReadyHook("job_hook_closing_new") {
+		t.Fatal("beginReadyHook admitted after admission closed")
+	}
+	if svc.DrainHooks(100 * time.Millisecond) {
+		t.Fatal("drain returned true while a pre-close admission still ran")
+	}
+	svc.endReadyHook("job_hook_closing_inflight")
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("drain did not observe the released pre-close admission")
+	}
+	id := createFilingStateJob(t, jobs, "wr_hook_closing_refile", job.StateReady)
+	svc.ReadyHook = &hook.Runner{Command: "configured"}
+	_, err := svc.RefileJob(ctx, id)
+	if !errors.Is(err, job.ErrConflict) || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("refile after admission closed = %v, want a shutting-down conflict", err)
+	}
+}
+
+// A crashed daemon leaves hook.filing_reserved events whose deferred releases
+// never run. Startup recovery must close every dead owner's reservation
+// before Archive can use the job again, and mark each release as
+// stale_after_restart instead of a normal completion — while a reservation
+// owned by a live process keeps its fence. Job A carries three dead
+// reservations (a dead pid with a foreign token, this pid with a foreign
+// token for pid reuse after death, and an old unattested legacy row); job B
+// carries this process's own reservation plus a fresh legacy row, both of
+// which recovery must not touch: the first names a live owner, the second is
+// newer than any possible run. On the old code nothing releases job A and
+// the final Archive stays conflicted.
+func TestStartupRecoveryReleasesOrphanedFilingReservation(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	// The age gate needs a bounded hook runtime; the timeout plus the pipe
+	// wait plus margin bounds every possible run.
+	svc.ReadyHook = &hook.Runner{Command: "configured", Timeout: time.Minute}
+	id := createFilingStateJob(t, jobs, "wr_hook_orphan", job.StateResolving)
+	sha := seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\norphan\n%%EOF")
+	artifactPath, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: 5000, MIME: "application/pdf",
+		IdentityResult: "pass", Path: artifactPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil, job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	dead := map[string]any{"reservation_id": "hook_orphan_dead", "owner_pid": 999999999, "owner_token": "hook_dead"}
+	reused := map[string]any{"reservation_id": "hook_orphan_reused", "owner_pid": os.Getpid(), "owner_token": "hook_dead"}
+	legacy := map[string]any{"reservation_id": "hook_orphan_legacy"}
+	for _, detail := range []map[string]any{dead, reused, legacy} {
+		if err := jobs.RecordEvent(ctx, id, "hook.filing_reserved", detail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The legacy row predates its writer's death by far: backdate it past
+	// the bound (timeout + pipe wait + margin) so the age gate releases it.
+	oldAt := store.FormatTime(time.Now().Add(-10 * time.Minute))
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE events SET at = ? WHERE job_id = ? AND kind = 'hook.filing_reserved' AND json_extract(detail_json, '$.reservation_id') = 'hook_orphan_legacy'`, oldAt, id); err != nil {
+		t.Fatal(err)
+	}
+	liveID := createFilingStateJob(t, jobs, "wr_hook_live_owner", job.StateReady)
+	live := map[string]any{"reservation_id": "hook_live", "owner_pid": os.Getpid(), "owner_token": hookProcessToken()}
+	freshLegacy := map[string]any{"reservation_id": "hook_live_legacy"}
+	for _, detail := range []map[string]any{live, freshLegacy} {
+		if err := jobs.RecordEvent(ctx, liveID, "hook.filing_reserved", detail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := jobs.Archive(ctx, id, true); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("archive during unrecovered reservations = %v, want conflict", err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, reservation := range []string{"hook_orphan_dead", "hook_orphan_reused", "hook_orphan_legacy"} {
+		var reason string
+		err := jobs.S.DB().QueryRowContext(ctx, `
+			SELECT COALESCE(json_extract(detail_json, '$.reason'), '')
+			FROM events WHERE job_id = ? AND kind = 'hook.filing_released'
+			AND json_extract(detail_json, '$.reservation_id') = ?
+			ORDER BY seq DESC LIMIT 1`, id, reservation).Scan(&reason)
+		if err != nil {
+			t.Fatalf("recovery left no filing_released event for %s: %v", reservation, err)
+		}
+		if reason != "stale_after_restart" {
+			t.Fatalf("recovery release for %s = reason %q, want stale_after_restart", reservation, reason)
+		}
+	}
+	var liveReleases int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'hook.filing_released'`, liveID).Scan(&liveReleases); err != nil {
+		t.Fatal(err)
+	}
+	if liveReleases != 0 {
+		t.Fatalf("recovery released a live reservation %d times; job B holds this process's own plus a fresh legacy row", liveReleases)
+	}
+	result, err := jobs.Archive(ctx, id, true)
+	if err != nil {
+		t.Fatalf("archive after recovery = %v", err)
+	}
+	if result.Disposition != job.DispositionArchived {
+		t.Fatalf("archive disposition = %q, want archived", result.Disposition)
+	}
+}
+
+// An end-to-end handoff: the real runner exits 0 while a background sleep
+// still holds the pipes past the 3 s WaitDelay, so runShell sees
+// exec.ErrWaitDelay and records ok (not failed). The refile then succeeds
+// and the fence closes normally. sleep 5 keeps the child past WaitDelay
+// with only ~2 s of linger after the run returns.
+func TestRefileHandoffHookRecordsOk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("background handoff uses POSIX shell semantics")
+	}
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_hook_handoff_refile", job.StateReady)
+	seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\nhandoff\n%%EOF")
+	svc.ReadyHook = &hook.Runner{Command: `sleep 5 & exit 0`, Timeout: 10 * time.Second}
+	result, err := svc.RefileJob(ctx, id)
+	if err != nil || result.Status != "ok" || result.ExitCode != 0 {
+		t.Fatalf("handoff refile = %+v, %v", result, err)
+	}
+	if err := svc.refuseFiledPaper(ctx, id); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("refile guard after a handoff ok = %v, want conflict", err)
+	}
+	rows, _, err := svc.UnfiledJobs(ctx, UnfiledFailed, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.JobID == id {
+			t.Fatalf("handed-off job listed as unfiled failed: %+v", row)
+		}
+	}
+	var released int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'hook.filing_released'`, id).Scan(&released); err != nil {
+		t.Fatal(err)
+	}
+	if released != 1 {
+		t.Fatalf("filing releases = %d, want 1", released)
+	}
+}
+
 // seedReadyArtifact stores real artifact bytes and binds their digest to the
 // job. Ready-hook recovery only dispatches for an artifact it can verify, so a
 // bare sha256 column would leave nothing to file.

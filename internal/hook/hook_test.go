@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -11,6 +12,51 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// classifyWaitResult pins the wait-error mapping: it passes exit codes
+// through and keeps every error it is given. The background-handoff rule
+// (WaitDelay after a zero exit maps to nil before reaching the classifier)
+// lives in runShell, which sees the live *exec.Cmd;
+// TestBackgroundHandoffAfterExitZeroIsSuccess covers it with a real child.
+// The nonzero case needs a real *exec.ExitError: only the os/exec type
+// carries the exit code errors.As unwraps, so the test runs one tiny shell.
+func TestClassifyWaitResultMapsExitErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test")
+	}
+	if got := classifyWaitResult(nil); got.Err != nil || got.ExitCode != 0 {
+		t.Fatalf("clean zero exit = %+v, want exit 0 nil Err", got)
+	}
+	if got := classifyWaitResult(errWaitDelayStub{}); got.Err == nil || got.ExitCode != -1 {
+		t.Fatalf("wait delay reaching the classifier = %+v, want exit -1 with Err", got)
+	}
+	failed := exitThree(t)
+	if got := classifyWaitResult(failed); got.ExitCode != 3 || got.Err == nil {
+		t.Fatalf("nonzero exit = %+v, want exit 3 with Err", got)
+	}
+}
+
+// exitThree runs one tiny shell for its real *exec.ExitError carrying exit
+// code 3. A stub cannot stand in here: errors.As only unwraps the code from
+// the os/exec type itself.
+func exitThree(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("sh", "-c", "exit 3").Run()
+	if err == nil {
+		t.Fatal("exit 3 ran clean")
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("shell error = %#v, want *exec.ExitError with exit 3", err)
+	}
+	return err
+}
+
+// errWaitDelayStub stands in for exec.ErrWaitDelay so the mapping above needs
+// no subprocess.
+type errWaitDelayStub struct{}
+
+func (errWaitDelayStub) Error() string { return "exec: WaitDelay expired before I/O complete" }
 
 func TestEmptyCommandDoesNotRun(t *testing.T) {
 	r := &Runner{Command: "   "}
