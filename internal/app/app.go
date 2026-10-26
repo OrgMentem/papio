@@ -172,7 +172,9 @@ type Service struct {
 	// ManagedFilingFolder enables the replay-safe folder destination.
 	ManagedFilingFolder string
 	// hookWG tracks automatic and manual on_ready runs so shutdown can drain
-	// them before the store closes (DrainHooks).
+	// them before the store closes (DrainHooks). Only beginReadyHook registers
+	// (under hookMu) and only endReadyHook releases, so admission and
+	// registration are one atomic step.
 	hookWG sync.WaitGroup
 	// hookMu protects hookInFlight, which admits at most one automatic or
 	// manual filing run per job.
@@ -4811,12 +4813,19 @@ func (s *Service) hasPublicationEdgeFresh(ctx context.Context, publication job.P
 // affected job can resume normal processing. A published destination is
 // re-verified. A surviving quarantine file takes the idempotent promotion
 // path. Only an absent destination and quarantine lets the journal discard its
-// owner row.
+// owner row. Hook filing reservations are also durable: a kill between the
+// reserve and its deferred release leaves an orphan whose writer can never
+// run again, so they are released here. No hook can be in flight during
+// startup recovery (daemons recover before admitting work), so any
+// reservation without its release belongs to a dead instance.
 func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	if err := s.Jobs.SweepOrphanComponentStages(ctx); err != nil {
 		return err
 	}
 	if err := s.reconcilePreparedPublications(ctx, ""); err != nil {
+		return err
+	}
+	if err := s.releaseOrphanHookReservations(ctx); err != nil {
 		return err
 	}
 	// Managed filing is deliberately absent: its destination is optional
@@ -4846,6 +4855,114 @@ func (r *PreparedPublicationRecovery) RunDue(ctx context.Context) error {
 		return nil
 	}
 	return r.svc.reconcilePreparedPublications(ctx, "")
+}
+
+// hookOrphanAgeMargin pads the age gate on unattested and possibly-reused
+// reservations. A hook run cannot outlive its Timeout plus the pipe wait, so
+// a reservation older than that bound plus this margin belongs to no live
+// run; the margin absorbs scheduling slop and clock adjustments, not runtime.
+const hookOrphanAgeMargin = time.Minute
+
+// releaseOrphanHookReservations closes hook.filing_reserved events whose
+// writer died between the reserve and its deferred release. Each orphan gets
+// its hook.filing_released under the same reservation_id, so the Archive
+// fence clears while the events still record what happened: reason
+// stale_after_restart marks the recovery instead of a hook that ran to
+// completion. An unmatched reservation alone proves nothing — the daemon
+// serves IPC before scheduler recovery runs, so a concurrent refile may
+// reserve first, and an in-process MCP server never takes the daemon lock.
+//
+// Released (owner provably gone):
+//   - another pid with no live process behind it;
+//   - this process's pid with another token (pid reuse after the owner died);
+//   - an unattested legacy row older than any possible run (an older binary
+//     can still hold a fresh one live, so fresh legacy rows are kept);
+//   - a reservation whose owner pid is alive but whose age exceeds any
+//     possible run (the pid must have been reused by an unrelated process,
+//     which would otherwise fence the job forever).
+//
+// Kept (a live holder may still release it itself):
+//   - this process's token (e.g. a refile racing startup recovery);
+//   - another live pid with a fresh reservation;
+//   - an unattested legacy row newer than the age bound.
+func (s *Service) releaseOrphanHookReservations(ctx context.Context) error {
+	rows, err := s.Jobs.S.DB().QueryContext(ctx, `
+		SELECT job_id,
+		       COALESCE(json_extract(detail_json, '$.reservation_id'), ''),
+		       CAST(COALESCE(json_extract(detail_json, '$.owner_pid'), 0) AS INTEGER),
+		       COALESCE(json_extract(detail_json, '$.owner_token'), ''),
+		       at
+		FROM events
+		WHERE kind = 'hook.filing_reserved'
+		  AND COALESCE(json_extract(detail_json, '$.reservation_id'), '') <> ''
+		  AND NOT EXISTS (
+			SELECT 1 FROM events released
+			WHERE released.job_id = events.job_id
+			  AND released.kind = 'hook.filing_released'
+			  AND COALESCE(json_extract(released.detail_json, '$.reservation_id'), '') =
+				COALESCE(json_extract(events.detail_json, '$.reservation_id'), '')
+		)`)
+	if err != nil {
+		return err
+	}
+	type orphan struct {
+		jobID, reservation, token, at string
+		pid                           int
+	}
+	var orphans []orphan
+	for rows.Next() {
+		var o orphan
+		var pid int64
+		if err := rows.Scan(&o.jobID, &o.reservation, &pid, &o.token, &o.at); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		o.pid = int(pid)
+		orphans = append(orphans, o)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// A run ends no later than its Timeout plus the pipe wait WaitDelay
+	// imposes after the leader exits. Without a positive Timeout there is no
+	// bound, so the age paths stay closed and only provably-dead owners are
+	// released.
+	var cutoff string
+	bounded := false
+	if s.ReadyHook != nil && s.ReadyHook.Timeout > 0 {
+		cutoff = store.FormatTime(time.Now().Add(-(s.ReadyHook.Timeout + hook.PipeWaitDelay + hookOrphanAgeMargin)))
+		bounded = true
+	}
+	mine := hookProcessToken()
+	for _, o := range orphans {
+		switch {
+		case o.token == mine:
+			// A live holder in this process (e.g. a refile racing startup).
+			continue
+		case o.token == "" || (o.pid != os.Getpid() && hookOwnerAlive(o.pid)):
+			// Unattested legacy rows predate owner attestation — an older
+			// binary can still hold a fresh one live — and a live pid on an
+			// old reservation means pid reuse by an unrelated process.
+			// Both release only past the age no live run can exceed.
+			if !bounded || o.at >= cutoff {
+				continue
+			}
+		case o.pid == os.Getpid():
+			// Same pid, another token: pid reuse after the owner died.
+		default:
+			// No live process has the owner's pid.
+		}
+		if err := s.Jobs.RecordEvent(ctx, o.jobID, "hook.filing_released", map[string]any{
+			"reservation_id": o.reservation,
+			"reason":         "stale_after_restart",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removeQuarantineBytes removes bytes only when no remaining publication owns
@@ -5439,9 +5556,7 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		return
 	}
 	execCtx := s.readyHookContext()
-	s.hookWG.Add(1)
 	go func() {
-		defer s.hookWG.Done()
 		defer s.endReadyHook(row.ID)
 		_, _ = s.executeReadyHook(execCtx, row, sha, "ready")
 	}()
@@ -5634,10 +5749,11 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 		return RefileResult{}, err
 	}
 	if !s.beginReadyHook(row.ID) {
+		if s.hookAdmissionClosed() {
+			return RefileResult{}, fmt.Errorf("daemon is shutting down; filing hook not started for %s: %w", row.ID, job.ErrConflict)
+		}
 		return RefileResult{}, fmt.Errorf("a filing hook is already running for %s; wait for it to finish: %w", row.ID, job.ErrConflict)
 	}
-	s.hookWG.Add(1)
-	defer s.hookWG.Done()
 	defer s.endReadyHook(row.ID)
 	if err := s.refuseFiledPaper(ctx, row.ID); err != nil {
 		return RefileResult{}, err
@@ -5651,6 +5767,18 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	return s.executeReadyHook(execCtx, row, row.ArtifactSHA256, "manual")
 }
 
+// hookProcessToken is this process's hook reservation owner identity. It is
+// process-wide (not per Service) so two Services in one process, and a
+// recovery pass in the process that reserved, always recognise their own
+// reservations as live. A daemon, an MCP server, and a CLI refile each run
+// in their own process and so attest different tokens.
+var hookProcessToken = sync.OnceValue(func() string { return job.NewID("hookowner") })
+
+// beginReadyHook admits one filing run for jobID. The closing check, the
+// in-flight insert, and the hookWG registration are one atomic step under
+// hookMu, so a DrainHooks that starts after admission returns always observes
+// the admitted run: admitting first and registering after the unlock let a
+// drain observe a zero counter while the admitted hook still runs.
 func (s *Service) beginReadyHook(jobID string) bool {
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
@@ -5664,13 +5792,17 @@ func (s *Service) beginReadyHook(jobID string) bool {
 		return false
 	}
 	s.hookInFlight[jobID] = struct{}{}
+	s.hookWG.Add(1)
 	return true
 }
 
+// endReadyHook releases one admission from beginReadyHook, pairing its hookWG
+// registration under the same lock.
 func (s *Service) endReadyHook(jobID string) {
 	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
 	delete(s.hookInFlight, jobID)
-	s.hookMu.Unlock()
+	s.hookWG.Done()
 }
 
 func (s *Service) readyHookContext() context.Context {
@@ -5680,6 +5812,25 @@ func (s *Service) readyHookContext() context.Context {
 		s.hookCtx, s.hookCancel = context.WithCancel(context.Background())
 	}
 	return s.hookCtx
+}
+
+// hookAdmissionClosed reports whether CloseHookAdmission (or CancelHooks) has
+// refused all future filing runs.
+func (s *Service) hookAdmissionClosed() bool {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.hooksClosing
+}
+
+// CloseHookAdmission refuses every future filing run without stopping the
+// ones already admitted. Shutdown calls it before the first DrainHooks so a
+// hook admitted after a zero-count drain cannot outlive the store close;
+// CancelHooks keeps setting the same flag for callers that cancel without a
+// prior close. Closing twice is safe.
+func (s *Service) CloseHookAdmission() {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.hooksClosing = true
 }
 
 // CancelHooks stops active hook commands and prevents new hook runs. Their
@@ -5698,13 +5849,17 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 	eventCtx := context.WithoutCancel(ctx)
 	out := RefileResult{JobID: row.ID, ExitCode: -1}
 	// Reserve against Archive in one SQLite statement before any external
-	// execution. A process crash leaves the reservation unresolved, fail-closed.
+	// execution. The reservation attests its owner (this process's pid and
+	// token) so startup recovery can tell a live owner's reservation from a
+	// dead one's: a kill before the deferred release leaves an orphan that
+	// recovery closes, while a concurrent live holder keeps its fence.
+	// Until either release lands the Archive fence stays closed, fail-closed.
 	reservation := job.NewID("hook")
 	reserved, err := s.Jobs.S.DB().ExecContext(eventCtx, `
 		INSERT INTO events(job_id, at, kind, detail_json)
-		SELECT id, ?, 'hook.filing_reserved', json_object('reservation_id', ?)
+		SELECT id, ?, 'hook.filing_reserved', json_object('reservation_id', ?, 'owner_pid', ?, 'owner_token', ?)
 		FROM jobs WHERE id = ? AND acquisition_disposition = 'active'`,
-		store.Now(), reservation, row.ID)
+		store.Now(), reservation, os.Getpid(), hookProcessToken(), row.ID)
 	if err != nil {
 		return out, err
 	}
@@ -5754,6 +5909,9 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 	out.DurationMS = result.Duration.Milliseconds()
 	switch {
 	case result.Err == nil && result.ExitCode == 0:
+		// A zero exit with nil Err is a success, including the supported
+		// background handoff: runShell maps exec.ErrWaitDelay after a zero
+		// exit to success because the leader already exited 0.
 		out.Status = "ok"
 	case errors.Is(result.Err, context.DeadlineExceeded):
 		out.Status = "timeout"
@@ -5849,9 +6007,12 @@ func (s *Service) UnfiledJobs(ctx context.Context, filter UnfiledFilter, limit i
 }
 
 // DrainHooks waits up to timeout for launched on_ready hooks to finish and
-// record their events. Shutdown calls it before the store closes so a hook
-// outcome insert does not race the SQLite connection teardown; hooks that
-// outlive the timeout are abandoned (their own deadline still bounds them).
+// record their events. Registration happens inside beginReadyHook under hookMu,
+// so any return from beginReadyHook is already visible to this wait: an
+// admitted hook can never hide in the gap between admission and registration.
+// Shutdown calls it before the store closes so a hook outcome insert does not
+// race the SQLite connection teardown; hooks that outlive the timeout are
+// abandoned (their own deadline still bounds them).
 func (s *Service) DrainHooks(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {

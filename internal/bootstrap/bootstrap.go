@@ -723,6 +723,10 @@ func (s *System) Close() error {
 	}
 	var hookErr error
 	if s.App != nil {
+		// Refuse new admissions before the first drain: a hook admitted
+		// after a zero-count drain but before cancel would otherwise
+		// outlive the store close below.
+		s.App.CloseHookAdmission()
 		grace := time.Duration(s.Config.Hooks.TimeoutSeconds) * time.Second
 		if grace <= 0 || grace > hookShutdownGraceCap {
 			grace = hookShutdownGraceCap

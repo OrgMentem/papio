@@ -22,6 +22,12 @@ import (
 // stderrTailLimit bounds how much captured stderr survives into Result.
 const stderrTailLimit = 500
 
+// PipeWaitDelay bounds how long Run waits for output pipes a background
+// descendant still holds after the leader exits. A hook run therefore ends
+// no later than its Timeout plus this delay, which lets startup recovery
+// age-gate reservations no live run can still hold.
+const PipeWaitDelay = 3 * time.Second
+
 // Runner executes one configured shell command line.
 type Runner struct {
 	// Command is the shell command line; empty disables the runner.
@@ -38,7 +44,8 @@ type Result struct {
 	// Ran is false when the runner is disabled (empty Command).
 	Ran bool
 	// ExitCode is the command's exit status; -1 when it failed to start
-	// or was killed by the deadline.
+	// or was killed by the deadline. A background handoff that exits 0 but
+	// still holds the output pipes past WaitDelay reports 0 with a nil Err.
 	ExitCode int
 	Err      error
 	Duration time.Duration
@@ -83,7 +90,7 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 	cmd.Stderr = stderr
 	// WaitDelay only bounds papio's wait on the pipes if a descendant escaped
 	// the confinement RunConfined applies; it never ends one.
-	cmd.WaitDelay = 3 * time.Second
+	cmd.WaitDelay = PipeWaitDelay
 
 	start := time.Now()
 	err := RunConfined(cmd)
@@ -92,21 +99,42 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 		Duration:   time.Since(start),
 		StderrTail: capUTF8(stderr.String(), stderrTailLimit),
 	}
+	exitedZero := err == nil || (cmd.ProcessState != nil && cmd.ProcessState.Success())
+	// A WaitDelay after a zero exit (the leader handed work to a background
+	// child that still holds the pipes) is a success: the leader already
+	// exited 0, so the pipes Wait closed under the child carry no failure.
+	// The ctx.Err check stays first — a timed-out or cancelled context still
+	// reports its own error even if the pipes also hit WaitDelay — and the
+	// old default (WaitDelay with exit -1) is how this code behaves once the
+	// WaitDelay-after-zero-success is excluded.
+	var waitErr error
 	switch {
-	case err == nil:
-		result.ExitCode = 0
-	case ctx.Err() != nil:
+	case ctx.Err() != nil && err != nil:
 		result.Err, result.ExitCode = ctx.Err(), -1
+		return result
+	case errors.Is(err, exec.ErrWaitDelay) && exitedZero:
+		waitErr = nil
 	default:
-		result.Err = err
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			result.ExitCode = exit.ExitCode()
-		} else {
-			result.ExitCode = -1
-		}
+		waitErr = err
 	}
+	classification := classifyWaitResult(waitErr)
+	result.ExitCode, result.Err = classification.ExitCode, classification.Err
 	return result
+}
+
+// classifyWaitResult maps one wait error to its Result prefix (ExitCode and
+// Err only; runShell fills the rest). The background-handoff rule lives in
+// runShell, which sees the live *exec.Cmd and ctx; the classifier stays a
+// pure mapping so unit tests pin it without a subprocess.
+func classifyWaitResult(waitErr error) Result {
+	if waitErr == nil {
+		return Result{ExitCode: 0}
+	}
+	var exit *exec.ExitError
+	if errors.As(waitErr, &exit) {
+		return Result{ExitCode: exit.ExitCode(), Err: waitErr}
+	}
+	return Result{ExitCode: -1, Err: waitErr}
 }
 
 // RunConfined runs cmd as one confined process tree and waits for it exactly
