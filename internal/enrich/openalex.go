@@ -107,7 +107,7 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 		return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: empty OpenAlex HTTP response")}
 	}
 	if resp.Body == nil {
-		return requested, false, errors.New("enrich: OpenAlex response body is missing")
+		return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: OpenAlex response body is missing")}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -120,6 +120,9 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 
 	var payload openAlexSearchResponse
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
+		if _, temporary := resolver.Temporary(err); temporary {
+			return requested, false, err
+		}
 		return requested, false, fmt.Errorf("enrich: invalid OpenAlex response: %w", err)
 	}
 	seen := make(map[string]string)

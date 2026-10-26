@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -629,7 +630,9 @@ func TestEnsureCitationMetadataFillsTitlelessReadyJob(t *testing.T) {
 	}}}
 	svc.Discovery = lookup
 
-	svc.EnsureCitationMetadata(ctx, jobID)
+	if err := svc.EnsureCitationMetadata(ctx, jobID); err != nil {
+		t.Fatal(err)
+	}
 
 	after, err := jobs.Get(ctx, jobID)
 	if err != nil {
@@ -644,7 +647,9 @@ func TestEnsureCitationMetadataFillsTitlelessReadyJob(t *testing.T) {
 
 	// A job that already has a citation must not spend a provider request.
 	before := lookup.calls
-	svc.EnsureCitationMetadata(ctx, jobID)
+	if err := svc.EnsureCitationMetadata(ctx, jobID); err != nil {
+		t.Fatal(err)
+	}
 	if lookup.calls != before {
 		t.Fatalf("lookup calls = %d, want %d: a job with a title must not be looked up again", lookup.calls, before)
 	}
@@ -760,5 +765,60 @@ func TestInterruptedApplyRefusalsSpendNoImportAttempts(t *testing.T) {
 	}
 	if importNeedsRetry(real) {
 		t.Fatal("genuine failures no longer exhaust the budget")
+	}
+}
+
+func TestCitationStoreReadFailureDoesNotSpendImportAttempts(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_citation_store_failure")
+	svc.Discovery = &fakeWorkLookup{}
+	readErr := svc.EnsureCitationMetadata(ctx, "missing-job")
+	if !errors.Is(readErr, sql.ErrNoRows) {
+		t.Fatalf("citation read error = %v, want the store error", readErr)
+	}
+	svc.AutoImporter = &fakeAutoImporter{err: readErr}
+	now := time.Now()
+	svc.Now = func() time.Time { return now }
+	for range 7 {
+		now = now.Add(24 * time.Hour)
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failures := 0
+	for _, event := range events {
+		if event["kind"] != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["status"] == "skipped" {
+			continue
+		}
+		if detail["status"] != "error" || detail["reason"] != "citation_store_unavailable" || detail["error_class"] != "citation_store_unavailable" {
+			t.Fatalf("store failure misclassified: %+v", detail)
+		}
+		failures++
+	}
+	if failures != 7 || !importNeedsRetry(events) {
+		t.Fatalf("store failures spent import attempts: failures=%d retry=%v", failures, importNeedsRetry(events))
+	}
+	svc.AutoImporter = &fakeAutoImporter{status: "applied"}
+	now = now.Add(24 * time.Hour)
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	events, err = jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := settledImport(events); status != "applied" {
+		t.Fatalf("recovered store import = %q", status)
 	}
 }

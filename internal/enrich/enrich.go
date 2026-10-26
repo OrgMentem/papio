@@ -107,7 +107,7 @@ func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, 
 		return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: empty HTTP response")}
 	}
 	if resp.Body == nil {
-		return requested, false, errors.New("enrich: response body is missing")
+		return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: response body is missing")}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -120,6 +120,9 @@ func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, 
 
 	var payload response
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
+		if _, temporary := resolver.Temporary(err); temporary {
+			return requested, false, err
+		}
 		return requested, false, fmt.Errorf("enrich: invalid Crossref response: %w", err)
 	}
 	seen := make(map[string]record)
@@ -185,8 +188,13 @@ type PublicationRelation struct {
 	Provider  string `json:"provider"`
 }
 
+// ErrPublicationSourceUnsupported means Crossref has no record for this DOI.
+// It is not evidence that a registered preprint has no published version.
+var ErrPublicationSourceUnsupported = errors.New("enrich: Crossref has no record for this DOI; publication tracking requires a Crossref record")
+
 // PublicationRelations returns only explicit publication edges, never generic
-// version siblings. The injected HTTP client retains the source budget gate.
+// version siblings. A DOI missing from Crossref returns ErrPublicationSourceUnsupported.
+// The injected HTTP client retains the source budget gate.
 func (e *Enricher) PublicationRelations(ctx context.Context, doi string) ([]PublicationRelation, error) {
 	return e.versionRelations(ctx, doi, []string{"is-preprint-of"}, true)
 }
@@ -246,6 +254,9 @@ func (e *Enricher) versionRelations(ctx context.Context, doi string, types []str
 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
+		if verifySource {
+			return nil, ErrPublicationSourceUnsupported
+		}
 		return nil, nil
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		return nil, temporaryStatus(resp)
@@ -255,6 +266,9 @@ func (e *Enricher) versionRelations(ctx context.Context, doi string, types []str
 
 	var payload relationResponse
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
+		if _, temporary := resolver.Temporary(err); temporary {
+			return nil, err
+		}
 		return nil, fmt.Errorf("enrich: invalid Crossref response: %w", err)
 	}
 	if verifySource {
@@ -430,7 +444,7 @@ func decodeBoundedJSON(body io.Reader, maximum int64, destination any) error {
 	}
 	data, err := io.ReadAll(io.LimitReader(body, maximum+1))
 	if err != nil {
-		return err
+		return &resolver.TemporaryError{Err: fmt.Errorf("enrich: reading response body: %w", err)}
 	}
 	if int64(len(data)) > maximum {
 		return fmt.Errorf("response exceeds %d-byte limit", maximum)

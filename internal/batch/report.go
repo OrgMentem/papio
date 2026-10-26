@@ -407,9 +407,11 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 			// attempt; it is neither failed nor unconfirmed.
 			item.Outcome, item.Reason = OutcomeAcquired, "import_waiting_for_zotero"
 		case autoImport.Status == "queued":
-			// The wait ended: Zotero desktop accepts papers and the paced
-			// import pass reaches this one within minutes.
 			item.Outcome, item.Reason = OutcomeAcquired, "import_queued"
+			if autoImport.Reason == "citation_metadata_unavailable" {
+				item.Reason = autoImport.Reason
+				item.ErrorHint = autoImport.ErrorHint
+			}
 		case autoImport.Status == "skipped" || !row.Policy.AutoImport:
 			// Acquisition succeeded and import was not requested (auto-import
 			// off) or could not run (zotio not configured). The PDF is a
@@ -450,6 +452,7 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 
 type autoImportDetail struct {
 	Status        string
+	Reason        string
 	ParentKey     string
 	AttachmentKey string
 	ErrorClass    string
@@ -467,6 +470,7 @@ func latestAutoImport(events []map[string]any) autoImportDetail {
 		detail, _ := event["detail"].(map[string]any)
 		latest = autoImportDetail{
 			Status:        stringField(detail, "status"),
+			Reason:        stringField(detail, "reason"),
 			ParentKey:     stringField(detail, "parent_key"),
 			AttachmentKey: stringField(detail, "attachment_key"),
 		}
@@ -474,6 +478,9 @@ func latestAutoImport(events []map[string]any) autoImportDetail {
 			latest.ErrorClass = class
 		}
 		latest.ErrorHint = zotio.SanitizeErrorHint(stringField(detail, "error_hint"))
+		if latest.Status == "queued" && latest.Reason == "citation_metadata_unavailable" {
+			latest.ErrorHint = store.ActivityText("zotio.auto_import", detail)
+		}
 	}
 	if latest.Status == "error" && latest.ErrorClass == "" {
 		latest.ErrorClass = zotio.ErrorClassUnknown
