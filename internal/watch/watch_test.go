@@ -357,6 +357,23 @@ func TestDueSelectsEnabledExpiredWatches(t *testing.T) {
 	}
 }
 
+func TestDueSelectsFutureLastRunAfterClockRollback(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	watched := createWatch(t, watches, testWatchInput("clock rollback"))
+	if err := watches.MarkRun(ctx, watched.ID, now.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	due, err := watches.Due(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != watched.ID {
+		t.Fatalf("due watches = %+v, want watch %d after clock rollback", due, watched.ID)
+	}
+}
+
 func TestDueSkipsCorruptLastRun(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)

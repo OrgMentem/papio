@@ -183,7 +183,7 @@ func (a *Arxiv) searchQuery(params SearchParams) (string, error) {
 		return "", errors.New("arxiv discovery: HTTP client is not configured")
 	}
 	if params.HasCitationSnowball() {
-		return "", errors.New("arxiv discovery: citation snowball is not supported")
+		return "", fmt.Errorf("arxiv discovery: citation snowball is not supported: %w", ErrUnsupportedParams)
 	}
 	query := strings.TrimSpace(params.Query)
 	if query == "" {

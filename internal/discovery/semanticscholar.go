@@ -266,7 +266,7 @@ func semanticScholarSnowball(params SearchParams) (string, string, error) {
 		return "", "", nil
 	}
 	if selected.kind == "related" {
-		return "", "", fmt.Errorf("semanticscholar: related-to snowball is not supported")
+		return "", "", fmt.Errorf("semanticscholar: related-to snowball is not supported: %w", ErrUnsupportedParams)
 	}
 	doi, err := work.NormalizeDOI(selected.doi)
 	if err != nil {

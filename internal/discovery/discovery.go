@@ -60,6 +60,10 @@ type Options struct {
 	MaxResponseBytes int64
 }
 
+// ErrUnsupportedParams marks a search capability the backend does not offer,
+// not a backend outage. Multi skips it unless no selected source can answer.
+var ErrUnsupportedParams = errors.New("discovery: unsupported search parameters")
+
 // SearchParams selects works from configured sources. Slim is an internal-only
 // mode for callers that do not need abstract_inverted_index and must keep
 // response sizes bounded on broad scheduled searches.

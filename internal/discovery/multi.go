@@ -88,7 +88,7 @@ func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]Disco
 					// own internal deadline expiring independently of the
 					// caller, which is real signal and must still be
 					// recorded.
-					if ctx.Err() != nil {
+					if ctx.Err() != nil || errors.Is(err, ErrUnsupportedParams) {
 						return nil, nil, err
 					}
 					return nil, []BackendFailure{m.recordFailure(source.Name(), err)}, err
@@ -113,7 +113,7 @@ func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]Disco
 			// See the identical ctx.Err() guard in the named-source branch
 			// above: a cancelled caller must not be recorded as this
 			// backend's failure.
-			if ctx.Err() == nil {
+			if ctx.Err() == nil && !errors.Is(err, ErrUnsupportedParams) {
 				failures = append(failures, m.recordFailure(source.Name(), err))
 			}
 			hard = append(hard, fmt.Errorf("%s: %w", source.Name(), err))
@@ -141,8 +141,9 @@ type SourcePage struct {
 	Next string `json:"next,omitempty"`
 	// Failure is set only when State is PageFailed.
 	Failure *BackendFailure `json:"failure,omitempty"`
-	// Err is the unsanitized cause behind Failure, kept for errors.Is
-	// (ErrInvalidPageToken, a budget deferral). Never display it: use Failure.
+	// Err is the unsanitized failure or capability refusal, kept for errors.Is
+	// (ErrInvalidPageToken, ErrUnsupportedParams, a budget deferral).
+	// Never display it: use Failure.
 	Err error `json:"-"`
 }
 
@@ -164,13 +165,14 @@ type MultiPage struct {
 //
 // Every searched backend reports its own State: a backend that fails is
 // PageFailed while the others still answer, and a backend that cannot page
-// answers its single page as PageUnsupported. A token for a backend that is
-// not searched (not configured, or excluded by params.Source) is ignored, and
-// that backend is absent from Sources.
+// answers its single page as PageUnsupported. Backends that do not support the
+// search parameters are skipped. A token for a skipped or unselected backend
+// is ignored, and that backend is absent from Sources.
 //
 // A hard error is returned when no backend is configured, params.Source names
-// an unknown backend, or every searched backend failed; in the last case the
-// returned MultiPage still lists each backend's failed page.
+// an unknown backend, or no searched backend can answer. Failed pages remain
+// in MultiPage; unsupported searches return ErrUnsupportedParams without a
+// backend-health failure.
 func (m *Multi) SearchPages(ctx context.Context, params SearchParams, tokens map[string]string) (MultiPage, error) {
 	if m == nil || len(m.sources) == 0 {
 		return MultiPage{}, errors.New("discovery: no discovery sources are configured")
@@ -198,6 +200,10 @@ func (m *Multi) SearchPages(ctx context.Context, params SearchParams, tokens map
 			continue
 		}
 		page := m.searchSourcePage(ctx, source, params, tokens[source.Name()])
+		if errors.Is(page.Err, ErrUnsupportedParams) {
+			hard = append(hard, fmt.Errorf("%s: %w", page.Source, page.Err))
+			continue
+		}
 		result.Sources = append(result.Sources, page)
 		if page.State == PageFailed {
 			hard = append(hard, fmt.Errorf("%s: %w", page.Source, page.Err))
@@ -213,9 +219,9 @@ func (m *Multi) SearchPages(ctx context.Context, params SearchParams, tokens map
 	return result, nil
 }
 
-// searchSourcePage fetches one backend's page and folds any error into a
-// PageFailed entry, retaining real backend failures for diagnostics exactly
-// as SearchPartial does.
+// searchSourcePage fetches one backend's page and folds a capability refusal
+// into PageUnsupported for SearchPages to skip. Other errors become PageFailed,
+// retaining real backend failures for diagnostics exactly as SearchPartial does.
 func (m *Multi) searchSourcePage(ctx context.Context, source Source, params SearchParams, token string) SourcePage {
 	name := source.Name()
 	var page Page
@@ -233,6 +239,9 @@ func (m *Multi) searchSourcePage(ctx context.Context, source Source, params Sear
 		page = Page{Works: works, State: PageUnsupported}
 	}
 	if err != nil {
+		if errors.Is(err, ErrUnsupportedParams) {
+			return SourcePage{Source: name, State: PageUnsupported, Err: err}
+		}
 		failure := m.pageFailure(ctx, name, err)
 		return SourcePage{Source: name, State: PageFailed, Next: token, Failure: &failure, Err: err}
 	}

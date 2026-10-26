@@ -12,8 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"papio/internal/batch"
+	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/store"
 	"papio/internal/work"
@@ -143,7 +146,11 @@ var ErrWatchRecoveryRunRequired = errors.New("watch has no successful run since 
 
 // Store layers watch semantics over the process-wide single-writer SQLite
 // handle.
-type Store struct{ S *store.Store }
+type Store struct {
+	S *store.Store
+	// submissionMu fences removal against an in-flight acquisition submit.
+	submissionMu sync.Mutex
+}
 
 // NewStore creates the watch store over the existing process-wide database.
 func NewStore(s *store.Store) *Store { return &Store{S: s} }
@@ -398,25 +405,85 @@ func (s *Store) KnownDigestEntries(ctx context.Context, watchID int64, entries [
 	return known, nil
 }
 
-// SubmittedRequests returns the subset of request IDs that already hold a
-// once-only submission receipt, meaning a job was created for them.
-func (s *Store) SubmittedRequests(ctx context.Context, requestIDs []string) (map[string]struct{}, error) {
+// SubmittedWorks reports which works this watch already queued, regardless of
+// arXiv version or the identifier set a later discovery backend supplies.
+// Receipts retain their exact request IDs; identity matching uses the durable
+// submitted/verified identifiers of their jobs, including pre-existing receipts.
+func (s *Store) SubmittedWorks(ctx context.Context, watchID int64, requests []protocol.WorkRequest) ([]bool, error) {
 	if s == nil || s.S == nil {
 		return nil, errors.New("watch store is not configured")
 	}
-	found := make(map[string]struct{})
-	for _, id := range requestIDs {
-		var jobID string
-		err := s.S.DB().QueryRowContext(ctx, `SELECT job_id FROM submission_receipts WHERE request_id=?`, id).Scan(&jobID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
+	submitted := make([]bool, len(requests))
+	if len(requests) == 0 {
+		return submitted, nil
+	}
+	rows, err := s.S.DB().QueryContext(ctx, `
+		SELECT r.request_id, COALESCE(i.kind, ''), COALESCE(i.value, '')
+		FROM submission_receipts r
+		JOIN jobs j ON j.id = r.job_id
+		LEFT JOIN identifiers i ON i.work_request_id = j.work_request_id
+			AND i.provenance IN ('submitted', 'verified')
+		WHERE r.request_id GLOB ?`, fmt.Sprintf("watch-%d-*", watchID))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	receipts := make(map[string]struct{})
+	identities := make(map[string]struct{})
+	for rows.Next() {
+		var requestID, kind, value string
+		if err := rows.Scan(&requestID, &kind, &value); err != nil {
 			return nil, err
 		}
-		found[id] = struct{}{}
+		receipts[requestID] = struct{}{}
+		if key := submissionIdentityKey(kind, value); key != "" {
+			identities[key] = struct{}{}
+		}
 	}
-	return found, nil
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf("watch-%d", watchID)
+	for i, request := range requests {
+		_, submitted[i] = receipts[batch.RequestID(prefix, request)]
+		for _, key := range submissionIdentityKeys(request.Identifiers) {
+			if _, found := identities[key]; found {
+				submitted[i] = true
+				break
+			}
+		}
+	}
+	return submitted, nil
+}
+
+func submissionIdentityKey(kind, value string) string {
+	if kind == "openalex" {
+		if normalized, err := work.NormalizeOpenAlex(value); err == nil && normalized != "" {
+			return kind + ":" + normalized
+		}
+		return ""
+	}
+	if id, ok := ownership.NormalizeIdentifier(ownership.Identifier{Kind: kind, Value: value}); ok {
+		return id.Key()
+	}
+	return ""
+}
+
+func submissionIdentityKeys(ids *protocol.Identifiers) []string {
+	if ids == nil {
+		return nil
+	}
+	keys := make([]string, 0, 3)
+	for _, id := range []ownership.Identifier{
+		{Kind: ownership.KindDOI, Value: ids.DOI},
+		{Kind: ownership.KindArXiv, Value: ids.ArXiv},
+		{Kind: "openalex", Value: ids.OpenAlex},
+	} {
+		if key := submissionIdentityKey(id.Kind, id.Value); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // Digest returns recent alert-watch discoveries, newest first.
@@ -1521,6 +1588,8 @@ func (s *Store) Remove(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("watch id must be positive")
 	}
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
 	result, err := s.S.DB().ExecContext(ctx, `DELETE FROM watches WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("removing watch: %w", err)
@@ -1554,6 +1623,8 @@ func (s *Store) RemoveIfNoPendingDigest(ctx context.Context, id int64, discard b
 	if id <= 0 {
 		return errors.New("watch id must be positive")
 	}
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
 	tx, err := s.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting watch remove transaction: %w", err)
@@ -1584,7 +1655,7 @@ func (s *Store) RemoveIfNoPendingDigest(ctx context.Context, id int64, discard b
 }
 
 // Due returns enabled watches whose previous attempt is at least one cadence
-// old. A newly created watch is immediately due.
+// old. New watches and watches with a future last_run_at are immediately due.
 func (s *Store) Due(ctx context.Context, now time.Time) ([]Watch, error) {
 	watches, err := s.List(ctx)
 	if err != nil {
@@ -1609,7 +1680,7 @@ func (s *Store) Due(ctx context.Context, now time.Time) ([]Watch, error) {
 			s.recordCorruptLastRun(ctx, watch.ID, watch.LastRunAt, err)
 			continue
 		}
-		if !lastRun.Add(time.Duration(watch.CadenceHours) * time.Hour).After(now) {
+		if lastRun.After(now) || !lastRun.Add(time.Duration(watch.CadenceHours)*time.Hour).After(now) {
 			due = append(due, watch)
 		}
 	}
