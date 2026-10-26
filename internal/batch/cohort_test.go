@@ -222,11 +222,8 @@ func TestPartialProjectionOmitsDenominatorAfterInactivity(t *testing.T) {
 	}
 }
 
-// A chunk whose domain submission succeeded but whose membership write failed
-// has crossed the domain boundary: the chunk and its members roll back, the
-// cohort is marked partial so no denominator is ever claimed, and a replay of
-// the same request re-submits idempotently and persists the members while
-// still withholding the total.
+// A failed membership write leaves a partial cohort. A successful replay
+// persists the missing members and restores the complete denominator.
 func TestSubmitChunkMembershipFailureAfterSubmitMarksCohortPartial(t *testing.T) {
 	ctx := context.Background()
 	s := cohortStore(t)
@@ -288,11 +285,152 @@ func TestSubmitChunkMembershipFailureAfterSubmitMarksCohortPartial(t *testing.T)
 	if calls != 2 || replay.Joined != 1 || replay.Submitted != 0 {
 		t.Fatalf("replay = %+v calls=%d, want an idempotent re-submission reporting joined", replay, calls)
 	}
-	if replay.Membership != "partial" || replay.CohortTotal != nil {
-		t.Fatalf("replay membership=%q total=%v, want partial with no denominator", replay.Membership, replay.CohortTotal)
+	if replay.Membership != "complete" || replay.CohortTotal == nil || *replay.CohortTotal != 51 {
+		t.Fatalf("replay = %+v, want complete membership with all 51 works", replay)
 	}
 	if chunks, members := count(`SELECT COUNT(*) FROM acquisition_batch_chunks`), count(`SELECT COUNT(*) FROM acquisition_batch_members`); chunks != 2 || members != 51 {
 		t.Fatalf("after replay chunks=%d members=%d, want 2 and 51", chunks, members)
+	}
+}
+
+// Chunk zero must retain its batch identity across a failed membership write.
+// Successful replay completes the same batch only after its members persist.
+func TestSubmitChunkZeroMembershipFailureAfterSubmitMarksCohortPartial(t *testing.T) {
+	ctx := context.Background()
+	s := cohortStore(t)
+	cohorts := New(s)
+	manifest := keys(1)
+	first := ChunkRequest{RequestID: "request-1", CohortID: "cohort-1", Source: browserSource(), CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: manifest}
+	if _, err := s.DB().ExecContext(ctx, `CREATE TRIGGER fail_first_members BEFORE INSERT ON acquisition_batch_members BEGIN SELECT RAISE(ABORT, 'injected membership failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if _, err := cohorts.SubmitChunk(ctx, first, func(context.Context, []string) ([]MemberOutcome, error) {
+		calls++
+		return outcomes(first.CanonicalKeys, "submitted", "job-"), nil
+	}); err == nil || !strings.Contains(err.Error(), "persist cohort membership") {
+		t.Fatalf("membership failure error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("submit calls = %d, want the one that crossed the domain boundary", calls)
+	}
+	count := func(query string) int {
+		t.Helper()
+		var n int
+		if err := s.DB().QueryRowContext(ctx, query).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if chunks, members := count(`SELECT COUNT(*) FROM acquisition_batch_chunks`), count(`SELECT COUNT(*) FROM acquisition_batch_members`); chunks != 0 || members != 0 {
+		t.Fatalf("after failure chunks=%d members=%d, want the failed chunk rolled back (0, 0)", chunks, members)
+	}
+	var batchID, membership string
+	var expected int
+	if err := s.DB().QueryRowContext(ctx, `SELECT id,membership_state,expected_total FROM acquisition_batches WHERE cohort_id='cohort-1'`).Scan(&batchID, &membership, &expected); err != nil {
+		t.Fatalf("batch row is missing after chunk-0 persist failure: %v", err)
+	}
+	if batchID == "" || membership != "partial" || expected != 1 {
+		t.Fatalf("batch = %q membership=%q expected=%d, want a partial row for the one-work cohort", batchID, membership, expected)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DROP TRIGGER fail_first_members`); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := cohorts.SubmitChunk(ctx, first, func(context.Context, []string) ([]MemberOutcome, error) {
+		calls++
+		return outcomes(first.CanonicalKeys, "joined", "job-"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || replay.Joined != 1 || replay.Submitted != 0 {
+		t.Fatalf("replay = %+v calls=%d, want an idempotent re-submission reporting joined", replay, calls)
+	}
+	if replay.BatchID != batchID || replay.Membership != "complete" || replay.CohortTotal == nil || *replay.CohortTotal != 1 {
+		t.Fatalf("replay = %+v, want the same batch id with complete membership and total 1", replay)
+	}
+	if chunks, members := count(`SELECT COUNT(*) FROM acquisition_batch_chunks`), count(`SELECT COUNT(*) FROM acquisition_batch_members`); chunks != 1 || members != 1 {
+		t.Fatalf("after replay chunks=%d members=%d, want 1 and 1", chunks, members)
+	}
+}
+
+// An interrupted submission leaves partial membership until replay commits.
+func TestSubmitChunkZeroCrashBeforePersistReplaysComplete(t *testing.T) {
+	ctx := context.Background()
+	s := cohortStore(t)
+	cohorts := New(s)
+	manifest := keys(1)
+	first := ChunkRequest{RequestID: "request-1", CohortID: "cohort-1", Source: browserSource(), CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: manifest}
+	if _, err := cohorts.SubmitChunk(ctx, first, func(context.Context, []string) ([]MemberOutcome, error) {
+		seedCohortJob(t, s, "interrupted-job", job.StateQueued, "", time.Time{}, time.Now().UTC())
+		// Stop after the domain write but before the membership transaction.
+		return nil, context.DeadlineExceeded
+	}); err == nil {
+		t.Fatal("interrupted submit accepted")
+	}
+	var batchID, membership string
+	var expected int
+	if err := s.DB().QueryRowContext(ctx, `SELECT id,membership_state,expected_total FROM acquisition_batches WHERE cohort_id='cohort-1'`).Scan(&batchID, &membership, &expected); err != nil {
+		t.Fatalf("batch row is missing after the interrupted chunk: %v", err)
+	}
+	if batchID == "" || membership != "partial" || expected != 1 {
+		t.Fatalf("batch = %q membership=%q expected=%d, want a partial row for the one-work cohort", batchID, membership, expected)
+	}
+	replay, err := cohorts.SubmitChunk(ctx, first, func(context.Context, []string) ([]MemberOutcome, error) {
+		return []MemberOutcome{{CanonicalKey: manifest[0], JobID: "interrupted-job", Outcome: "joined"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.BatchID != batchID || replay.Membership != "complete" || replay.CohortTotal == nil || *replay.CohortTotal != 1 || replay.Joined != 1 {
+		t.Fatalf("replay = %+v, want the same batch id reporting complete membership with total 1", replay)
+	}
+	if err := s.DB().QueryRowContext(ctx, `SELECT membership_state FROM acquisition_batches WHERE id=?`, batchID).Scan(&membership); err != nil {
+		t.Fatal(err)
+	}
+	if membership != "complete" {
+		t.Fatalf("stored membership = %q, want complete after replay commits", membership)
+	}
+}
+
+func TestSubmitChunkLegacyPartialFinalCacheRestoresTotal(t *testing.T) {
+	ctx := context.Background()
+	s := cohortStore(t)
+	cohorts := New(s)
+	req := ChunkRequest{RequestID: "legacy-final", CohortID: "legacy-cohort", Source: browserSource(), CohortTotal: 1, FinalChunk: true, CanonicalKeys: keys(1)}
+	result, err := cohorts.SubmitChunk(ctx, req, func(context.Context, []string) ([]MemberOutcome, error) {
+		return outcomes(req.CanonicalKeys, "invalid", ""), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Membership, result.CohortTotal = "partial", nil
+	for _, encoding := range []string{"wire", "legacy"} {
+		t.Run(encoding, func(t *testing.T) {
+			raw, err := encodeChunkResult(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoding == "legacy" {
+				raw = []byte(goCasedResultJSON(result))
+			}
+			if _, err := s.DB().ExecContext(ctx, `UPDATE acquisition_batches SET membership_state='partial' WHERE id=?`, result.BatchID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.DB().ExecContext(ctx, `UPDATE acquisition_batch_chunks SET result_json=? WHERE batch_id=?`, raw, result.BatchID); err != nil {
+				t.Fatal(err)
+			}
+			replay, err := cohorts.SubmitChunk(ctx, req, func(context.Context, []string) ([]MemberOutcome, error) {
+				t.Fatal("cached final replay must not submit again")
+				return nil, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replay.CohortTotal == nil || *replay.CohortTotal != 1 || replay.BatchID != result.BatchID || replay.Membership != "partial" || replay.Invalid != 1 {
+				t.Fatalf("replay = %+v, want the cached partial result with durable total 1", replay)
+			}
+		})
 	}
 }
 

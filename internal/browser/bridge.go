@@ -6394,6 +6394,13 @@ func (b *Bridge) canonicalJobProbe(ctx context.Context, kind, value, stateClause
 // Every valid key rechecks holdings immediately before submission. Only a
 // fresh artifact-present claim suppresses the ordinary app submission; the
 // result is counted as already_owned (ADR-0008 invariant 2).
+// submitPageBulkMembers submits one canonical key per member. It returns a
+// non-nil error only when a member cannot be classified as valid or invalid:
+// a daemon-side submit failure carries no per-key verdict, so the caller must
+// fail the chunk instead of caching a per-key outcome. Callers that aggregate
+// across keys (the V1 non-cohort path) keep every classifiable member and
+// fold the failure into invalid with a log line; only the V2 cohort path
+// propagates the error.
 func (b *Bridge) submitPageBulkMembers(ctx context.Context, keys []string) ([]batch.MemberOutcome, error) {
 	outcomes := make([]batch.MemberOutcome, 0, len(keys))
 	for _, key := range keys {
@@ -6419,15 +6426,25 @@ func (b *Bridge) submitPageBulkMembers(ctx context.Context, keys []string) ([]ba
 			continue
 		}
 		if b.svc == nil {
-			outcome.Outcome = "invalid"
-			outcomes = append(outcomes, outcome)
-			continue
+			return outcomes, errors.New("page-bulk submit unavailable: no application service")
 		}
 		result, err := b.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, app.SubmitOptions{Consumer: pageBulkConsumer})
 		if err != nil {
-			outcome.Outcome = "invalid"
-			outcomes = append(outcomes, outcome)
-			continue
+			var invalid *app.InvalidRequestError
+			if errors.As(err, &invalid) {
+				// Page-bulk requests never select a resolver. An unknown default
+				// therefore belongs to daemon configuration, not this member.
+				if name := strings.TrimSpace(b.svc.Config.Browser.DefaultResolver); name != "" {
+					if _, ok := b.svc.Config.OpenURLBaseFor(name); !ok {
+						return outcomes, fmt.Errorf("page-bulk default resolver: %w", err)
+					}
+				}
+				outcome.Outcome = "invalid"
+				outcomes = append(outcomes, outcome)
+				continue
+			}
+			log.Printf("papio: page-bulk submit for %s failed: %v", key, err)
+			return outcomes, err
 		}
 		outcome.JobID = result.JobID
 		if result.Existing {
@@ -6457,12 +6474,23 @@ func memberCounts(outcomes []batch.MemberOutcome) (submitted, joined, owned, inv
 }
 
 func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkSubmitRequestPayload) ([]json.RawMessage, error) {
-	outcomes, _ := b.submitPageBulkMembers(ctx, request.CanonicalKeys)
+	// V1 has no request-id cache to replay against, so a daemon-side failure
+	// keeps the legacy accounting: the failed key counts invalid and later
+	// keys still submit.
+	outcomes := make([]batch.MemberOutcome, 0, len(request.CanonicalKeys))
+	for _, key := range request.CanonicalKeys {
+		members, err := b.submitPageBulkMembers(ctx, []string{key})
+		outcomes = append(outcomes, members...)
+		if err != nil {
+			log.Printf("papio: page-bulk submit for %s failed: %v", key, err)
+			outcomes = append(outcomes, batch.MemberOutcome{CanonicalKey: key, Outcome: "invalid"})
+		}
+	}
 	submitted, joined, alreadyOwned, invalid := memberCounts(outcomes)
 	batchID := newMsgID()
 	at := b.now().UTC()
-	if err := b.recordPageBulkRun(ctx, request.Source, len(request.CanonicalKeys), submitted, invalid, batchID, at); err != nil {
-		log.Printf("papio: recording page-bulk run: %v", err)
+	if recErr := b.recordPageBulkRun(ctx, request.Source, len(request.CanonicalKeys), submitted, invalid, batchID, at); recErr != nil {
+		log.Printf("papio: recording page-bulk run: %v", recErr)
 	}
 	frame, err := b.frame(protocol.MsgPageBulkSubmitResult, "", protocol.PageBulkSubmitResultPayload{
 		RequestID: request.RequestID, ScanID: request.ScanID,
