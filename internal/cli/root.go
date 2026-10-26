@@ -222,8 +222,12 @@ func (o *options) callExisting(ctx context.Context, method string, params, resul
 		return err
 	}
 	socket := filepath.Join(cfg.DataDir, "papio.sock")
-	if err := o.warnDaemonVersion(ctx, socket, cfg); err != nil {
-		return err
+	// Recovery commands must not wait for a diagnostic handshake. Status is
+	// already a ping, so sending another one adds no information.
+	if method != "daemon.shutdown" && method != "ping" {
+		if err := o.warnDaemonVersion(ctx, socket, cfg); err != nil {
+			return err
+		}
 	}
 	return o.socketCall(ctx, socket, method, params, result)
 }
@@ -247,6 +251,11 @@ func (o *options) autostarter(socket string) *daemon.Autostarter {
 }
 
 func (o *options) socketCall(ctx context.Context, socket, method string, params, result any) error {
+	if method == "ping" || method == "daemon.shutdown" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+	}
 	if o.rpcCall != nil {
 		return pointAtDaemonLog(o.rpcCall(ctx, socket, method, params, result), socket)
 	}
@@ -265,6 +274,9 @@ const daemonBareFailure = "operation failed"
 // it. A failure with detail (a Zotio class, a watch hint) already says more
 // and is left alone.
 func pointAtDaemonLog(err error, socket string) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("daemon did not respond: %w; inspect %s (send SIGQUIT to the daemon for a goroutine dump)", err, filepath.Join(filepath.Dir(socket), "daemon.log"))
+	}
 	var remote *ipc.RemoteError
 	if !errors.As(err, &remote) || remote == nil || remote.Code != "internal" || remote.Message != daemonBareFailure || remote.Detail != nil {
 		return err

@@ -2,13 +2,24 @@
 package browser
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"papio/internal/grab"
 	"papio/internal/job"
 	"papio/internal/pdf"
+	"papio/internal/protocol"
 	"papio/internal/work"
 )
 
@@ -158,5 +169,439 @@ func TestConfirmGuards(t *testing.T) {
 	// captured bytes to an arbitrary job id it happens to know.
 	if got := b.ConfirmGrabCandidate(ctx, grabID, "job_00000000000000000000000999"); got.Outcome != "unknown_job" {
 		t.Fatalf("absent job outcome = %q, want unknown_job", got.Outcome)
+	}
+}
+
+func TestConfirmStagingDoesNotHoldSessionLockAndLatchesTimeout(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSyncAs(t, b, sessA, hello())
+	runSyncAs(t, b, sessB, hello())
+	runSyncAs(t, b, testSessionID, hello())
+	vor, preprint := versionPair()
+	parkManualDownload(t, jobs, "wr_stage_vor", vor)
+	picked := parkManualDownload(t, jobs, "wr_stage_pre", preprint)
+	grabID := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), exoticExcerpt(vor), "Blocked staging")
+	otherGrab := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), exoticExcerpt(vor), "Latched confirmation")
+
+	previousDeadline := AdoptionScanDeadline
+	AdoptionScanDeadline = time.Second
+	t.Cleanup(func() { AdoptionScanDeadline = previousDeadline })
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var workers sync.WaitGroup
+	var calls atomic.Int32
+	jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), picked)
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		if dir != jobDir {
+			return os.ReadDir(dir)
+		}
+		if calls.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil, os.ErrPermission
+	}
+	t.Cleanup(func() {
+		close(release)
+		workers.Wait()
+	})
+	type reply struct {
+		frames []json.RawMessage
+		err    error
+	}
+	confirmed := make(chan reply, 1)
+	request := inFrame(t, protocol.MsgPdfGrabConfirmRequest, "", protocol.PdfGrabConfirmRequestPayload{
+		RequestID: "confirm-blocked-stage", GrabID: grabID, JobID: picked,
+	})
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		frames, err := b.Sync(ctx, sessB, false, []json.RawMessage{request})
+		confirmed <- reply{frames, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("confirmation never reached adoption staging")
+	}
+
+	polled := make(chan reply, 1)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		frames, err := b.Sync(ctx, testSessionID, false, nil)
+		polled <- reply{frames, err}
+	}()
+	select {
+	case got := <-polled:
+		if got.err != nil || len(got.frames) != 0 {
+			t.Fatalf("pending session poll = %+v, want an empty successful reply", got)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("blocked grab staging holds the bridge mutex")
+	}
+
+	select {
+	case got := <-confirmed:
+		if got.err != nil || len(got.frames) != 1 {
+			t.Fatalf("confirmation = %+v, want one structured response", got)
+		}
+		message, err := protocol.DecodeBrowserMessage(got.frames[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		outcome, ok := message.Payload.(*protocol.PdfGrabConfirmResponsePayload)
+		if !ok || outcome.Outcome != "job_created" || outcome.JobID != picked {
+			t.Fatalf("deferred confirmation = %+v, want the committed bind", message)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("confirmation did not return after the staging deadline")
+	}
+	got, err := b.grabs.Get(ctx, grabID)
+	if err != nil || got == nil || got.State != grab.StateJobCreated || got.JobID != picked {
+		t.Fatalf("committed grab = %+v, err = %v", got, err)
+	}
+	if _, err := os.Stat(got.QuarantinePath); err != nil {
+		t.Fatalf("deferred staging lost the quarantine copy: %v", err)
+	}
+	events, err := jobs.Events(ctx, picked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deferred := false
+	for _, event := range events {
+		deferred = deferred || event["kind"] == "browser.adoption_deferred"
+	}
+	if !deferred {
+		t.Fatal("the committed bind has no deferred-adoption event")
+	}
+	if again := b.ConfirmGrabCandidate(ctx, otherGrab, picked); again.Outcome != "unavailable" || !strings.Contains(again.Detail, "downloads folder") {
+		t.Fatalf("confirmation while latched = %+v, want the folder health refusal", again)
+	}
+	untouched, err := b.grabs.Get(ctx, otherGrab)
+	if err != nil || untouched == nil || untouched.State != grab.StateParkedNoIdentifier || untouched.JobID != "" {
+		t.Fatalf("latched confirmation changed the parked grab: %+v, %v", untouched, err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("stalled staging calls = %d, want one outstanding operation", calls.Load())
+	}
+}
+
+func TestConfirmRevalidatesAfterConcurrentGrabChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome string
+		row     bool
+		source  bool
+	}{
+		{name: "dismiss bound grab", outcome: "job_created", row: true, source: true},
+		{name: "grab row removed", outcome: "conflict", source: true},
+		{name: "quarantine removed", outcome: "failed", row: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, cfg, _ := newBridge(t)
+			ctx := context.Background()
+			runSyncAs(t, b, sessA, hello())
+			runSyncAs(t, b, sessB, hello())
+			vor, preprint := versionPair()
+			parkManualDownload(t, jobs, "wr_recheck_vor", vor)
+			picked := parkManualDownload(t, jobs, "wr_recheck_pre", preprint)
+			grabID := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), exoticExcerpt(vor), "Concurrent confirmation")
+			before, err := b.grabs.Get(ctx, grabID)
+			if err != nil || before == nil {
+				t.Fatalf("parked grab = %+v, %v", before, err)
+			}
+			originalBytes, err := os.ReadFile(before.QuarantinePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			previousDeadline := AdoptionScanDeadline
+			AdoptionScanDeadline = 5 * time.Second
+			t.Cleanup(func() { AdoptionScanDeadline = previousDeadline })
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			var workers sync.WaitGroup
+			jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), picked)
+			b.readDir = func(dir string) ([]os.DirEntry, error) {
+				if dir != jobDir {
+					return os.ReadDir(dir)
+				}
+				close(entered)
+				<-release
+				// Keep ingestion deferred so this test can assert that the
+				// committed grab retains its only recovery source.
+				return nil, os.ErrPermission
+			}
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				workers.Wait()
+			})
+			type reply struct {
+				frames []json.RawMessage
+				err    error
+			}
+			confirmed := make(chan reply, 1)
+			request := inFrame(t, protocol.MsgPdfGrabConfirmRequest, "", protocol.PdfGrabConfirmRequestPayload{
+				RequestID: "confirm-concurrent-change", GrabID: grabID, JobID: picked,
+			})
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				frames, err := b.Sync(ctx, sessB, false, []json.RawMessage{request})
+				confirmed <- reply{frames, err}
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("confirmation never reached post-bind staging")
+			}
+
+			changed := make(chan error, 1)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				var err error
+				switch tc.name {
+				case "dismiss bound grab":
+					source := parkedGrabItemSource{store: jobs.S, grabs: b.grabs}
+					var dismissed bool
+					dismissed, err = source.DismissPdfGrab(ctx, grabID)
+					if dismissed || !errors.Is(err, sql.ErrNoRows) {
+						err = fmt.Errorf("dismiss committed grab = %v, %w; want the conflict refusal", dismissed, err)
+					} else {
+						err = nil // triage maps this refused dismissal to DecisionConflict
+					}
+				case "grab row removed":
+					_, err = jobs.S.DB().ExecContext(ctx, `DELETE FROM pdf_grabs WHERE id = ?`, grabID)
+				case "quarantine removed":
+					err = os.Remove(before.QuarantinePath)
+				}
+				changed <- err
+			}()
+			select {
+			case err := <-changed:
+				if err != nil {
+					t.Errorf("concurrent change: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the concurrent change could not acquire the session lock during staging")
+			}
+			releaseOnce.Do(func() { close(release) })
+
+			select {
+			case got := <-confirmed:
+				if got.err != nil || len(got.frames) != 1 {
+					t.Fatalf("confirmation = %+v, want one structured response", got)
+				}
+				message, err := protocol.DecodeBrowserMessage(got.frames[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				outcome, ok := message.Payload.(*protocol.PdfGrabConfirmResponsePayload)
+				if !ok || outcome.Outcome != tc.outcome || outcome.JobID != picked {
+					t.Fatalf("confirmation after %s = %+v, want %s for %s", tc.name, message, tc.outcome, picked)
+				}
+				if tc.outcome != "job_created" && outcome.Detail == "" {
+					t.Fatal("the structured refusal has no explanation")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("confirmation did not finish after staging resumed")
+			}
+
+			after, err := b.grabs.Get(ctx, grabID)
+			if err != nil || (after != nil) != tc.row {
+				t.Fatalf("grab after %s = %+v, %v", tc.name, after, err)
+			}
+			if after != nil && (after.State != grab.StateJobCreated || after.JobID != picked || after.QuarantinePath != before.QuarantinePath) {
+				t.Fatalf("committed bind changed during %s: %+v", tc.name, after)
+			}
+			remaining, err := os.ReadFile(before.QuarantinePath)
+			if tc.source {
+				if err != nil || !bytes.Equal(remaining, originalBytes) {
+					t.Fatalf("recovery source changed during %s: %v", tc.name, err)
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("removed quarantine returned %v, want not-exist", err)
+			}
+			row, err := jobs.Get(ctx, picked)
+			if err != nil || row == nil || row.State != job.StateAwaitingHuman || row.ArtifactSHA256 != "" {
+				t.Fatalf("job after %s = %+v, %v", tc.name, row, err)
+			}
+		})
+	}
+}
+
+func TestConcurrentConfirmKeepsWinnerStagingOwnedDuringRecovery(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	vor, preprint := versionPair()
+	picked := parkManualDownload(t, jobs, "wr_owner_vor", vor)
+	parkManualDownload(t, jobs, "wr_owner_pre", preprint)
+	grabID := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), exoticExcerpt(vor), "Concurrent staging owners")
+	g, err := b.grabs.Get(ctx, grabID)
+	if err != nil || g == nil {
+		t.Fatalf("parked grab = %+v, %v", g, err)
+	}
+	digest, err := fileDigest(g.QuarantinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousDeadline := AdoptionScanDeadline
+	AdoptionScanDeadline = 5 * time.Second
+	t.Cleanup(func() { AdoptionScanDeadline = previousDeadline })
+	winnerEntered, loserEntered, stagingEntered := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	releaseWinner, releaseLoser, releaseStaging := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var winnerOnce, loserOnce, stagingOnce sync.Once
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		winnerOnce.Do(func() { close(releaseWinner) })
+		loserOnce.Do(func() { close(releaseLoser) })
+		stagingOnce.Do(func() { close(releaseStaging) })
+		workers.Wait()
+	})
+	validate := b.svc.Validate
+	var validations, stages atomic.Int32
+	b.svc.Validate = func(ctx context.Context, path, mime string, target work.Work) (pdf.ValidationReport, error) {
+		if path == g.QuarantinePath {
+			switch validations.Add(1) {
+			case 1:
+				close(winnerEntered)
+				<-releaseWinner
+			case 2:
+				close(loserEntered)
+				<-releaseLoser
+			}
+		}
+		return validate(ctx, path, mime, target)
+	}
+	jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), picked)
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		if dir == jobDir && stages.Add(1) == 1 {
+			close(stagingEntered)
+			<-releaseStaging
+		}
+		return os.ReadDir(dir)
+	}
+	start := func() <-chan GrabConfirmResult {
+		result := make(chan GrabConfirmResult, 1)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result <- b.ConfirmGrabCandidate(ctx, grabID, picked)
+		}()
+		return result
+	}
+	await := func(entered <-chan struct{}, phase string) {
+		t.Helper()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("confirmation never reached %s", phase)
+		}
+	}
+	winner := start()
+	await(winnerEntered, "winner validation")
+	loser := start()
+	await(loserEntered, "loser validation")
+	winnerOnce.Do(func() { close(releaseWinner) })
+	await(stagingEntered, "winner staging")
+	loserOnce.Do(func() { close(releaseLoser) })
+	select {
+	case result := <-loser:
+		if result.Outcome != "conflict" {
+			t.Fatalf("losing confirmation = %+v, want conflict", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("losing confirmation did not finish")
+	}
+
+	recovered := make(chan struct{})
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		b.recoverCommittedGrabStaging(ctx)
+		close(recovered)
+	}()
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatal("recovery competed for the winner's still-owned staging")
+	}
+	if _, err := os.Stat(g.QuarantinePath); err != nil {
+		t.Fatalf("recovery removed the live winner's source: %v", err)
+	}
+	stagingOnce.Do(func() { close(releaseStaging) })
+	select {
+	case result := <-winner:
+		if result.Outcome != "job_created" {
+			t.Fatalf("winning confirmation = %+v, want job_created", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("winning confirmation did not finish")
+	}
+	row, err := jobs.Get(ctx, picked)
+	if err != nil || row == nil || row.State != job.StateReady || row.ArtifactSHA256 != digest {
+		t.Fatalf("confirmed job = %+v, %v; want the captured PDF ready", row, err)
+	}
+	if err := b.svc.Artifacts.Verify(digest); err != nil {
+		t.Fatalf("confirmed artifact: %v", err)
+	}
+	bound, err := b.grabs.Get(ctx, grabID)
+	if err != nil || bound == nil || bound.State != grab.StateJobCreated || bound.JobID != picked {
+		t.Fatalf("confirmed grab = %+v, %v", bound, err)
+	}
+	if _, err := os.Stat(g.QuarantinePath); !os.IsNotExist(err) {
+		t.Fatalf("successful confirmation left its quarantine: %v", err)
+	}
+}
+
+func TestConfirmRecognizesCommittedGrabRecovery(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	vor, preprint := versionPair()
+	picked := parkManualDownload(t, jobs, "wr_recovered_vor", vor)
+	parkManualDownload(t, jobs, "wr_recovered_pre", preprint)
+	grabID := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), exoticExcerpt(vor), "Recovered confirmation")
+	jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), picked)
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		if dir == jobDir {
+			return nil, os.ErrPermission
+		}
+		return os.ReadDir(dir)
+	}
+	if result := b.ConfirmGrabCandidate(ctx, grabID, picked); result.Outcome != "job_created" {
+		t.Fatalf("deferred confirmation = %+v", result)
+	}
+	b.readDir = os.ReadDir
+	g, err := b.grabs.Get(ctx, grabID)
+	if err != nil || g == nil {
+		t.Fatalf("bound grab = %+v, %v", g, err)
+	}
+	name, _, digest, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filepath.Base(g.QuarantinePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.recoverCommittedGrabStaging(ctx)
+	row, err := jobs.Get(ctx, picked)
+	if err != nil || row == nil || row.State != job.StateReady || row.ArtifactSHA256 != digest {
+		t.Fatalf("recovered job = %+v, %v", row, err)
+	}
+	if _, err := os.Stat(g.QuarantinePath); !os.IsNotExist(err) {
+		t.Fatalf("recovery did not consume quarantine: %v", err)
+	}
+	b.mu.Lock()
+	result := b.revalidateGrabConfirmation(ctx, g, picked, name, digest)
+	otherBytes := b.revalidateGrabConfirmation(ctx, g, picked, name, strings.Repeat("0", 64))
+	b.mu.Unlock()
+	if result.Outcome != "job_created" || result.JobID != picked {
+		t.Fatalf("confirmation after recovery = %+v, want job_created", result)
+	}
+	if otherBytes.Outcome == "job_created" || otherBytes.Outcome == "" {
+		t.Fatalf("a different ready artifact satisfied confirmation: %+v", otherBytes)
 	}
 }

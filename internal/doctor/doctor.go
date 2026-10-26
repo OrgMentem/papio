@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/app"
@@ -1128,10 +1129,39 @@ func checkDataDir(path string) error {
 }
 
 // adoptionRootReadDir is the adoption-root health probe's ReadDir seam.
-// Production leaves it nil so browser.BoundedReadDir falls back to
-// os.ReadDir; tests substitute a blocking or error-returning func to
-// exercise the timeout/EPERM paths without a real TCC-protected filesystem.
+// Production leaves it nil to use os.ReadDir; tests substitute a blocking or
+// error-returning func without a real TCC-protected filesystem.
 var adoptionRootReadDir func(string) ([]os.DirEntry, error)
+
+// A timed-out syscall cannot be canceled. Keep ownership until it returns,
+// including across repeated doctor RPCs in the same daemon.
+var adoptionRootProbes = struct {
+	sync.Mutex
+	active map[string]bool
+}{active: make(map[string]bool)}
+
+func readAdoptionRoot(root string) ([]os.DirEntry, error) {
+	root = filepath.Clean(root)
+	adoptionRootProbes.Lock()
+	if adoptionRootProbes.active[root] {
+		adoptionRootProbes.Unlock()
+		return nil, browser.ErrAdoptionScanTimeout
+	}
+	adoptionRootProbes.active[root] = true
+	adoptionRootProbes.Unlock()
+	readDir := adoptionRootReadDir
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	return browser.BoundedReadDir(root, func(path string) ([]os.DirEntry, error) {
+		defer func() {
+			adoptionRootProbes.Lock()
+			delete(adoptionRootProbes.active, root)
+			adoptionRootProbes.Unlock()
+		}()
+		return readDir(path)
+	}, nil)
+}
 
 // checkAdoptionRoot reports whether the browser adoption root
 // (download_adoption_root, default <user downloads dir>/papio) is both
@@ -1150,8 +1180,8 @@ var adoptionRootReadDir func(string) ([]os.DirEntry, error)
 // protected location (Downloads is one, which is precisely where a correct
 // root lives) block in-kernel forever, waiting on a consent decision only an
 // interactive process can supply — the same wall Bridge.scanAdoptionDir
-// latches against. The probe is bounded the same way (browser.BoundedReadDir)
-// so doctor itself can never hang on it. ENOENT stays healthy: the root
+// latches against. The probe is bounded and single-flight per root, so doctor
+// neither hangs nor accumulates blocked syscalls. ENOENT stays healthy: the root
 // simply has not been created yet, which is the pre-first-download state
 // `papio init` normally resolves.
 func checkAdoptionRoot(cfg config.Config, add func(string, string, string, string)) {
@@ -1162,7 +1192,7 @@ func checkAdoptionRoot(cfg config.Config, add func(string, string, string, strin
 			fmt.Sprintf("clear download_adoption_root to use the default %s, or set it to <your browser download folder>/%s", config.DefaultAdoptionRoot(), config.AdoptionDirName))
 		return
 	}
-	_, err := browser.BoundedReadDir(root, adoptionRootReadDir, nil)
+	_, err := readAdoptionRoot(root)
 	switch {
 	case errors.Is(err, browser.ErrAdoptionScanTimeout), errors.Is(err, os.ErrPermission):
 		add("adoption_root", Fail,
@@ -1217,7 +1247,7 @@ func checkLegacyAdoptionRoot(ctx context.Context, cfg config.Config, db *store.S
 	if legacy == "" {
 		return
 	}
-	entries, err := browser.BoundedReadDir(legacy, adoptionRootReadDir, nil)
+	entries, err := readAdoptionRoot(legacy)
 	if err != nil {
 		return // absent or unreadable: nothing actionable to say here
 	}
@@ -1285,7 +1315,7 @@ type legacyStalledLanding struct {
 }
 
 func legacyLandingHoldsFile(dir string) bool {
-	entries, err := os.ReadDir(dir)
+	entries, err := readAdoptionRoot(dir)
 	if err != nil {
 		return false
 	}

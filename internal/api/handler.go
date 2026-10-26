@@ -676,14 +676,7 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, up
 	}
 	result := statusResult{Status: "ok", Version: Version}
 	if system != nil && system.Browser != nil {
-		result.ExtensionVersion, _, result.ExtensionConnected = system.Browser.SessionInfo()
-		sessions, denied, _ := system.Browser.Sessions()
-		for _, session := range sessions {
-			if !session.Holder {
-				result.PendingBrowserSessions++
-			}
-		}
-		result.BrowserSessionDenied = denied
+		result.ExtensionVersion, result.ExtensionConnected, result.PendingBrowserSessions, result.BrowserSessionDenied = system.Browser.SessionStatus()
 	}
 	if system != nil && system.Updates != nil {
 		refresh := updateRefreshInFlight.CompareAndSwap(false, true)

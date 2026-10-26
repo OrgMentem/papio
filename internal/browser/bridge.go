@@ -516,8 +516,8 @@ type Bridge struct {
 	// bridge RPC wedges behind it — the exact incident this latch exists to
 	// prevent.
 	adoptionScanMu sync.Mutex
-	// adoptionScanSuspended latches true the instant one adoption-directory
-	// ReadDir call misses AdoptionScanDeadline. A hung syscall can block
+	// adoptionScanSuspended latches true the instant an adoption listing,
+	// inspection, or staging operation misses AdoptionScanDeadline. A syscall can block
 	// forever, so every scan while this is true short-circuits to "nothing
 	// adoptable" without spawning another goroutine — at most one hung call
 	// is ever outstanding per bridge. The goroutine that tripped it clears
@@ -530,19 +530,18 @@ type Bridge struct {
 	// disables it). See adapter_control.go.
 	adapterControl        AdapterControlSource
 	adoptionScanSuspended bool
-	// grabStageMu guards grabStaging and makes stageGrabCopy's
-	// look-then-copy atomic in-process. grabStaging names grabs whose bind is
-	// being committed and staged right now, so recoverCommittedGrabStaging
-	// never races the live path into staging the same bytes twice.
+	// grabStageMu guards the active-owner count for each grab. A losing bind
+	// must not release a concurrent winner's recovery exclusion. The adoption
+	// gate serializes filesystem work without holding this bookkeeping lock.
 	grabStageMu sync.Mutex
-	grabStaging map[string]bool
+	grabStaging map[string]int
 	// unavailableLogMu guards unavailableLog. Repeated identical read-model
 	// failures (same surface and cause) log once per window instead of every
 	// UI poll.
 	unavailableLogMu sync.Mutex
 	unavailableLog   map[string]unavailableLogState
 	// adoptionScanGate is a capacity-1 semaphore held for the full lifetime
-	// of one underlying root/dir listing.
+	// of one underlying adoption listing, inspection, or staging operation.
 	adoptionScanGate chan struct{}
 	// captureOrphanPinsReconciled records the one-time pre-index-first orphan
 	// reconciliation. Index-first ordering makes new orphans impossible, so
@@ -762,6 +761,15 @@ func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, hello
 		return "", 0, false
 	}
 	return b.arbitration.holderSession().ExtensionVersion, len(b.arbitration.holderSession().AdapterVersions), true
+}
+
+// SessionStatus returns the last committed arbitration state without taking
+// b.mu. Diagnostic pings must answer even when a browser handler stalls.
+func (b *Bridge) SessionStatus() (extensionVersion string, connected bool, pending, denied int) {
+	if status := b.arbitration.status.Load(); status != nil {
+		return status.extensionVersion, status.connected, status.pending, status.denied
+	}
+	return "", false, 0, 0
 }
 
 // FocusHandoffs queues compatible holder sessions to surface tracked handoffs.
@@ -6929,14 +6937,14 @@ func (b *Bridge) pdfGrabSuggest(ctx context.Context, request *protocol.PdfGrabSu
 // MarkBoundToJobFenced fence autonomous binding uses — so there is exactly
 // one place that decision is made.
 //
-// See pdfGrabSuggest's doc comment for why this needs no concurrency cap of
-// its own: it runs under the same Sync-held b.mu.
+// Confirmation runs outside b.mu: the durable bind fence arbitrates competing
+// picks, and adoption staging can block behind macOS privacy consent.
 //
 // Every routine failure ConfirmGrabCandidate reports, including the
 // refused_identity veto, is carried straight to the wire outcome; nothing
 // here may become a raw Go error.
 func (b *Bridge) pdfGrabConfirm(ctx context.Context, request *protocol.PdfGrabConfirmRequestPayload) ([]json.RawMessage, error) {
-	result := b.ConfirmGrabCandidate(ctx, request.GrabID, request.JobID)
+	result := b.confirmGrabCandidate(ctx, request.GrabID, request.JobID, true)
 	frame, err := b.frame(protocol.MsgPdfGrabConfirmResponse, "", protocol.PdfGrabConfirmResponsePayload{
 		RequestID: request.RequestID, GrabID: result.GrabID, JobID: result.JobID, Outcome: result.Outcome, Detail: result.Detail,
 	})
@@ -7293,8 +7301,8 @@ func (b *Bridge) persistArtifactCorrelation(ctx context.Context, jobID, filename
 }
 
 // queueReoffer marks a job for priority re-offer at the next poll. Adoption
-// reaches commitArtifact both while Sync holds b.mu (a grab confirmation, for
-// example) and without it (the adoption sweeper, adoptOutsideSessionLock), so
+// reaches commitArtifact both while Sync holds b.mu and without it (grab
+// confirmation, the adoption sweeper, adoptOutsideSessionLock), so
 // neither taking b.mu here nor writing reofferPending directly is safe: the
 // first deadlocks the session, the second is a concurrent map access that ends
 // the process. Commit-side additions land in their own small queue instead,
@@ -9219,7 +9227,7 @@ func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, p
 // assigns it.
 var AdoptionScanDeadline = 2 * time.Second
 
-// ErrAdoptionScanTimeout marks a ReadDir call that did not return within
+// ErrAdoptionScanTimeout marks adoption filesystem work that did not return within
 // AdoptionScanDeadline — the signature of the TCC consent wall described on
 // scanAdoptionDir. Never wrapped, so callers compare it with errors.Is.
 var ErrAdoptionScanTimeout = errors.New("adoption directory scan timed out")
@@ -9230,10 +9238,8 @@ var ErrAdoptionScanTimeout = errors.New("adoption directory scan timed out")
 // in-kernel, so on timeout the goroutine is left running; when afterTimeout
 // is non-nil, a second goroutine (which only waits on a channel, never on
 // the syscall itself) reports its eventual real result to afterTimeout
-// exactly once. This is the seam Bridge.scanAdoptionDir (which also latches
-// further scans off while a call is outstanding — see adoptionScanSuspended)
-// and doctor's adoption-root health check both build on, so a TCC-hung
-// filesystem can never wedge the daemon or a one-shot doctor run.
+// exactly once. Bridge and doctor retain ownership of each operation until
+// its worker returns, so repeated timeouts never accumulate blocked syscalls.
 func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), afterTimeout func([]os.DirEntry, error)) ([]os.DirEntry, error) {
 	if readDir == nil {
 		readDir = os.ReadDir
@@ -9301,28 +9307,37 @@ func (b *Bridge) readAdoptionDirWith(dir string, fn func(string) ([]os.DirEntry,
 	if fn == nil {
 		fn = os.ReadDir
 	}
+	// Completion and timeout share this lock so a late completion cannot
+	// clear the latch just before the caller sets it permanently.
+	completed := false
 	held := func(d string) ([]os.DirEntry, error) {
-		defer func() { <-gate }() // released when the real call returns — timely or hours late
+		defer func() {
+			b.adoptionScanMu.Lock()
+			completed = true
+			if b.adoptionScanSuspended {
+				b.adoptionScanSuspended = false
+				log.Printf("papio: adoption scans resumed")
+			}
+			<-gate
+			b.adoptionScanMu.Unlock()
+		}()
 		return fn(d)
 	}
-	entries, err := BoundedReadDir(dir, held, func([]os.DirEntry, error) {
-		b.adoptionScanMu.Lock()
-		b.adoptionScanSuspended = false
-		b.adoptionScanMu.Unlock()
-		log.Printf("papio: adoption scans resumed")
-	})
+	entries, err := BoundedReadDir(dir, held, nil)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		b.adoptionScanMu.Lock()
-		b.adoptionScanSuspended = true
+		if !completed {
+			b.adoptionScanSuspended = true
+			log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", dir)
+		}
 		b.adoptionScanMu.Unlock()
-		log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", dir)
 	}
 	return entries, err
 }
 
 // adoptionLatchUnhealthy reports whether the adoption-scan latch
-// (adoptionScanSuspended) is currently tripped: a prior ReadDir under the
-// adoption root missed AdoptionScanDeadline and has not yet returned. It is
+// (adoptionScanSuspended) is currently tripped: prior filesystem work under
+// the adoption root missed AdoptionScanDeadline and has not yet returned. It is
 // the daemon-side signature of the macOS TCC consent wall AGENTS.md
 // documents, and recordAdoptionDeferred uses it to decide whether a failed
 // adoption is plausibly that wall (worth a human grant prompt) rather than
@@ -10124,7 +10139,7 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 	if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
 		fallbackName = "grab.pdf"
 	}
-	boundName, _, err := b.stageGrabCopy(temp, jobDir, fallbackName)
+	boundName, _, _, err := b.stageGrabCopy(temp, jobDir, fallbackName)
 	if err != nil {
 		if evErr := b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err); evErr != nil {
 			return true, evErr
@@ -10224,52 +10239,76 @@ func uniqueAdoptionDest(dir, filename string) string {
 
 // stageGrabCopy places src's bytes in the job adoption directory dir under
 // filename, or a unique sibling when that name is taken, and returns the
-// staged base name. A regular file already in dir with the same bytes is
+// staged base name and source digest. A regular file already in dir with the same bytes is
 // reused instead (created is false): a retried or recovered stage must never
 // mint a second identical copy, because the single-file adoption scan reads
 // two files as ambiguous and adopts neither.
-func (b *Bridge) stageGrabCopy(src, dir, filename string) (name string, created bool, err error) {
-	b.grabStageMu.Lock()
-	defer b.grabStageMu.Unlock()
+func (b *Bridge) stageGrabCopy(src, dir, filename string) (string, bool, string, error) {
+	var name, digest string
+	var created bool
+	_, err := b.readAdoptionDirWith(dir, func(dir string) ([]os.DirEntry, error) {
+		var err error
+		name, created, digest, err = b.stageGrabCopyUnbounded(src, dir, filename)
+		return nil, err
+	})
+	if err != nil {
+		// The worker still owns its result after a timeout. Recovery reuses a
+		// late copy by digest once the gate opens; keep quarantine until then.
+		return "", false, "", err
+	}
+	return name, created, digest, nil
+}
+
+// stageGrabCopyUnbounded runs only while the adoption gate is held. All of
+// mkdir, listing, hashing, open, copy, and sync share the same deadline.
+func (b *Bridge) stageGrabCopyUnbounded(src, dir, filename string) (string, bool, string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
 	digest, err := fileDigest(src)
 	if err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
-	entries, err := b.readAdoptionDir(dir)
+	readDir := b.readDir
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	entries, err := readDir(dir)
 	if err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".") || !e.Type().IsRegular() {
 			continue
 		}
 		if existing, err := fileDigest(filepath.Join(dir, e.Name())); err == nil && existing == digest {
-			return e.Name(), false, nil
+			return e.Name(), false, digest, nil
 		}
 	}
 	dest := uniqueAdoptionDest(dir, filename)
 	if err := b.copyGrabFile(src, dest); err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
-	return filepath.Base(dest), true, nil
+	return filepath.Base(dest), true, digest, nil
 }
 
-// beginGrabStaging marks grabID as committed-and-staging on the live path
-// until the returned func runs, so recoverCommittedGrabStaging leaves it be.
+// beginGrabStaging retains one live owner's recovery exclusion until its
+// returned release runs. Concurrent owners release only their own reference.
 func (b *Bridge) beginGrabStaging(grabID string) func() {
 	b.grabStageMu.Lock()
 	defer b.grabStageMu.Unlock()
 	if b.grabStaging == nil {
-		b.grabStaging = map[string]bool{}
+		b.grabStaging = map[string]int{}
 	}
-	b.grabStaging[grabID] = true
+	b.grabStaging[grabID]++
 	return func() {
 		b.grabStageMu.Lock()
 		defer b.grabStageMu.Unlock()
-		delete(b.grabStaging, grabID)
+		if b.grabStaging[grabID] == 1 {
+			delete(b.grabStaging, grabID)
+		} else {
+			b.grabStaging[grabID]--
+		}
 	}
 }
 
@@ -10299,7 +10338,7 @@ func (b *Bridge) recoverCommittedGrabStaging(ctx context.Context) {
 	}
 	for _, g := range pending {
 		b.grabStageMu.Lock()
-		live := b.grabStaging[g.ID]
+		live := b.grabStaging[g.ID] != 0
 		b.grabStageMu.Unlock()
 		if live {
 			continue
@@ -10308,7 +10347,7 @@ func (b *Bridge) recoverCommittedGrabStaging(ctx context.Context) {
 			continue
 		}
 		jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), g.JobID)
-		name, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filepath.Base(g.QuarantinePath))
+		name, _, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filepath.Base(g.QuarantinePath))
 		if err != nil {
 			log.Printf("papio: re-staging pdf grab %s for job %s: %v", g.ID, g.JobID, err)
 			continue
@@ -10381,7 +10420,7 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 			src = landing
 		}
 	}
-	boundName, created, err := b.stageGrabCopy(src, jobDir, filename)
+	boundName, created, _, err := b.stageGrabCopy(src, jobDir, filename)
 	if err != nil {
 		return err
 	}
@@ -10833,7 +10872,7 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 		return result
 	}
 	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), created.JobID)
-	boundName, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filename)
+	boundName, _, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filename)
 	if err != nil {
 		if evErr := b.recordAdoptionDeferred(ctx, created.JobID, filename, err); evErr != nil {
 			result.Outcome, result.Detail = "failed", "pdf grab bound but bytes could not be staged"
@@ -10882,9 +10921,24 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 // precedence rule — unchanged from the autonomous path — is that extracted
 // identity outranks a human pick.
 func (b *Bridge) ConfirmGrabCandidate(ctx context.Context, grabID, jobID string) GrabConfirmResult {
+	return b.confirmGrabCandidate(ctx, grabID, jobID, false)
+}
+
+// sessionLocked means the caller owns b.mu on entry and expects it on return.
+// Staging and ingestion run without it; the post-staging recheck takes it back
+// before trusting the bind and retained source.
+func (b *Bridge) confirmGrabCandidate(ctx context.Context, grabID, jobID string, sessionLocked bool) GrabConfirmResult {
+	if sessionLocked {
+		b.mu.Unlock()
+		defer b.mu.Lock()
+	}
 	result := GrabConfirmResult{GrabID: grabID, JobID: jobID}
 	if b == nil || b.grabs == nil || b.jobs == nil || b.svc == nil || b.svc.Validate == nil {
 		result.Outcome, result.Detail = "unavailable", "pdf grabs are not configured"
+		return result
+	}
+	if b.adoptionLatchUnhealthy() {
+		result.Outcome, result.Detail = "unavailable", "the downloads folder is not responding (macOS privacy consent?); try again after granting access"
 		return result
 	}
 	g, err := b.grabs.Get(ctx, grabID)
@@ -11008,7 +11062,17 @@ func (b *Bridge) ConfirmGrabCandidate(ctx context.Context, grabID, jobID string)
 	if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
 		fallbackName = "grab.pdf"
 	}
-	boundName, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, fallbackName)
+	boundName, _, digest, err := b.stageGrabCopy(g.QuarantinePath, jobDir, fallbackName)
+	if sessionLocked {
+		b.mu.Lock()
+	}
+	checked := b.revalidateGrabConfirmation(ctx, g, jobID, boundName, digest)
+	if sessionLocked {
+		b.mu.Unlock()
+	}
+	if checked.Outcome != "" {
+		return checked
+	}
 	if err != nil {
 		_ = b.recordAdoptionDeferred(ctx, jobID, fallbackName, err)
 		result.Outcome = "job_created"
@@ -11029,6 +11093,45 @@ func (b *Bridge) ConfirmGrabCandidate(ctx context.Context, grabID, jobID string)
 	_ = os.Remove(g.QuarantinePath)
 	_ = os.RemoveAll(filepath.Dir(g.QuarantinePath))
 	result.Outcome = "job_created"
+	return result
+}
+
+// Recheck after staging, before ingestion legitimately removes the grab's
+// quarantine copy. Only the retained data-dir source is inspected here:
+// touching the Downloads staging directory under b.mu would restore the wedge.
+func (b *Bridge) revalidateGrabConfirmation(ctx context.Context, expected *grab.Grab, jobID, filename, digest string) GrabConfirmResult {
+	result := GrabConfirmResult{GrabID: expected.ID, JobID: jobID}
+	current, err := b.grabs.Get(ctx, expected.ID)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab could not be rechecked after staging"
+		return result
+	}
+	if current == nil || current.State != grab.StateJobCreated || current.JobID != jobID || current.QuarantinePath != expected.QuarantinePath {
+		result.Outcome, result.Detail = "conflict", "pdf grab changed while its bytes were being staged"
+		return result
+	}
+	info, err := os.Stat(current.QuarantinePath)
+	if errors.Is(err, os.ErrNotExist) && digest != "" {
+		// Recovery may have already ingested these exact staged bytes and
+		// removed quarantine. Reuse the accepted-candidate and artifact
+		// checks, not merely the job's ready state.
+		candidateID, recoveryErr := b.completedAdoption(ctx, jobID, filename, &artifactFence{digest: digest}, nil, nil)
+		if recoveryErr != nil {
+			result.Outcome, result.Detail = "unavailable", "pdf grab adoption could not be rechecked"
+			return result
+		}
+		if candidateID != 0 {
+			result.Outcome = "job_created"
+			return result
+		}
+	}
+	if errors.Is(err, os.ErrNotExist) || (err == nil && (!info.Mode().IsRegular() || info.Size() == 0)) {
+		result.Outcome, result.Detail = "failed", "pdf grab bound but its quarantined file is no longer available"
+		return result
+	}
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab bound but its quarantined file could not be rechecked"
+	}
 	return result
 }
 
