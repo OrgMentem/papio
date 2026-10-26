@@ -175,6 +175,24 @@ func TestOpenAlexCreditCostClassifier(t *testing.T) {
 	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?search=trust")); got != 10 {
 		t.Fatalf("search = %d, want 10", got)
 	}
+	// The metadata enricher searches via filter=title.search:, with no
+	// search= parameter. The provider prices that shape at 10.
+	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?filter=title.search%3Atrust%2Cpublication_year%3A2020&per-page=5")); got != 10 {
+		t.Fatalf("enricher title.search filter = %d, want 10", got)
+	}
+	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?filter=abstract.search%3Atrust")); got != 10 {
+		t.Fatalf("abstract.search filter = %d, want 10", got)
+	}
+	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?filter=default.search%3Atrust")); got != 10 {
+		t.Fatalf("default.search filter = %d, want 10", got)
+	}
+	// A citation filter with no search clause is not a search.
+	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?filter=cites%3AW2741809807")); got != 1 {
+		t.Fatalf("citation filter = %d, want 1", got)
+	}
+	if got := OpenAlexCreditCost(guardedRequest(t, "https://api.openalex.org/works?filter=from_publication_date%3A2020-01-01%2Copen_access.is_oa%3Atrue")); got != 1 {
+		t.Fatalf("discovery date filter = %d, want 1", got)
+	}
 }
 
 // recordingAuthority captures the EgressRequest the guarded client builds, so a

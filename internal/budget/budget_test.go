@@ -454,3 +454,41 @@ func TestTokenBucketDeferralNamesTheIdentity(t *testing.T) {
 		t.Fatalf("error renders an empty identity: %s", err)
 	}
 }
+
+// A refused reservation must not consume a token: every Acquire that passes
+// takeToken and then fails in reserve is a request that never left the
+// machine. Without the refund the bucket drains on refusals, and the first
+// real request after the cap resets waits inline for a refill with no
+// provider-side reason.
+func TestRefusedAcquireRefundsItsToken(t *testing.T) {
+	clock := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	m := New(s, WithNow(func() time.Time { return clock }))
+	ctx := context.Background()
+	capped := config.Source{Enabled: true, RatePerSec: 1, Burst: 1, MaxCostUSD: 1}
+	if err := m.Acquire(ctx, "paid", capped, 1); err != nil {
+		t.Fatalf("first Acquire = %v, want the cap spent", err)
+	}
+	// Refill the bucket once, then refuse repeatedly against the still
+	// exhausted cap. Each refusal must hand its token back.
+	for range 3 {
+		clock = clock.Add(time.Second)
+		err := m.Acquire(ctx, "paid", capped, 1)
+		var exceeded *ErrExceeded
+		if !errors.As(err, &exceeded) {
+			t.Fatalf("refused Acquire = %T %v, want *ErrExceeded from the exhausted cap", err, err)
+		}
+	}
+	// The cap resets (a new policy with headroom) with no further refill: the
+	// next permitted Acquire must succeed immediately, not wait for a token.
+	raised := config.Source{Enabled: true, RatePerSec: 1, Burst: 1, MaxCostUSD: 10}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := m.Acquire(short, "paid", raised, 0); err != nil {
+		t.Fatalf("Acquire after the cap reset = %v, want success on the refunded token", err)
+	}
+}

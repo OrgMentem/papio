@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,4 +378,41 @@ func doAndClose(c interface {
 		return err
 	}
 	return resp.Body.Close()
+}
+
+// A response pricing this request above the committed shape cost closes egress
+// durably (ADR-0024 §8). The enricher shape used to commit 1 while the
+// provider charged 10; without the drift check the fuse undercounted every
+// title-only enrichment with no warning.
+func TestObserverDriftCloseOnObservedCostAboveCommitted(t *testing.T) {
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	m := budget.New(s, budget.WithNow(func() time.Time { return observerNow }), budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+		return budget.CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000}
+	}))
+	keyed := config.Source{Enabled: true, APIKey: "private-key"}
+	inner := &headerClient{status: http.StatusOK, headers: map[string]string{
+		"X-RateLimit-Credits-Used": "10",
+	}}
+	stack, err := WrapOpenAlex(m, m, config.SourceOpenAlex, keyed, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := bearerRequest(t)
+	req.URL, _ = url.Parse("https://api.openalex.org/works/W1")
+	if err := doAndClose(stack, req); err != nil {
+		t.Fatal(err)
+	}
+	err = m.CommitEgress(context.Background(), budget.EgressRequest{
+		Source:   config.SourceOpenAlex,
+		Identity: budget.IdentityFor(config.Source{APIKey: "private-key"}),
+		Credits:  1,
+	})
+	var exceeded *budget.ErrExceeded
+	if !errors.As(err, &exceeded) || exceeded.Window != budget.WindowSticky {
+		t.Fatalf("CommitEgress after drift = %v, want sticky refusal until acknowledged", err)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,13 +26,21 @@ type CreditCost func(req *http.Request) int
 func UnitCreditCost(*http.Request) int { return 1 }
 
 // OpenAlexCreditCost maps OpenAlex works lookups to provider credits: singleton
-// entity GET = 1, any search query = 10.
+// entity GET = 1, any search query = 10. A filter carrying a `.search:` clause
+// (title.search, abstract.search, default.search, …) is a search even without
+// a `search=` parameter: the provider prices the enricher's
+// `filter=title.search:` shape at 10 (x-ratelimit-credits-used, measured live).
 func OpenAlexCreditCost(req *http.Request) int {
 	if req == nil || req.URL == nil {
 		return 1
 	}
 	if req.URL.Query().Get("search") != "" {
 		return 10
+	}
+	for _, clause := range strings.Split(req.URL.Query().Get("filter"), ",") {
+		if strings.Contains(clause, ".search:") {
+			return 10
+		}
 	}
 	return 1
 }
@@ -166,9 +175,13 @@ func (c *RequireEgressCommit) Do(req *http.Request) (*http.Response, error) {
 	return c.inner.Do(req)
 }
 
-// PacingClient applies identity-agnostic token-bucket pacing only. OpenAlex
-// discovery uses this beneath GuardedClient so construction-time api_key policy
-// cannot pre-empt the wire-derived identity authority.
+// PacingClient paces OpenAlex discovery through the budget before the guarded
+// stack commits it. It carries the configured policy unchanged so admission
+// uses the identity the wire actually sends: discovery always presents the
+// configured key (it has no anonymous fallback), and the same keyed identity
+// is enforced again at the wire by CommitEgress. Stripping the key here
+// admitted keyed discovery under the anonymous identity, so an anonymous gate
+// refused keyed requests for up to a day while the key stayed healthy.
 type PacingClient struct {
 	inner    HTTPClient
 	reserve  Reserver
@@ -177,8 +190,8 @@ type PacingClient struct {
 	costEach float64
 }
 
-// NewPacingOnly wraps inner with source-wide pacing from policy's rate/burst.
-// The policy's API key is ignored for admission identity.
+// NewPacingOnly wraps inner with pacing from policy's rate/burst, keeping the
+// policy's API key so admission identity matches the outgoing request.
 func NewPacingOnly(reserve Reserver, source string, policy config.Source, costEach float64, inner HTTPClient) (*PacingClient, error) {
 	if reserve == nil {
 		return nil, fmt.Errorf("sourcegate: %s pacing client has no reserver", source)
@@ -186,9 +199,7 @@ func NewPacingOnly(reserve Reserver, source string, policy config.Source, costEa
 	if inner == nil {
 		return nil, fmt.Errorf("sourcegate: %s pacing client has no inner client", source)
 	}
-	pacing := policy
-	pacing.APIKey = ""
-	return &PacingClient{inner: inner, reserve: reserve, source: source, pacing: pacing, costEach: costEach}, nil
+	return &PacingClient{inner: inner, reserve: reserve, source: source, pacing: policy, costEach: costEach}, nil
 }
 
 // Do paces, then forwards without re-reserving per identity.
