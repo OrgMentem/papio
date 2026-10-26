@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -193,6 +194,16 @@ type Service struct {
 
 	RetryDelay time.Duration
 	Now        func() time.Time
+	// deferredMu guards deferredLogged and deferredDelay, the per-process
+	// memory that keeps unknown-presence deferrals quiet and escalating:
+	// deferredLogged records publication rows already logged while deferred
+	// so maintenance does not log one line per row per pass forever, and
+	// deferredDelay tracks the current backoff per job so a permanently
+	// broken filesystem parks longer instead of cycling at a fixed delay.
+	// Both reset when the row settles.
+	deferredMu     sync.Mutex
+	deferredLogged map[string]struct{}
+	deferredDelay  map[string]time.Duration
 	// suppression is the host-aware daemon fetch suppression rule
 	// (ADR-0031). Nil disables it: fetchCandidates fetches everything.
 	// EnableHostSuppression wires it; suppressionMu guards the one-time
@@ -4813,12 +4824,36 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	return s.recoverMissingReadyHookForSettled(ctx)
 }
 
+// PreparedPublicationRecovery retries deferred publication rows on the
+// daemon's periodic maintenance cadence, so a filesystem error that clears
+// after startup still settles without waiting for the next restart. It only
+// runs reconcilePreparedPublications: the orphan-stage sweep and the ready
+// hook replay stay startup-only. Deferred rows keep their journal and park
+// runnable jobs in retry_wait, so errors stay best-effort and never stop
+// acquisition workers. It satisfies daemon.MaintenanceRunner without
+// importing that package.
+type PreparedPublicationRecovery struct{ svc *Service }
+
+// PreparedPublicationRecovery returns the maintenance runner that retries
+// deferred publication rows.
+func (s *Service) PreparedPublicationRecovery() *PreparedPublicationRecovery {
+	return &PreparedPublicationRecovery{svc: s}
+}
+
+// RunDue performs one bounded retry pass over all prepared publications.
+func (r *PreparedPublicationRecovery) RunDue(ctx context.Context) error {
+	if r == nil || r.svc == nil || r.svc.Jobs == nil {
+		return nil
+	}
+	return r.svc.reconcilePreparedPublications(ctx, "")
+}
+
 // removeQuarantineBytes removes bytes only when no remaining publication owns
-// the exact file or its component-stage_ directory. The caller must hold the
-// same writer-reserved transaction that consumed the redundant publication,
-// so another publication cannot appear between this ownership read and the
-// filesystem removal.
-func (s *Service) removeQuarantineBytes(ctx context.Context, tx *sql.Tx, quarantinePath string) error {
+// the exact file or its component-stage_ directory. It runs after the caller
+// commits the row delete, so a failed commit keeps the quarantine bytes. It
+// holds its writer reservation through the filesystem removal, so another
+// publication cannot appear between the ownership read and the removal.
+func (s *Service) removeQuarantineBytes(ctx context.Context, quarantinePath string) error {
 	if quarantinePath == "" {
 		return nil
 	}
@@ -4847,7 +4882,19 @@ func (s *Service) removeQuarantineBytes(ctx context.Context, tx *sql.Tx, quarant
 		target = base
 		stage = true
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT quarantine_path FROM artifact_publications`)
+	qtx, err := s.Jobs.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = qtx.Rollback() }()
+	// The no-op UPDATE reserves the writer (MaxOpenConns(1) serializes the
+	// store) so no PreparePublication can slip in between the ownership
+	// read and the removal. The row count is intentionally unchecked: the
+	// fence holds whether the table is empty or not.
+	if _, err := qtx.ExecContext(ctx, `UPDATE artifact_publications SET prepared_at = prepared_at WHERE id = (SELECT id FROM artifact_publications LIMIT 1)`); err != nil {
+		return err
+	}
+	rows, err := qtx.QueryContext(ctx, `SELECT quarantine_path FROM artifact_publications`)
 	if err != nil {
 		return err
 	}
@@ -4874,18 +4921,31 @@ func (s *Service) removeQuarantineBytes(ctx context.Context, tx *sql.Tx, quarant
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if owned {
-		return nil
+	if !owned {
+		// The writer reservation stays open across the removal, so a
+		// concurrent PreparePublication cannot adopt this same path between
+		// the ownership read and the unlink. Shared paths are legal: the
+		// journal scan also runs under this fence, so a pre-existing owner
+		// stops the removal before any bytes move.
+		if err := os.RemoveAll(target); err != nil {
+			log.Printf("papio: removing published quarantine bytes %s: %v", target, err)
+		}
 	}
-	if err := os.RemoveAll(target); err != nil {
-		log.Printf("papio: removing published quarantine bytes %s: %v", target, err)
-	}
-	return nil
+	return qtx.Commit()
 }
 
-// consumePublishedPublication consumes one redundant journal row and cleans
-// its unowned quarantine bytes while one SQLite writer fence covers both the
-// durable ownership check and the filesystem change.
+// consumePublishedBeforeCommitForTest interrupts consumption after the row
+// delete but before the commit, mirroring publicationBeforeCommitForTest in
+// internal/job. It stays package-private by design.
+var consumePublishedBeforeCommitForTest func() error
+
+// consumePublishedPublication consumes one redundant journal row, then cleans
+// its unowned quarantine bytes after a successful commit. The bytes stay when
+// the commit fails: the row is restored by rollback, and only orphan bytes
+// remain on a failure after the commit. The newcomer window between the
+// commit and the cleanup is safe: every quarantine path is a fresh unique
+// name, so no new row can name the just-consumed file before the post-commit
+// ownership scan proves no other journal row owns it.
 func (s *Service) consumePublishedPublication(ctx context.Context, publicationID string) (bool, error) {
 	tx, err := s.Jobs.S.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -4933,13 +4993,161 @@ func (s *Service) consumePublishedPublication(ctx context.Context, publicationID
 	if deleted != 1 {
 		return false, fmt.Errorf("%w: publication %s changed during consumption", job.ErrConflict, publicationID)
 	}
-	if err := s.removeQuarantineBytes(ctx, tx, quarantinePath); err != nil {
-		return false, err
+	if consumePublishedBeforeCommitForTest != nil {
+		if err := consumePublishedBeforeCommitForTest(); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
+	if err := s.removeQuarantineBytes(ctx, quarantinePath); err != nil {
+		// The journal row is already committed away: a post-commit cleanup
+		// failure must not abort the whole reconcile pass. Log and continue;
+		// the orphan bytes are benign and the next pass converges them.
+		log.Printf("papio: published quarantine cleanup for %s: %v", publicationID, err)
+	}
 	return true, nil
+}
+
+// deferPublicationRow parks a runnable job and logs why one prepared
+// publication waits out recovery, then frees its reclaimed lease. The journal
+// and artifact rows stay: a deferred row settles on a later startup or
+// maintenance pass once the filesystem error clears, instead of stopping
+// startup or the rows after it. Logging happens only on the transition into
+// deferral — when the job is newly parked, or the first time per row per
+// process — so maintenance does not log one line per row per pass forever.
+func (s *Service) deferPublicationRow(ctx context.Context, publication job.PreparedPublication, recoveryOwner, why string) {
+	parked := s.parkDeferredPublicationJob(ctx, publication.JobID)
+	first := s.markDeferredLogged(publication.ID)
+	if parked || first {
+		log.Printf("papio: deferring prepared publication %s: %s", publication.ID, why)
+	}
+	if recoveryOwner != "" {
+		_ = s.Jobs.Release(context.WithoutCancel(ctx), publication.JobID, recoveryOwner)
+	}
+}
+
+// markDeferredLogged records that one publication row has been logged while
+// deferred and reports whether this call is the first per row per process.
+func (s *Service) markDeferredLogged(publicationID string) bool {
+	s.deferredMu.Lock()
+	defer s.deferredMu.Unlock()
+	if s.deferredLogged == nil {
+		s.deferredLogged = make(map[string]struct{})
+	}
+	if _, ok := s.deferredLogged[publicationID]; ok {
+		return false
+	}
+	s.deferredLogged[publicationID] = struct{}{}
+	return true
+}
+
+// clearDeferredPublicationState forgets the per-process deferral memory for
+// one settled row so a later incident logs and backs off from the base again.
+func (s *Service) clearDeferredPublicationState(publicationID, jobID string) {
+	s.deferredMu.Lock()
+	defer s.deferredMu.Unlock()
+	delete(s.deferredLogged, publicationID)
+	delete(s.deferredDelay, jobID)
+}
+
+// parkDeferredPublicationJob moves a runnable job with an unknown publication
+// presence to retry_wait with a future retry_at, so ClaimNext skips it until
+// the backoff lapses instead of reclaiming it on the next tick. Repeated
+// deferrals of the same job escalate: the delay doubles per consecutive
+// deferral, capped at one hour, so a permanently broken filesystem does not
+// cycle at a fixed delay. A job already in retry_wait gets its retry_at
+// pushed out the same way. Non-runnable jobs stay where they are; the next
+// startup or maintenance pass retries them. The park makes no request, so it
+// carries retry_kind source_gate and never spends the retry budget. It
+// reports whether it newly scheduled the job.
+func (s *Service) parkDeferredPublicationJob(ctx context.Context, jobID string) bool {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return false
+	}
+	nowFn := time.Now
+	if s.Now != nil {
+		nowFn = s.Now
+	}
+	base := s.RetryDelay
+	if base <= 0 {
+		base = 30 * time.Second
+	}
+	const maxDelay = time.Hour
+	s.deferredMu.Lock()
+	if s.deferredDelay == nil {
+		s.deferredDelay = make(map[string]time.Duration)
+	}
+	delay := base
+	if prev, ok := s.deferredDelay[jobID]; ok && prev > 0 {
+		delay = 2 * prev
+		if delay <= 0 || delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	next := nowFn().Add(delay)
+	s.deferredMu.Unlock()
+	detail := map[string]any{"reason": "publication_presence_unknown", "retry_kind": retryKindSourceGate}
+	switch row.State {
+	case job.StateValidating, job.StateFetching, job.StateResolving:
+		if err := s.Jobs.Transition(ctx, jobID, row.State, job.StateRetryWait, detail, job.WithRetryAt(next)); err != nil {
+			if errors.Is(err, job.ErrConflict) {
+				return false
+			}
+			log.Printf("papio: parking deferred publication job %s: %v", jobID, err)
+			return false
+		}
+	case job.StateRetryWait:
+		res, err := s.Jobs.S.DB().ExecContext(ctx,
+			`UPDATE jobs SET retry_at = ?, updated_at = ? WHERE id = ? AND state = ?`,
+			store.FormatTime(next), store.Now(), jobID, job.StateRetryWait)
+		if err != nil {
+			log.Printf("papio: parking deferred publication job %s: %v", jobID, err)
+			return false
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false
+		}
+	default:
+		return false
+	}
+	s.deferredMu.Lock()
+	s.deferredDelay[jobID] = delay
+	s.deferredMu.Unlock()
+	return true
+}
+
+// probePublishedDestination verifies a stored artifact and reports whether
+// recovery may proceed and whether a valid destination waits. Only a Verify
+// failure that wraps fs.ErrNotExist means absent; any other failure
+// (permissions, I/O, TCC) is unknown and defers the row until a later pass.
+func (s *Service) probePublishedDestination(sha string) (proceed, exists bool) {
+	if err := s.Artifacts.Verify(sha); err == nil {
+		return true, true
+	} else if errors.Is(err, fs.ErrNotExist) {
+		return true, false
+	}
+	return false, false
+}
+
+// probeQuarantineFile stats one quarantine path and reports whether recovery
+// may proceed and whether a regular file waits. Only a present regular file
+// or a confirmed absence lets recovery proceed; a stat failure or a
+// non-regular path (for example a directory) is unknown and defers the row.
+func probeQuarantineFile(path string) (proceed, exists bool) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return errors.Is(statErr, fs.ErrNotExist), false
+	}
+	if !info.Mode().IsRegular() {
+		return false, false
+	}
+	return true, true
 }
 
 func (s *Service) reconcilePreparedPublications(ctx context.Context, jobID string) error {
@@ -4968,6 +5176,7 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 			if _, err := s.consumePublishedPublication(ctx, publication.ID); err != nil {
 				return err
 			}
+			s.clearDeferredPublicationState(publication.ID, publication.JobID)
 			continue
 		}
 		recoveryOwner := ""
@@ -4991,9 +5200,7 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 				}
 			}
 		}
-		destExists := s.Artifacts.Verify(publication.SHA256) == nil
-		quarantineInfo, quarantineErr := os.Stat(publication.QuarantinePath)
-		quarantineExists := quarantineErr == nil && quarantineInfo.Mode().IsRegular()
+		destProceed, destExists := s.probePublishedDestination(publication.SHA256)
 		dest := ""
 		if destExists {
 			resolved, pathErr := s.Artifacts.ArtifactPath(publication.SHA256)
@@ -5002,18 +5209,32 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 			}
 			dest = resolved
 		}
+		if !destProceed {
+			s.deferPublicationRow(ctx, publication, recoveryOwner,
+				"destination presence is unknown, keeping the journal row for a later pass")
+			continue
+		}
 		switch {
 		case destExists:
 			_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
 				return job.PromotionResult{Path: dest}, nil
 			})
-		case quarantineExists:
-			_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
-				path, created, promoteErr := s.Artifacts.Promote(publication.QuarantinePath, publication.SHA256)
-				return job.PromotionResult{Path: path, Created: created}, promoteErr
-			})
 		default:
-			_, err = s.Jobs.DiscardPublication(ctx, publication.ID)
+			quarantineProceed, quarantineExists := probeQuarantineFile(publication.QuarantinePath)
+			if !quarantineProceed {
+				s.deferPublicationRow(ctx, publication, recoveryOwner,
+					"quarantine presence is unknown, keeping the journal row for a later pass")
+				continue
+			}
+			switch {
+			case quarantineExists:
+				_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
+					path, created, promoteErr := s.Artifacts.Promote(publication.QuarantinePath, publication.SHA256)
+					return job.PromotionResult{Path: path, Created: created}, promoteErr
+				})
+			default:
+				_, err = s.Jobs.DiscardPublication(ctx, publication.ID)
+			}
 		}
 		if recoveryOwner != "" {
 			_ = s.Jobs.Release(context.WithoutCancel(ctx), publication.JobID, recoveryOwner)
@@ -5027,6 +5248,7 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 				return err
 			}
 		}
+		s.clearDeferredPublicationState(publication.ID, publication.JobID)
 	}
 	return nil
 }

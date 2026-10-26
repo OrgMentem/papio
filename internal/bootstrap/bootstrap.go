@@ -621,7 +621,7 @@ func NewWithEnvironment(ctx context.Context, cfg config.Config, version string, 
 	// [drive] enabled = true; Browser is attached once the bridge exists below.
 	pacer := &drive.Pacer{Jobs: jobs, Config: cfg, Notifier: router}
 	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), pacer, retractions, router}
-	maintenance = append(maintenance, service.ManagedFilingRetrier(), publicationWatches)
+	maintenance = append(maintenance, service.ManagedFilingRetrier(), service.PreparedPublicationRecovery(), publicationWatches)
 	controlService, controlRunner, err := openAdapterControl(cfg)
 	if err != nil {
 		return nil, err

@@ -3,12 +3,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1327,6 +1329,542 @@ func TestRecoverPreparedPublicationsSweepsAbandonedComponentStage(t *testing.T) 
 	}
 	if _, err := os.Stat(stage); !os.IsNotExist(err) {
 		t.Fatalf("abandoned component stage remains at %s: %v", stage, err)
+	}
+}
+
+// TestConsumePublishedPublicationKeepsQuarantineBytesOnCommitFailure pins the
+// benign failure order directly against consumePublishedPublication: a commit
+// failure must restore the journal row and leave the quarantine bytes in
+// place. The package hook fails the commit after the row delete, so the bytes
+// must still exist and the row must survive.
+func TestConsumePublishedPublicationKeepsQuarantineBytesOnCommitFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_consume_commit_failure", "consume-commit", "consume-commit")
+	if _, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+	}); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	qdir, err := svc.Artifacts.QuarantineDir(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined := filepath.Join(qdir, "redundant.pdf")
+	if err := os.WriteFile(quarantined, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := jobs.GetArtifact(ctx, sha)
+	if err != nil || stored == nil {
+		t.Fatalf("artifact metadata = %+v, %v", stored, err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_consume_commit_failure", JobID: row.ID, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: quarantined, Artifact: *stored,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	consumePublishedBeforeCommitForTest = func() error { return errors.New("consume commit interrupted") }
+	t.Cleanup(func() { consumePublishedBeforeCommitForTest = nil })
+	if _, err := svc.consumePublishedPublication(ctx, "publication_consume_commit_failure"); err == nil {
+		t.Fatal("consume succeeded despite forced commit failure")
+	}
+	consumePublishedBeforeCommitForTest = nil
+	prepared, err := jobs.PreparedPublications(ctx, row.ID)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared = %+v, %v; want the restored journal row", prepared, err)
+	}
+	if got, err := os.ReadFile(quarantined); err != nil || string(got) != string(body) {
+		t.Fatalf("quarantine bytes = %q, %v; want intact after failed commit", got, err)
+	}
+}
+
+// TestRecoverPreparedPublicationsKeepsJournalOnUnknownDestination pins the
+// deferred row arm of reconcilePreparedPublicationsForOwner: a destination
+// read error that is not absence is unknown, so recovery keeps the journal
+// row and the artifact metadata and returns nil for the deferred row. A
+// directory in place of the artifact file makes Verify fail on every OS.
+func TestRecoverPreparedPublicationsKeepsJournalOnUnknownDestination(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_recover_unknown_destination", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("unknown destination")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(qdir, "candidate.tmp")
+	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := job.PublicationInput{
+		ID: "publication_unknown_destination", JobID: id, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: filepath.Join(qdir, "missing-quarantine.pdf"),
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1, Path: dest, IdentityResult: "pass",
+		},
+	}
+	if err := jobs.PreparePublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DELETE FROM job_artifacts`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.reconcilePreparedPublications(ctx, id); err != nil {
+		t.Fatalf("deferred unknown destination must not fail startup: %v", err)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared = %+v, %v; want retained journal", prepared, err)
+	}
+	art, err := jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("artifact metadata = %+v, %v; want retained", art, err)
+	}
+	if _, err := os.Stat(tempPath); err != nil {
+		t.Fatalf("quarantine file was collateral of unknown destination: %v", err)
+	}
+}
+
+// TestRecoverPreparedPublicationsKeepsJournalOnUnknownQuarantine pins the
+// quarantine arm the same way: a directory in place of the expected
+// quarantine file is not absence, so recovery keeps the journal row and the
+// artifact metadata and returns nil for the deferred row.
+func TestRecoverPreparedPublicationsKeepsJournalOnUnknownQuarantine(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_recover_unknown_quarantine", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("unknown quarantine")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineAsDir := filepath.Join(qdir, "unexpected-dir")
+	if err := os.MkdirAll(quarantineAsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("fixture destination = %v; want genuinely absent so only the quarantine probe defers", err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_unknown_quarantine", JobID: id, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: quarantineAsDir,
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1, Path: dest, IdentityResult: "pass",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared = %+v, %v; want one durable owner", prepared, err)
+	}
+	if err := svc.reconcilePreparedPublications(ctx, id); err != nil {
+		t.Fatalf("deferred unknown quarantine must not fail startup: %v", err)
+	}
+	prepared, err = jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared = %+v, %v; want retained journal", prepared, err)
+	}
+	art, err := jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("artifact metadata = %+v, %v; want retained", art, err)
+	}
+	if _, err := svc.Jobs.HasPublicationEdge(ctx, id, sha, job.PublicationRoleMain); err != nil {
+		t.Fatalf("edge check = %v; want a clean probe after unknown quarantine", err)
+	}
+}
+
+// TestRecoverPreparedPublicationsContinuesPastUnknownRow settles one
+// recoverable publication while an earlier unknown row defers: startup must
+// return nil and the deferred row keeps its journal metadata.
+func TestRecoverPreparedPublicationsContinuesPastUnknownRow(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	unknownID, err := jobs.CreateRequest(ctx, "wr_recover_unknown_first", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownBody := pdfBytes("unknown first")
+	unknownSum := sha256.Sum256(unknownBody)
+	unknownSHA := hex.EncodeToString(unknownSum[:])
+	unknownQDir, err := svc.Artifacts.QuarantineDir(unknownID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownDest, err := svc.Artifacts.ArtifactPath(unknownSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_unknown_first", JobID: unknownID, Role: job.PublicationRoleMain, SHA256: unknownSHA,
+		QuarantinePath: filepath.Join(unknownQDir, "missing-quarantine.pdf"),
+		Artifact: job.Artifact{
+			SHA256: unknownSHA, SizeBytes: int64(len(unknownBody)), MIME: "application/pdf",
+			PageCount: 1, Path: unknownDest, IdentityResult: "pass",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(unknownDest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DELETE FROM job_artifacts`); err != nil {
+		t.Fatal(err)
+	}
+	cleanID, err := jobs.CreateRequest(ctx, "wr_recover_clean_second", work.Work{DOI: "10.1003/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanBody := pdfBytes("clean second")
+	cleanSum := sha256.Sum256(cleanBody)
+	cleanSHA := hex.EncodeToString(cleanSum[:])
+	cleanQDir, err := svc.Artifacts.QuarantineDir(cleanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanDest, err := svc.Artifacts.ArtifactPath(cleanSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cleanDest, cleanBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_clean_second", JobID: cleanID, Role: job.PublicationRoleMain, SHA256: cleanSHA,
+		QuarantinePath: filepath.Join(cleanQDir, "missing-quarantine.pdf"),
+		Artifact: job.Artifact{
+			SHA256: cleanSHA, SizeBytes: int64(len(cleanBody)), MIME: "application/pdf",
+			PageCount: 1, Path: cleanDest, IdentityResult: "pass",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("startup recovery must defer the unknown row and continue: %v", err)
+	}
+	unknownPrepared, err := jobs.PreparedPublications(ctx, unknownID)
+	if err != nil || len(unknownPrepared) != 1 {
+		t.Fatalf("unknown prepared = %+v, %v; want deferred journal", unknownPrepared, err)
+	}
+	if art, err := jobs.GetArtifact(ctx, unknownSHA); err != nil || art == nil {
+		t.Fatalf("unknown artifact = %+v, %v; want retained", art, err)
+	}
+	cleanPrepared, err := jobs.PreparedPublications(ctx, cleanID)
+	if err != nil || len(cleanPrepared) != 0 {
+		t.Fatalf("clean prepared = %+v, %v; want settled", cleanPrepared, err)
+	}
+}
+
+// TestProcessDefersWorkerOnUnknownPublicationPresence pins the Process path:
+// an unknown row defers the worker's own publication instead of failing it,
+// and the journal survives so a later tick retries.
+func TestProcessDefersWorkerOnUnknownPublicationPresence(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Fetch = fakeDownload(new(int))
+	svc.Validate = passValidation()
+	id, err := jobs.CreateRequest(ctx, "wr_process_unknown_publication", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateFetching, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateFetching, job.StateValidating, nil); err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("process unknown")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(qdir, "candidate.tmp")
+	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := job.PublicationInput{
+		ID: "publication_process_unknown", JobID: id, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: tempPath,
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1, Path: dest, IdentityResult: "pass",
+		},
+		FromState: job.StateValidating, ToState: job.StateReady,
+		TransitionDetail: map[string]any{"source": "fixture"},
+	}
+	if err := jobs.PreparePublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	// The destination exists as a directory: Verify fails with a non-absence
+	// error, so Process must defer the worker row instead of failing it.
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobs.Claim(ctx, id, "process-owner", time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim = %+v, %v; want leased row", claimed, err)
+	}
+	if err := svc.Process(ctx, claimed); err != nil {
+		t.Fatalf("worker must defer the unknown row, not fail: %v", err)
+	}
+	deferred, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(deferred) != 1 {
+		t.Fatalf("deferred = %+v, %v; want retained journal", deferred, err)
+	}
+	parked, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.State != job.StateRetryWait || parked.RetryAt == "" {
+		t.Fatalf("parked = %+v; want retry_wait with a future retry_at so the worker does not hot-loop", parked)
+	}
+	if at, err := time.Parse(time.RFC3339Nano, parked.RetryAt); err != nil || !at.After(time.Now().Add(-time.Minute)) {
+		t.Fatalf("retry_at = %q, %v; want a future schedule", parked.RetryAt, err)
+	}
+	// The worker released the job, but the retry time has not lapsed: a
+	// second claim must not pick the deferred job back up immediately.
+	if again, err := jobs.ClaimNext(ctx, "process-owner-2", time.Minute); err != nil || again != nil {
+		t.Fatalf("second claim = %+v, %v; want nil before the retry time", again, err)
+	}
+}
+
+// TestPreparedPublicationRecoveryMaintenanceSettlesAfterFilesystemHeals pins
+// the maintenance pass: a deferred row on a non-runnable job is retried by
+// RunDue without waiting for the next daemon start, and settles once the
+// destination heals.
+func TestPreparedPublicationRecoveryMaintenanceSettlesAfterFilesystemHeals(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_maintenance_unknown_heals", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("maintenance heals")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_maintenance_heals", JobID: id, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: filepath.Join(qdir, "missing-quarantine.pdf"),
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1, Path: dest, IdentityResult: "pass",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PreparedPublicationRecovery().RunDue(ctx); err != nil {
+		t.Fatalf("maintenance must defer the unknown row, not fail: %v", err)
+	}
+	if prepared, err := jobs.PreparedPublications(ctx, id); err != nil || len(prepared) != 1 {
+		t.Fatalf("deferred = %+v, %v; want retained journal", prepared, err)
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PreparedPublicationRecovery().RunDue(ctx); err != nil {
+		t.Fatalf("maintenance retry after heal: %v", err)
+	}
+	if prepared, err := jobs.PreparedPublications(ctx, id); err != nil || len(prepared) != 0 {
+		t.Fatalf("settled = %+v, %v; want no journal rows after heal", prepared, err)
+	}
+}
+
+// TestDeferredPublicationLogsOnlyOnTransitionIntoDeferral pins the quiet
+// maintenance contract: repeating the recovery pass while a row stays
+// unknown must not log one line per row per pass. The first pass logs the
+// deferral; the second pass keeps the journal silently.
+func TestDeferredPublicationLogsOnlyOnTransitionIntoDeferral(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_deferred_log_once", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("log once")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_log_once", JobID: id, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: filepath.Join(qdir, "missing-quarantine.pdf"),
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1, Path: dest, IdentityResult: "pass",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	if err := svc.PreparedPublicationRecovery().RunDue(ctx); err != nil {
+		t.Fatalf("first maintenance: %v", err)
+	}
+	if got := strings.Count(logs.String(), "publication_log_once"); got != 1 {
+		t.Fatalf("first pass log mentions = %d, want 1; output:\n%s", got, logs.String())
+	}
+	logs.Reset()
+	if err := svc.PreparedPublicationRecovery().RunDue(ctx); err != nil {
+		t.Fatalf("second maintenance: %v", err)
+	}
+	if got := strings.Count(logs.String(), "publication_log_once"); got != 0 {
+		t.Fatalf("second pass log mentions = %d, want 0; output:\n%s", got, logs.String())
+	}
+	if prepared, err := jobs.PreparedPublications(ctx, id); err != nil || len(prepared) != 1 {
+		t.Fatalf("deferred = %+v, %v; want retained journal", prepared, err)
+	}
+}
+
+// TestParkDeferredPublicationJobEscalatesBackoff pins the escalating park:
+// repeated deferrals of the same runnable job push retry_at out by doubling
+// delays capped at one hour, so a permanently broken filesystem does not
+// cycle at a fixed delay.
+func TestParkDeferredPublicationJobEscalatesBackoff(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.RetryDelay = time.Minute
+	base := time.Date(2026, time.October, 26, 12, 0, 0, 0, time.UTC)
+	svc.Now = func() time.Time { return base }
+	id, err := jobs.CreateRequest(ctx, "wr_deferred_backoff", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateFetching, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateFetching, job.StateValidating, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.parkDeferredPublicationJob(ctx, id) {
+		t.Fatal("first park must schedule the validating job")
+	}
+	first, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != job.StateRetryWait {
+		t.Fatalf("state = %s, want retry_wait after first park", first.State)
+	}
+	wantFirst := base.Add(time.Minute)
+	if got, err := time.Parse(time.RFC3339Nano, first.RetryAt); err != nil || !got.Equal(wantFirst) {
+		t.Fatalf("retry_at = %q, %v; want %s", first.RetryAt, err, wantFirst.Format(time.RFC3339Nano))
+	}
+	svc.Now = func() time.Time { return base.Add(61 * time.Minute) }
+	if !svc.parkDeferredPublicationJob(ctx, id) {
+		t.Fatal("second park must push an already-parked job out again")
+	}
+	second, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecond := base.Add(61*time.Minute + 2*time.Minute)
+	if got, err := time.Parse(time.RFC3339Nano, second.RetryAt); err != nil || !got.Equal(wantSecond) {
+		t.Fatalf("retry_at = %q, %v; want doubled %s", second.RetryAt, err, wantSecond.Format(time.RFC3339Nano))
+	}
+	svc.Now = func() time.Time { return base.Add(5 * time.Hour) }
+	for range 10 {
+		if !svc.parkDeferredPublicationJob(ctx, id) {
+			t.Fatal("park must keep pushing retry_at out")
+		}
+	}
+	capped, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := time.Parse(time.RFC3339Nano, capped.RetryAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest := svc.Now().Add(time.Hour); got.After(latest.Add(time.Second)) {
+		t.Fatalf("retry_at = %s; want capped at one hour past now (%s)", got.Format(time.RFC3339Nano), latest.Format(time.RFC3339Nano))
 	}
 }
 
