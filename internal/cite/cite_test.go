@@ -121,7 +121,7 @@ func TestBibTeXEscapesReservedCharactersAndJoinsAuthors(t *testing.T) {
 	r := article()
 	r.Title = "50% of R&D {matters}_here"
 	out := string(BibTeX([]Record{r}))
-	if !strings.Contains(out, `50\% of R\&D \{matters\}\_here`) {
+	if !strings.Contains(out, `50\% of R\&D \textbraceleft{}matters\textbraceright{}\_here`) {
 		t.Fatalf("BibTeX output does not escape reserved characters:\n%s", out)
 	}
 	if !strings.Contains(out, "author = {{Joshua Holzer} and {Ada Lovelace}}") {
@@ -242,6 +242,35 @@ func TestProjectionsStripTerminalControlBytes(t *testing.T) {
 	}
 }
 
+func TestProjectionsPreserveWhitespaceWordBoundaries(t *testing.T) {
+	for _, separator := range []string{"\n", "\r", "\r\n", "\t", "\v", "\f", " \n\t ", "\u0085", "\u2028"} {
+		t.Run("separator="+separator, func(t *testing.T) {
+			value := "a" + separator + "b"
+			r := Record{
+				Title:     value,
+				Authors:   []string{value},
+				Container: value,
+				Abstract:  value,
+			}
+			ris := string(RIS([]Record{r}))
+			for _, tag := range []string{"TI", "AU", "T2", "AB"} {
+				if want := tag + "  - a b\r\n"; !strings.Contains(ris, want) {
+					t.Errorf("RIS missing %q:\n%s", want, ris)
+				}
+			}
+			bibtex := string(BibTeX([]Record{r}))
+			for _, field := range []string{"title", "journal", "abstract"} {
+				if want := field + " = {a b}"; !strings.Contains(bibtex, want) {
+					t.Errorf("BibTeX missing %q:\n%s", want, bibtex)
+				}
+			}
+			if !strings.Contains(bibtex, "author = {{a b}}") {
+				t.Errorf("BibTeX lost the author word boundary:\n%s", bibtex)
+			}
+		})
+	}
+}
+
 func TestBibTeXZeroFieldEntryStaysWellFormed(t *testing.T) {
 	out := string(BibTeX([]Record{{}}))
 	// The comma after the citation key is BibTeX syntax; the malformed
@@ -266,8 +295,69 @@ func TestIdentityPrefersOpenAlexOverSharedISBNAndCanonicalizesISBN(t *testing.T)
 }
 
 func TestBibTeXVerbatimFieldKeepsEntryWellFormedWithUnbalancedBrace(t *testing.T) {
-	out := string(BibTeX([]Record{{DOI: "10.1000/a}b"}}))
-	if strings.Contains(out, "doi = {10.1000/a}b}") {
-		t.Fatalf("unbalanced brace closed the field early:\n%s", out)
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: "10.1000/a}b_1", want: "10.1000/a%7Db_1"},
+		{value: "10.1000/a{b_1", want: "10.1000/a%7Bb_1"},
+		{value: "10.1000/a}{b_1", want: "10.1000/a%7D%7Bb_1"},
+		{value: "10.1000/a{b}_1", want: "10.1000/a{b}_1"},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			out := string(BibTeX([]Record{{DOI: test.value, ArXiv: test.value}}))
+			assertBibTeXFieldsBalanced(t, out)
+			for _, field := range []string{"doi", "eprint"} {
+				if want := field + " = {" + test.want + "}"; !strings.Contains(out, want) {
+					t.Errorf("BibTeX missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestBibTeXTextFieldsKeepStrayBracesBalanced(t *testing.T) {
+	for _, value := range []string{"f{x", "f}x", "f}{x", "f{{x}", `f\{x`, `f\}x`} {
+		t.Run(value, func(t *testing.T) {
+			out := string(BibTeX([]Record{{
+				Title:     value,
+				Authors:   []string{value},
+				Container: value,
+				Abstract:  value,
+			}}))
+			assertBibTeXFieldsBalanced(t, out)
+		})
+	}
+}
+
+func assertBibTeXFieldsBalanced(t *testing.T, out string) {
+	t.Helper()
+	fields := 0
+	for _, line := range strings.Split(out, "\n") {
+		_, value, ok := strings.Cut(line, " = ")
+		if !ok {
+			continue
+		}
+		fields++
+		value = strings.TrimSuffix(value, ",")
+		depth := 0
+		// BibTeX and biber count raw braces, including those after a backslash.
+		for i, r := range value {
+			switch r {
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+			if depth < 0 || (depth == 0 && i != len(value)-1) {
+				t.Fatalf("BibTeX field closes early in %q:\n%s", line, out)
+			}
+		}
+		if depth != 0 {
+			t.Fatalf("BibTeX field has unclosed braces in %q:\n%s", line, out)
+		}
+	}
+	if fields == 0 {
+		t.Fatalf("BibTeX output has no fields:\n%s", out)
 	}
 }
