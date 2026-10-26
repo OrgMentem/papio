@@ -919,6 +919,10 @@ type landingSeed struct {
 // only url_keys — never the landing URL or the derived PDF URL.
 const landingDerivedEventKind = "job.landing_derived"
 
+// landingReadEventKind keeps an unfinished landing read retryable even before
+// a derived candidate exists. The latest event settles or retries its parent.
+const landingReadEventKind = "job.landing_read"
+
 // expandLandingSeeds is the acquisition side of the 10.3389/feduc.2018.00095
 // incident: Unpaywall and OpenAlex both returned the identical expired
 // Azure SAS link, both candidates 403'd and were correctly marked invalid,
@@ -933,7 +937,7 @@ const landingDerivedEventKind = "job.landing_derived"
 // version, reuse license and identity confidence, so ranking, budgets and
 // source policy still apply to it exactly as they did to the parent — this
 // is the same candidate reached a second way, never a new resolver source.
-func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, seeds []landingSeed) (bool, error) {
+func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, seeds []landingSeed, plan *retryPlan) (bool, error) {
 	if len(seeds) == 0 {
 		return false, nil
 	}
@@ -953,15 +957,20 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 	inserted := false
 	for _, seed := range seeds {
 		pdfURL, err := s.LandingReader.PDFURLFor(ctx, seed.landingURL)
+		if ctx.Err() != nil {
+			return inserted, ctx.Err()
+		}
+		delay, temporary := resolver.Temporary(err)
+		if err := s.Jobs.RecordEvent(ctx, row.ID, landingReadEventKind, map[string]any{
+			"parent_url_key": seed.parentKey, "retryable": temporary,
+		}); err != nil {
+			return inserted, err
+		}
+		if temporary {
+			plan.observeCandidateTemporary(s.Now(), delay, s.RetryDelay)
+		}
 		if err != nil {
-			if ctx.Err() != nil {
-				return inserted, ctx.Err()
-			}
-			// landingmeta.ErrConflictingPDFURL (two disagreeing citation_pdf_url
-			// tags) and every other read failure both mean "no usable
-			// derivation" for this seed: this is a fallback riding on a
-			// candidate that already failed permanently, and must never turn a
-			// landing-page read failure into a job-ending error.
+			// Conflicting tags are permanent; an unreadable page is not.
 			continue
 		}
 		if pdfURL == "" || tried[pdfURL] {
@@ -1005,9 +1014,9 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 	return inserted, nil
 }
 
-// rederivableLandingSeeds finds every landing_derived candidate an earlier
-// pass inserted that is still pending or retryable — never acquired, never
-// permanently failed — and rebuilds the seed that produced it. Without this,
+// rederivableLandingSeeds rebuilds unfinished landing reads and every
+// landing_derived candidate that is still pending or retryable — never
+// acquired or permanently failed. Without this,
 // such a row is a ticking bomb: candidateRows only ever populates live from
 // resolver output, and no resolver produces a landing-derived URL, so on the
 // very next pass live has no entry for its url_key. A single retryable fetch
@@ -1037,13 +1046,20 @@ func (s *Service) rederivableLandingSeeds(ctx context.Context, row *job.Row, liv
 		return nil, nil, err
 	}
 	pendingDerived := make(map[string]bool)
+	pendingReads := make(map[string]bool)
+	seenLanding := make(map[string]bool)
 	var seeds []landingSeed
 	for _, event := range events {
-		if kind, _ := event["kind"].(string); kind != landingDerivedEventKind {
+		kind, _ := event["kind"].(string)
+		if kind != landingDerivedEventKind && kind != landingReadEventKind {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
 		parentKey, _ := detail["parent_url_key"].(string)
+		if kind == landingReadEventKind {
+			pendingReads[parentKey], _ = detail["retryable"].(bool)
+			continue
+		}
 		derivedKey, _ := detail["url_key"].(string)
 		if parentKey == "" || derivedKey == "" {
 			continue
@@ -1067,9 +1083,18 @@ func (s *Service) rederivableLandingSeeds(ctx context.Context, row *job.Row, liv
 		}
 		pendingDerived[derivedKey] = true
 		parent, ok := live[parentKey]
-		if !ok {
-			continue // this pass's resolvers no longer reproduce the parent; unusable
+		if !ok || seenLanding[parent.Landing] {
+			continue // this pass's resolvers no longer reproduce the parent, or it is already seeded
 		}
+		seenLanding[parent.Landing] = true
+		seeds = append(seeds, landingSeed{landingURL: parent.Landing, parent: parent, parentKey: parentKey})
+	}
+	for parentKey, pending := range pendingReads {
+		parent, ok := live[parentKey]
+		if !pending || !ok || seenLanding[parent.Landing] {
+			continue
+		}
+		seenLanding[parent.Landing] = true
 		seeds = append(seeds, landingSeed{landingURL: parent.Landing, parent: parent, parentKey: parentKey})
 	}
 	return seeds, pendingDerived, nil
@@ -1912,7 +1937,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		for _, seed := range reseeds {
 			seenLanding[seed.landingURL] = true
 		}
-		if _, err := s.expandLandingSeeds(ctx, row, live, reseeds); err != nil {
+		if _, err := s.expandLandingSeeds(ctx, row, live, reseeds, &plan); err != nil {
 			return err
 		}
 	}
@@ -1934,7 +1959,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			if !landingExpansionTried {
 				landingExpansionTried = true
 				if s.LandingReader != nil {
-					ok, err := s.expandLandingSeeds(ctx, row, live, landingSeeds)
+					ok, err := s.expandLandingSeeds(ctx, row, live, landingSeeds, &plan)
 					if err != nil {
 						return err
 					}
@@ -2050,9 +2075,8 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			}
 			return err
 		}
-		// One policy binding for the whole iteration: the Defer on a retryable
-		// fetch failure below must name the same quota identity the Acquire
-		// here reserved against, or the gate lands on a different row.
+		// Candidate costs retain their source policy, but a file host's
+		// retry delay must never close that source's metadata API gate.
 		policy := s.sourcePolicy(stored.Source)
 		if s.Budgets != nil {
 			if err := s.Budgets.Acquire(ctx, stored.Source, policy, stored.CostUSD); err != nil {
@@ -2178,10 +2202,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
 					return err
 				}
-				sourceRetry := plan.observeCandidateTemporary(s.Now(), delay, s.RetryDelay)
-				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, stored.Source, policy, sourceRetry)
-				}
+				plan.observeCandidateTemporary(s.Now(), delay, s.RetryDelay)
 			case fetch.ClassBlocked:
 				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 					return err

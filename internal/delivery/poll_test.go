@@ -521,6 +521,55 @@ func TestPollFailureClassesLeaveStateUnchanged(t *testing.T) {
 	}
 }
 
+func TestPollBodyReadFailuresRemainTransient(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		name := "truncated"
+		if timeout {
+			name = "timeout"
+		}
+		t.Run(name, func(t *testing.T) {
+			svc, clock := testServiceClock(t)
+			ctx := context.Background()
+			req := newLiveRequest(t, svc, "body-"+name, *clock)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", "1000")
+				_, _ = w.Write([]byte(`{"TransactionNumber":555,`))
+				w.(http.Flusher).Flush()
+				if timeout {
+					<-r.Context().Done()
+				}
+			}))
+			defer server.Close()
+			client := illiad.NewWithOptions(illiad.Options{
+				Client: server.Client(), BaseURL: server.URL, APIKey: "key",
+				RequestTimeout: time.Second,
+			})
+			result, err := svc.Poll(ctx, req, PollDeps{Client: client, StatusPollMinutes: 60})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Settled || result.State != StateSubmitted {
+				t.Fatalf("poll result = %+v, want submitted and unsettled", result)
+			}
+			got, err := svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.LastPollErrorClass != PollErrorClassTransient || got.ConsecutivePollFailures != 1 {
+				t.Fatalf("poll failure = %+v, want one transient failure", got)
+			}
+			next, err := time.Parse(time.RFC3339Nano, got.NextCheckAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !next.After(*clock) || next.After(clock.Add(maxPollInterval)) {
+				t.Fatalf("next check = %v, want a retry within %v, not disabled polling", next, maxPollInterval)
+			}
+		})
+	}
+}
+
 func TestPollContractDriftDisablesPolling(t *testing.T) {
 	svc, clock := testServiceClock(t)
 	ctx := context.Background()

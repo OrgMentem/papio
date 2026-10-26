@@ -468,7 +468,7 @@ func decodeBoundedJSON(body io.Reader, maximum int64, destination any) error {
 	}
 	data, err := io.ReadAll(io.LimitReader(body, maximum+1))
 	if err != nil {
-		return err
+		return &resolver.TemporaryError{Err: err}
 	}
 	if int64(len(data)) > maximum {
 		return fmt.Errorf("response exceeds %d-byte limit", maximum)

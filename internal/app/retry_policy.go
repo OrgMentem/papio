@@ -72,8 +72,8 @@ func (p *retryPlan) observeResolverTemporary(now time.Time, delay, fallback time
 	return at
 }
 
-// observeCandidateTemporary records a retryable candidate fetch and returns
-// its wake time so the caller can defer the same budget identity.
+// observeCandidateTemporary records a retryable file or landing-page fetch
+// and returns its wake time. That wait never closes the source's API gate.
 func (p *retryPlan) observeCandidateTemporary(now time.Time, delay, fallback time.Duration) time.Time {
 	at := earlierRetry(time.Time{}, now, delay, fallback)
 	p.candidateTemporary = earlierTime(p.candidateTemporary, at)
