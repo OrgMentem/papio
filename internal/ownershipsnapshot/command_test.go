@@ -545,3 +545,60 @@ func TestCommandProviderCancelledWaiterReturnsWhileSharedRunFinishes(t *testing.
 		t.Fatalf("runs = %d, want 1 shared run", got)
 	}
 }
+
+// The count-collapse guard must survive a daemon restart: a fresh provider on
+// the same data directory still rejects a truncated command export instead of
+// publishing it as the whole library.
+func TestCommandCollapseBaselineSurvivesProviderRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	queries := []ownership.Query{doiQuery("10.1000/one")}
+
+	first := newCommandFixture(t)
+	first.setData(sourceRecordsWithOneDOI(100))
+	source := config.LibrarySource{
+		Name: "papis-live", Kind: config.LibraryKindCommand,
+		Argv: []string{"/bin/sh", first.script}, Format: "bibtex",
+		Claim: config.LibraryClaimPDFPresent,
+	}
+	provider, err := NewProviderWithDataDir(source, time.Now, dataDir)
+	if err != nil {
+		t.Fatalf("NewProviderWithDataDir: %v", err)
+	}
+	defer func() { _ = provider.(*commandProvider).Close() }()
+	if _, health := provider.Lookup(context.Background(), queries); !health.Complete || health.EntryCount != 100 {
+		t.Fatalf("initial health = %+v, want a complete load of 100 entries", health)
+	}
+
+	// Simulating a restart: a fresh provider whose command now prints a
+	// single record must fail closed, not publish the fragment as complete.
+	second := newCommandFixture(t)
+	second.setData(oneEntryBibTeX("10.1000/one"))
+	source.Argv = []string{"/bin/sh", second.script}
+	restarted, err := NewProviderWithDataDir(source, time.Now, dataDir)
+	if err != nil {
+		t.Fatalf("NewProviderWithDataDir after restart: %v", err)
+	}
+	defer func() { _ = restarted.(*commandProvider).Close() }()
+	claims, health := restarted.Lookup(context.Background(), queries)
+	if health.Complete {
+		t.Fatalf("health = %+v, want an incomplete read after a collapse across restart", health)
+	}
+	if health.FailureCode != ownership.FailureCountCollapse {
+		t.Fatalf("FailureCode = %q, want %q", health.FailureCode, ownership.FailureCountCollapse)
+	}
+	if len(claims[0]) != 0 {
+		t.Fatalf("claims = %+v, want none from a collapsed first read", claims)
+	}
+}
+
+// An empty command export without a configured format is an empty library,
+// not a parse failure: there is no content to misclassify.
+func TestCommandEmptyOutputWithoutFormatIsAnEmptyLibrary(t *testing.T) {
+	fixture := newCommandFixture(t)
+	fixture.setData("")
+	provider := fixture.provider(newFakeClock(), func(source *config.LibrarySource) { source.Format = "" })
+	_, health := provider.Lookup(context.Background(), []ownership.Query{doiQuery("10.1000/one")})
+	if !health.Complete || health.EntryCount != 0 || health.FailureCode != "" {
+		t.Fatalf("health = %+v, want a complete empty library", health)
+	}
+}

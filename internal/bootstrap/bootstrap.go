@@ -566,7 +566,7 @@ func NewWithEnvironment(ctx context.Context, cfg config.Config, version string, 
 		// one. When zotio is configured, its behaviour is untouched.
 		providers := make([]ownership.Provider, 0, len(cfg.Library.Sources))
 		for _, source := range cfg.Library.Sources {
-			provider, err := ownershipsnapshot.NewProvider(source, time.Now)
+			provider, err := ownershipsnapshot.NewProviderWithDataDir(source, time.Now, cfg.DataDir)
 			if err != nil {
 				// Config validation already rejects unusable sources, so this is a
 				// programming error rather than user input; failing startup keeps a
