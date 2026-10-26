@@ -7071,6 +7071,157 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 	}
 }
 
+// TestCandidateOfferLoginRoutingIsPerResolverProfile pins that the
+// institutional candidate offer carries the same per-profile login identity
+// as the ordinary job offer. serviceMaterializationCandidate fills
+// LoginEntityID and ProquestAccountID from InstitutionFor at bridge.go:12465;
+// collapsing that lookup to the default institution would silently route a
+// named profile's candidates to the default IdP. It fails if the lookup is
+// collapsed to InstitutionFor("").
+func TestCandidateOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
+	cfg.Browser.ProquestAccountID = "12345"
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"institute": {
+			OpenURLBase:        "https://onesearch.library.example-institute.edu/discovery/openurl",
+			ShibbolethEntityID: "https://idp.example-institute.edu/idp/shibboleth",
+			ProquestAccountID:  "67890",
+		},
+		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
+	}
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	for _, test := range []struct {
+		name, resolver, wantEntityID, wantAccountID string
+	}{
+		{name: "default", wantEntityID: "https://idp.example.edu/entity", wantAccountID: "12345"},
+		{name: "named carries own identity", resolver: "institute", wantEntityID: "https://idp.example-institute.edu/idp/shibboleth", wantAccountID: "67890"},
+		{name: "named without identity leaks nothing", resolver: "bare"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := "wr_cand_login_" + strings.ReplaceAll(test.name, " ", "_")
+			jobID := parkInstitutional(t, jobs, req, handoffWork(), test.resolver)
+			profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+				ConfiguredName: "default", AuthorityDigest: "digest-" + jobID, AuthenticationClaimID: "auth-" + jobID,
+			}})
+			if err != nil || len(profiles) != 1 {
+				t.Fatalf("profile reconcile: %+v %v", profiles, err)
+			}
+			attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+				ID: "candidate-login-" + jobID, JobID: jobID, JobAttemptRevision: attempt,
+				InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+				RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+				PreRouteSafetyKey: "safety-login", SafetyDomainID: "domain-login",
+				AdapterRevision: "test-adapter", EffectContractID: "test-effect", Status: "eligible",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, err := jobs.Get(ctx, jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			action := openHandoffAction(t, jobs, jobID)
+			descriptor := schedulerDescriptor(t, jobs, candidate.ID, "eligible")
+			raw, err := b.serviceMaterializationCandidate(ctx, jobID, row, action, config.ModeDelegated, map[string]job.BrowserCandidateDescriptor{jobID: descriptor}, nil)
+			if err != nil || raw == nil {
+				t.Fatalf("candidate=%s err=%v", raw, err)
+			}
+			message, err := protocol.DecodeBrowserMessage(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, ok := message.Payload.(*protocol.InstitutionalCandidateOfferPayload)
+			if !ok {
+				t.Fatalf("payload = %T, want *protocol.InstitutionalCandidateOfferPayload", message.Payload)
+			}
+			if payload.LoginEntityID != test.wantEntityID {
+				t.Fatalf("login_entity_id = %q, want %q", payload.LoginEntityID, test.wantEntityID)
+			}
+			if payload.ProquestAccountID != test.wantAccountID {
+				t.Fatalf("proquest_account_id = %q, want %q", payload.ProquestAccountID, test.wantAccountID)
+			}
+		})
+	}
+}
+
+// TestOfferHostsArePerResolverProfile pins that browserOfferHosts resolves
+// the LibKey URL and the resolver host from the job's own resolver profile.
+// With a LibKey-configured named profile the offer must carry the profile's
+// resolver host and must not leak the default's. It fails if
+// browserOfferHosts collapses InstitutionFor to the default ("").
+func TestOfferHostsArePerResolverProfile(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"libby": {
+			OpenURLBase:     "https://onesearch.library.example-institute.edu/discovery/openurl",
+			LibKeyMode:      "link",
+			LibKeyLibraryID: 4321,
+		},
+	}
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	row := job.Row{ID: "job-libby-offer", Work: handoffWork(), Policy: job.Policy{Resolver: "libby"}}
+	action := job.HumanAction{Kind: handoffActionKind, Detail: "handoff available", RequiresAuth: true}
+	raw, err := b.offer(row, action, config.ModeDelegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := protocol.DecodeBrowserMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := message.Payload.(*protocol.JobOfferPayload).ProviderHosts
+	if !slices.Contains(hosts, "onesearch.library.example-institute.edu") {
+		t.Fatalf("provider hosts = %v, want the named profile resolver host", hosts)
+	}
+	for _, host := range hosts {
+		if host == "resolver.example.edu" {
+			t.Fatalf("provider hosts = %v, leaked the default resolver host", hosts)
+		}
+	}
+	if got := message.Payload.(*protocol.JobOfferPayload).OpenURL; got != "https://libkey.io/libraries/4321/10.1002/example.42" {
+		t.Fatalf("offer URL = %q, want the named profile LibKey link", got)
+	}
+}
+
+// TestDirectRouteFamilyIsPerResolverProfile pins that direct-route inference
+// reads the job's own resolver profile. The default profile here points at a
+// Sage journal host (family sage-doi-pdf) while the named profile points at
+// the Wiley host (family wiley-doi-pdfdirect). A job on the named profile
+// with a Wiley-prefixed DOI must select the Wiley family. It fails if the
+// inference collapses InstitutionFor to the default ("").
+func TestDirectRouteFamilyIsPerResolverProfile(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	cfg.Browser.OpenURLBase = "https://journals.sagepub.com/link"
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"wiley": {OpenURLBase: "https://onlinelibrary.wiley.com/action/showFullText"},
+	}
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	wileyWork := work.Work{DOI: "10.1002/example.42", Title: "Wiley Paper"}
+	jobID := parkInstitutional(t, jobs, "wr_direct_profile_family", wileyWork, "wiley")
+	row, err := jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := b.directRouteCandidates(ctx, *row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range candidates {
+		if strings.HasPrefix(c.RouteRevision, "wiley-") {
+			return
+		}
+	}
+	t.Fatalf("direct route candidates = %+v, want the Wiley family from the named profile", candidates)
+}
+
 // SweepAdoptions adopts a settled file WITHOUT any hello/extension connection —
 // the daemon owns completion; the browser plane is only a delivery hint.
 func TestSweepAdoptionsAdoptsWithoutHello(t *testing.T) {
@@ -11091,6 +11242,178 @@ func TestSweepGrabsParksNoIdentifier(t *testing.T) {
 	if err != nil || final == nil || final.State != grab.StateJobCreated || final.JobID != identified.JobID {
 		t.Fatalf("final grab = %+v, err=%v", final, err)
 	}
+}
+
+// TestIdentifyGrabGuardsAndKinds pins every IdentifyGrab gate the merged
+// coverage showed as unexecuted. Rows assert the consumer-visible outcome
+// and that a refusal moves no bytes and creates no job; the two happy rows
+// prove pmid and arxiv reach job creation. It fails if the wrong_state guard
+// is removed (identify on a non-parked grab must refuse).
+func TestIdentifyGrabGuardsAndKinds(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+
+	_ = grabDOIValidate
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 40, Excerpt: "No identifier printed anywhere on this page.\n"},
+		}, nil
+	}
+	parkOne := func(t *testing.T, title string) (string, string) {
+		t.Helper()
+		g, err := b.grabs.Allocate(ctx, "pdf.example.org", title)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+		writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+		if err := b.SweepGrabs(ctx); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		got, err := b.grabs.Get(ctx, g.ID)
+		if err != nil || got == nil || got.State != grab.StateParkedNoIdentifier {
+			t.Fatalf("grab before identify = %+v, err=%v; want parked_no_identifier", got, err)
+		}
+		return got.ID, got.QuarantinePath
+	}
+	jobCount := func(t *testing.T) int {
+		t.Helper()
+		var n int
+		if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("bound grab refuses with wrong_state", func(t *testing.T) {
+		grabID, quarantine := parkOne(t, "Identify Bound Refusal")
+		before := jobCount(t)
+		first := b.IdentifyGrab(ctx, grabID, "doi", "10.1234/grab.identify-bound")
+		if first.Outcome != "job_created" || first.JobID == "" {
+			t.Fatalf("first identify = %+v, want job_created", first)
+		}
+		bound, err := b.grabs.Get(ctx, grabID)
+		if err != nil || bound == nil || bound.State != grab.StateJobCreated {
+			t.Fatalf("grab after first identify = %+v, err=%v; want job_created", bound, err)
+		}
+		mid := jobCount(t)
+		if before+1 != mid {
+			t.Fatalf("jobs before=%d mid=%d, want exactly one new job from the first identify", before, mid)
+		}
+		// Re-identifying a non-parked grab must refuse before it creates a
+		// job or reuses the bound job's bytes: no new job appears and the
+		// first identify's job keeps its exact row. The mutation drops the
+		// guard, so the retry then creates a second job instead of refusing.
+		row, err := jobs.Get(ctx, bound.JobID)
+		if err != nil || row == nil {
+			t.Fatalf("bound job lookup: %+v err=%v", row, err)
+		}
+		snapshot := *row
+		if _, err := os.Stat(quarantine); !os.IsNotExist(err) {
+			t.Fatalf("quarantine path %s: err=%v; want it consumed by the first identify", quarantine, err)
+		}
+		retry := b.IdentifyGrab(ctx, grabID, "doi", "10.1234/grab.identify-other")
+		if retry.Outcome != "wrong_state" {
+			t.Fatalf("re-identify of bound grab = %+v, want wrong_state", retry)
+		}
+		after, err := b.grabs.Get(ctx, grabID)
+		if err != nil || after == nil || after.State != grab.StateJobCreated || after.JobID != bound.JobID {
+			t.Fatalf("grab after re-identify = %+v, err=%v; want it still bound to %s", after, err, bound.JobID)
+		}
+		if got := jobCount(t); got != mid {
+			t.Fatalf("jobs = %d, want %d: re-identifying a bound grab must create no job", got, mid)
+		}
+		rerow, err := jobs.Get(ctx, bound.JobID)
+		if err != nil || rerow == nil || !reflect.DeepEqual(*rerow, snapshot) {
+			t.Fatalf("bound job after retry = %+v (was %+v), err=%v; want the first identify's row unchanged", rerow, snapshot, err)
+		}
+		if _, err := os.Stat(quarantine); !os.IsNotExist(err) {
+			t.Fatalf("quarantine path %s reappeared: err=%v; the refused retry must move no bytes", quarantine, err)
+		}
+	})
+
+	t.Run("invalid kind refuses", func(t *testing.T) {
+		grabID, quarantine := parkOne(t, "Identify Invalid Kind")
+		before := jobCount(t)
+		got := b.IdentifyGrab(ctx, grabID, "isbn", "9780306406157")
+		if got.Outcome != "invalid_identifier" {
+			t.Fatalf("identify with kind isbn = %+v, want invalid_identifier", got)
+		}
+		if _, err := os.Stat(quarantine); err != nil {
+			t.Fatalf("quarantined bytes after invalid kind: %v; want them kept", err)
+		}
+		parked, err := b.grabs.Get(ctx, grabID)
+		if err != nil || parked == nil || parked.State != grab.StateParkedNoIdentifier {
+			t.Fatalf("grab after invalid kind = %+v, err=%v; want it still parked", parked, err)
+		}
+		if n := jobCount(t); n != before {
+			t.Fatalf("jobs = %d, want %d: invalid kind must create no job", n, before)
+		}
+	})
+
+	t.Run("malformed identifier refuses", func(t *testing.T) {
+		grabID, quarantine := parkOne(t, "Identify Malformed DOI")
+		before := jobCount(t)
+		got := b.IdentifyGrab(ctx, grabID, "doi", "not-a-doi")
+		if got.Outcome != "invalid_identifier" {
+			t.Fatalf("identify with malformed DOI = %+v, want invalid_identifier", got)
+		}
+		if _, err := os.Stat(quarantine); err != nil {
+			t.Fatalf("quarantined bytes after malformed identifier: %v; want them kept", err)
+		}
+		parked, err := b.grabs.Get(ctx, grabID)
+		if err != nil || parked == nil || parked.State != grab.StateParkedNoIdentifier {
+			t.Fatalf("grab after malformed identifier = %+v, err=%v; want it still parked", parked, err)
+		}
+		if n := jobCount(t); n != before {
+			t.Fatalf("jobs = %d, want %d: malformed identifier must create no job", n, before)
+		}
+	})
+
+	t.Run("missing quarantine file fails", func(t *testing.T) {
+		grabID, _ := parkOne(t, "Identify Missing File")
+		before := jobCount(t)
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE pdf_grabs SET quarantine_path='' WHERE id=?`, grabID); err != nil {
+			t.Fatal(err)
+		}
+		got := b.IdentifyGrab(ctx, grabID, "doi", "10.1234/grab.missing-file")
+		if got.Outcome != "failed" {
+			t.Fatalf("identify without quarantine file = %+v, want failed", got)
+		}
+		parked, err := b.grabs.Get(ctx, grabID)
+		if err != nil || parked == nil || parked.State != grab.StateParkedNoIdentifier {
+			t.Fatalf("grab after missing file = %+v, err=%v; want it still parked", parked, err)
+		}
+		if n := jobCount(t); n != before {
+			t.Fatalf("jobs = %d, want %d: missing file must create no job", n, before)
+		}
+	})
+
+	t.Run("pmid identifies", func(t *testing.T) {
+		grabID, _ := parkOne(t, "Identify PMID Happy")
+		got := b.IdentifyGrab(ctx, grabID, "pmid", "12345678")
+		if got.Outcome != "job_created" || got.JobID == "" {
+			t.Fatalf("identify with pmid = %+v, want job_created", got)
+		}
+		final, err := b.grabs.Get(ctx, grabID)
+		if err != nil || final == nil || final.State != grab.StateJobCreated || final.JobID != got.JobID {
+			t.Fatalf("grab after pmid identify = %+v, err=%v", final, err)
+		}
+	})
+
+	t.Run("arxiv identifies", func(t *testing.T) {
+		grabID, _ := parkOne(t, "Identify ArXiv Happy")
+		got := b.IdentifyGrab(ctx, grabID, "arxiv", "2301.12345")
+		if got.Outcome != "job_created" || got.JobID == "" {
+			t.Fatalf("identify with arxiv = %+v, want job_created", got)
+		}
+		final, err := b.grabs.Get(ctx, grabID)
+		if err != nil || final == nil || final.State != grab.StateJobCreated || final.JobID != got.JobID {
+			t.Fatalf("grab after arxiv identify = %+v, err=%v", final, err)
+		}
+	})
 }
 
 // TestIdentifyGrabKeepsBytesWhenAReadyJobOwnsTheIdentifier pins that an

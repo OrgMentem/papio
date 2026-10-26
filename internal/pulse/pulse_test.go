@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/batch"
 	"papio/internal/job"
+	"papio/internal/protocol"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
 	"papio/internal/triage"
@@ -439,6 +440,40 @@ func TestPrimaryLabelUnknownIncompleteClaim(t *testing.T) {
 	snap := Snapshot{Schema: 1, GeneratedAt: "2026-08-12T12:00:00Z", ProjectionComplete: &incomplete, Continuing: &continuing}
 	if got := PrimaryLabel(snap); got != "Unknown" {
 		t.Fatalf("label = %q, want Unknown", got)
+	}
+}
+
+// TestPrimaryLabelDisplayPrecedence pins the three headline states the
+// operator watches most closely: Moving while papers move, Waiting on you
+// while a handoff needs the researcher, and Stalled for a wedged permit.
+// Each arm reads a hand-built snapshot, so a regression in the precedence
+// order fails here even when no production job changes state.
+func TestPrimaryLabelDisplayPrecedence(t *testing.T) {
+	complete := true
+	zero := int64(0)
+	one := int64(1)
+	two := int64(2)
+	stallEpisode := []protocol.WorkPulseStallEpisode{{
+		EpisodeKey: "permit-pulse-stall", CauseKind: "execution_lease_overdue",
+		PublicLabel: "Browser effect completion unknown", Since: "2026-08-12T12:00:00Z", Count: 1,
+	}}
+	for _, test := range []struct {
+		name string
+		snap Snapshot
+		want string
+	}{
+		{"in flight moves", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &one, InFlight: &one, Scheduled: &zero, Continuing: &zero, WaitingRequired: &zero, Stalled: &zero}, "Moving"},
+		{"continuing moves", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &one, InFlight: &zero, Scheduled: &zero, Continuing: &one, WaitingRequired: &zero, Stalled: &zero}, "Moving"},
+		{"moving beats waiting", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &two, InFlight: &one, Scheduled: &zero, Continuing: &zero, WaitingRequired: &two, Stalled: &zero}, "Moving"},
+		{"open turn waits on researcher", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &one, InFlight: &zero, Scheduled: &zero, Continuing: &zero, WaitingRequired: &one, Stalled: &zero}, "Waiting on you"},
+		{"wedged permit stalls", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &one, InFlight: &zero, Scheduled: &zero, Continuing: &zero, WaitingRequired: &zero, Stalled: &one, StallEpisodes: stallEpisode}, "Stalled"},
+		{"stalled without episode stays unknown", Snapshot{ProjectionComplete: &complete, NonterminalTotal: &one, InFlight: &zero, Scheduled: &zero, Continuing: &zero, WaitingRequired: &zero, Stalled: &one}, "Unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := PrimaryLabel(test.snap); got != test.want {
+				t.Fatalf("label = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

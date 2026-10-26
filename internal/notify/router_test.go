@@ -2224,10 +2224,13 @@ func TestSlowWebhookSendStillSettlesAttempted(t *testing.T) {
 	}
 	defer db.Close()
 	previous := webhookSettleTimeout
-	webhookSettleTimeout = 50 * time.Millisecond
+	// The bound must comfortably cover one SQLite settle write on a loaded CI
+	// runner (50 ms did not on macOS); the send outlasts it by a whole bound,
+	// so a deadline started before the POST still expires mid-send.
+	webhookSettleTimeout = 300 * time.Millisecond
 	defer func() { webhookSettleTimeout = previous }()
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	webhook := &slowWebhookSender{delay: 4 * webhookSettleTimeout}
+	webhook := &slowWebhookSender{delay: 2 * webhookSettleTimeout}
 	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
 	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
 		t.Fatalf("Route after a slow accepted POST = %v, want nil", err)
