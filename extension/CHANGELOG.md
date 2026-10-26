@@ -131,6 +131,27 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **Browser navigation failures survive worker restarts and storage
+  errors.** New errors no longer overwrite stored failures before the
+  extension reads them. The extension keeps each failure until it has safely
+  queued the report to the daemon, including errors that arrive during
+  recovery.
+- **A hung page request no longer blocks subsequent download actions
+  forever.** Page API requests stop after 30 seconds, including response
+  reads, and an unfinished article action releases its slot after 120
+  seconds. Late replies cannot complete a timed-out action, and a timed-out
+  click no longer prevents a retry.
+- **Page-bulk acquisition resumes every remaining chunk after a worker
+  restart.** Recovery replays an unresolved chunk with its saved request id,
+  then submits the remaining chunks in order. A daemon refusal stops the
+  resume and preserves recovery state.
+- **A page-bulk rescan no longer shows an older scan's status.** The
+  extension ignores delayed status replies and errors from earlier scans
+  instead of letting them overwrite the current result.
+- **Page-bulk DOI links no longer open a different paper for dot-segment
+  identifiers.** The extension omits links containing `.` or `..` DOI path
+  segments, including encoded spellings, because browsers change their
+  destination. Ordinary DOI links stay unchanged.
 - **A paper whose route is not on your library's own address now opens its
   sign-in tab once your session is live.** A DOI link, its OpenAthens
   redirector or a LibKey link sits on a publisher or link-service host, and the
