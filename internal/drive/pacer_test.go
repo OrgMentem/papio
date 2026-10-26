@@ -544,6 +544,104 @@ func TestOperatorPauseHoldsUntilResume(t *testing.T) {
 	}
 }
 
+// seedBusyClaim pins one live materialization claim on an unrelated job, the
+// exact "browser is driving something" state LiveBrowserWork counts.
+func seedBusyClaim(t *testing.T, h *harness, jobID string, future time.Time) {
+	t.Helper()
+	created := store.FormatTime(future.Add(-time.Hour))
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT OR IGNORE INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		  VALUES ('pacer-profile', 'pacer profile', 1, 'digest', 'auth-claim', ?, ?)`, []any{created, created}},
+		{`INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		  VALUES ('pacer-cand', ?, 1, 'pacer-profile', 1, 1, 'institutional', 'doi',
+		          'pre-route', 'institution:institutional', 'adapter-1', 'effect-1', 'claimed', ?, ?)`, []any{jobID, created, created}},
+		{`INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, lease_until, created_at, updated_at)
+		  VALUES ('pacer-claim', 'pacer-cand', 1, 'browser_tab', 'pacer-binding', 'claimed', ?, ?, ?)`, []any{store.FormatTime(future), created, created}},
+	} {
+		if _, err := h.jobs.S.DB().ExecContext(context.Background(), stmt.query, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestPacerSkipsBusyDuplicateForeignAndParked covers the four candidate
+// guards the pacer applies before it opens a handoff in the operator's own
+// browser. Each case starts from the oldest-first pass, then checks which job
+// opens and which skip counter records the pass-over.
+func TestPacerSkipsBusyDuplicateForeignAndParked(t *testing.T) {
+	t.Run("browser busy", func(t *testing.T) {
+		h := newHarness(t, true)
+		busy := h.park("wr_busy_claim", "10.1000/busy-claim", "openurl_handoff")
+		h.park("wr_busy_next", "10.5555/busy-next", "openurl_handoff")
+		seedBusyClaim(t, h, busy, h.clock.Add(time.Hour))
+		h.run()
+		if got := h.browser.openedJobs(); len(got) != 0 {
+			t.Fatalf("opened %v with a live claim on the browser, want nothing", got)
+		}
+		status := h.status()
+		if !slices.Contains(status.Blockers, BlockBrowserBusy) {
+			t.Fatalf("blockers = %v, want %s", status.Blockers, BlockBrowserBusy)
+		}
+	})
+	t.Run("duplicate action", func(t *testing.T) {
+		h := newHarness(t, true)
+		ctx := context.Background()
+		dup := h.park("wr_dup", "10.1000/dup", "openurl_handoff")
+		other := h.park("wr_dup_other", "10.5555/dup-other", "openurl_handoff")
+		if _, err := h.jobs.OpenHumanAction(ctx, dup, "manual_download", "second prompt", job.Access(false, "landing_page")); err != nil {
+			t.Fatal(err)
+		}
+		h.run()
+		if got := h.browser.openedJobs(); !slices.Equal(got, []string{other}) {
+			t.Fatalf("opened %v, want the unambiguous next job %s", got, other)
+		}
+		if status := h.status(); status.Skipped[SkipDuplicateOnJob] != 2 {
+			t.Fatalf("skipped = %v, want two %s counts for the ambiguous job", status.Skipped, SkipDuplicateOnJob)
+		}
+	})
+	t.Run("foreign kind", func(t *testing.T) {
+		h := newHarness(t, true)
+		ctx := context.Background()
+		foreign := h.park("wr_foreign", "10.1000/foreign", "openurl_handoff")
+		other := h.park("wr_foreign_other", "10.5555/foreign-other", "openurl_handoff")
+		if _, err := h.jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET kind='verify_identity' WHERE job_id=?`, foreign); err != nil {
+			t.Fatal(err)
+		}
+		h.run()
+		if got := h.browser.openedJobs(); !slices.Equal(got, []string{other}) {
+			t.Fatalf("opened %v, want the openable next job %s", got, other)
+		}
+		if status := h.status(); status.Skipped[SkipOtherKind] != 1 {
+			t.Fatalf("skipped = %v, want one %s count", status.Skipped, SkipOtherKind)
+		}
+	})
+	t.Run("not awaiting", func(t *testing.T) {
+		h := newHarness(t, true)
+		ctx := context.Background()
+		parked := h.park("wr_ready", "10.1000/ready", "openurl_handoff")
+		other := h.park("wr_ready_other", "10.5555/ready-other", "openurl_handoff")
+		if _, err := h.jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state='ready' WHERE id=?`, parked); err != nil {
+			t.Fatal(err)
+		}
+		h.run()
+		if got := h.browser.openedJobs(); !slices.Equal(got, []string{other}) {
+			t.Fatalf("opened %v, want the parked job %s", got, other)
+		}
+		if status := h.status(); status.Skipped[SkipNotAwaiting] != 1 {
+			t.Fatalf("skipped = %v, want one %s count", status.Skipped, SkipNotAwaiting)
+		}
+	})
+}
+
 // declinedReason returns the reason recorded on jobID's drive.open_declined
 // event, or "" when it has none.
 func (h *harness) declinedReason(jobID string) string {
