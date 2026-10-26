@@ -28,6 +28,8 @@ const (
 	tagsMinimumZotioVersion = "0.13.0"
 	tagBatchSize            = 50
 	tagErrorLogInterval     = 15 * time.Minute
+	tagRetryInitialDelay    = 5 * time.Minute
+	tagRetryMaxDelay        = 6 * time.Hour
 
 	tagStatusPending = "pending"
 	tagStatusOwned   = "owned"
@@ -404,14 +406,38 @@ func batchKeys(keys []string) [][]string {
 	return batches
 }
 
+// tagReconcileRetry spaces automatic passes after a partial or total failure.
+// Retain the failure for maintenance health while skipping retries quietly.
+// On-demand reconciliation bypasses this delay, and a daemon restart permits
+// an immediate recovery attempt.
+type tagReconcileRetry struct {
+	failedAt time.Time
+	delay    time.Duration
+	err      error
+}
+
+func (r *tagReconcileRetry) due(now time.Time) bool {
+	return r.err == nil || now.Before(r.failedAt) || !now.Before(r.failedAt.Add(r.delay))
+}
+
+func (r *tagReconcileRetry) fail(now time.Time, err error) {
+	if r.delay == 0 {
+		r.delay = tagRetryInitialDelay
+	} else {
+		r.delay = min(r.delay*2, tagRetryMaxDelay)
+	}
+	r.failedAt, r.err = now, err
+}
+
 // TagReconciler adapts ReconcileTags to the daemon's maintenance seam with
-// throttled error logging. Disabled configurations keep a runner only while
-// ledger state remains to clean, so the default-off path adds no maintenance
-// work and an off transition still converges.
+// bounded retry delays and throttled error logging. Disabled configurations
+// keep a runner only while ledger state remains to clean, so the default-off
+// path adds no maintenance work and an off transition still converges.
 type TagReconciler struct {
 	service    *Service
 	lastErr    string
 	lastErrLog time.Time
+	retry      tagReconcileRetry
 }
 
 func (s *Service) TagReconciler() *TagReconciler {
@@ -428,15 +454,29 @@ func (s *Service) TagReconciler() *TagReconciler {
 	return &TagReconciler{service: s}
 }
 
+// MaintenanceFailure reports the last failed pass until reconciliation
+// succeeds. The scheduler reads it after RunDue on the maintenance goroutine.
+func (r *TagReconciler) MaintenanceFailure() error {
+	if r == nil {
+		return nil
+	}
+	return r.retry.err
+}
+
 func (r *TagReconciler) RunDue(ctx context.Context) error {
 	if r == nil {
+		return nil
+	}
+	if !r.retry.due(r.service.now()) {
 		return nil
 	}
 	_, err := r.service.ReconcileTags(ctx)
 	if err == nil {
 		r.lastErr = ""
+		r.retry = tagReconcileRetry{}
 		return nil
 	}
+	r.retry.fail(r.service.now(), err)
 	if msg := err.Error(); msg != r.lastErr || time.Since(r.lastErrLog) >= tagErrorLogInterval {
 		log.Printf("zotio tag reconcile: %v", err)
 		r.lastErr = msg

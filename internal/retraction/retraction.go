@@ -199,7 +199,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	if cached.LastFetchErrorAt.After(latestAttempt) {
 		latestAttempt = cached.LastFetchErrorAt
 	}
-	fresh := ok && !latestAttempt.IsZero() && now.Sub(latestAttempt) < sweepEvery
+	fresh := ok && !latestAttempt.IsZero() && !latestAttempt.After(now) && now.Sub(latestAttempt) < sweepEvery
 	s.mu.Unlock()
 	if fresh {
 		// A previous sweep may have published notices without delivering
@@ -329,26 +329,13 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	if len(repair) > 0 {
-		if acked, err := s.acknowledged(ctx, nil); err != nil {
-			log.Printf("papio: reading retraction acknowledgements: %v", err)
-		} else {
-			unacked := make([]Finding, 0, len(repair))
-			for _, finding := range repair {
-				if !acked[findingKey(finding)] {
-					unacked = append(unacked, finding)
-				}
-			}
-			repair = unacked
+		// Retry under the publishing sweep's identity so the ledger
+		// sees the same notification across retry and crash.
+		repairAt := cached.CheckedAt
+		if repairAt.IsZero() {
+			repairAt = now
 		}
-		if len(repair) > 0 {
-			// Retry under the publishing sweep's identity so the ledger
-			// sees the same notification across retry and crash.
-			repairAt := cached.CheckedAt
-			if repairAt.IsZero() {
-				repairAt = now
-			}
-			s.routeIntegrityFindings(ctx, repairScanID, repair, repairAt)
-		}
+		s.routeIntegrityFindings(ctx, repairScanID, repair, repairAt)
 	}
 	if len(newFindings) > 0 && s.notifier != nil {
 		s.routeIntegrityFindings(ctx, scanID, newFindings, now)
@@ -362,6 +349,24 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 // same scan key.
 func (s *Sentinel) routeIntegrityFindings(ctx context.Context, scanID string, findings []Finding, at time.Time) {
 	if s.notifier == nil || len(findings) == 0 {
+		return
+	}
+	// Acknowledgements outlive the disposable cache. Check them for new
+	// findings as well as repairs, so rebuilding the cache cannot reannounce
+	// notices the operator already dismissed.
+	acked, err := s.acknowledged(ctx, nil)
+	if err != nil {
+		log.Printf("papio: reading retraction acknowledgements: %v", err)
+		return
+	}
+	unacked := findings[:0]
+	for _, finding := range findings {
+		if !acked[findingKey(finding)] {
+			unacked = append(unacked, finding)
+		}
+	}
+	findings = unacked
+	if len(findings) == 0 {
 		return
 	}
 	message := integrityNoticeMessage(findings)
@@ -393,14 +398,9 @@ func (s *Sentinel) repairPendingNotifications(ctx context.Context, cached cache)
 	if s.notifier == nil || cached.Notified == nil {
 		return
 	}
-	acked, err := s.acknowledged(ctx, nil)
-	if err != nil {
-		log.Printf("papio: reading retraction acknowledgements: %v", err)
-		return
-	}
 	pending := make([]Finding, 0)
 	for key, finding := range cached.Notices {
-		if cached.Notified[key] || acked[key] {
+		if cached.Notified[key] {
 			continue
 		}
 		pending = append(pending, finding)
@@ -1145,6 +1145,12 @@ func (s *Sentinel) recordFetchFailure(cached cache, valid bool, at time.Time, fe
 	if !valid {
 		cached = cache{Version: cacheVersion, Notices: map[string]Finding{}, Notified: map[string]bool{}}
 	}
+	// A future successful-sweep timestamp is not usable after a clock
+	// rollback. Leave the notices intact, but let this failed attempt set the
+	// retry clock instead of forcing a fetch on every maintenance pass.
+	if cached.CheckedAt.After(at) {
+		cached.CheckedAt = time.Time{}
+	}
 	cached.LastFetchError = boundedFetchError(fetchErr)
 	cached.LastFetchErrorAt = at
 	s.mu.Lock()
@@ -1232,10 +1238,17 @@ func (s *Sentinel) writeCache(cached cache) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, s.cachePath())
+	if err := os.Rename(name, s.cachePath()); err != nil {
+		return err
+	}
+	return config.SyncDir(s.dataDir)
 }
 
 func decodeBoundedJSON(body io.Reader, maximum int64, destination any) error {

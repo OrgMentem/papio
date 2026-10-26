@@ -17,11 +17,13 @@ import (
 // semantics (add --automatic is a no_op over a manual tag; remove
 // --automatic-only never removes a manual tag).
 type retractionCLI struct {
-	mu       sync.Mutex
-	byDOI    map[string][]retractionFound // lookup result per queried DOI
-	tags     map[string]map[string]string // item key -> tag -> "automatic" | "manual"
-	mutation []string
-	findErr  error
+	mu          sync.Mutex
+	byDOI       map[string][]retractionFound // lookup result per queried DOI
+	tags        map[string]map[string]string // item key -> tag -> "automatic" | "manual"
+	mutation    []string
+	findErr     error
+	findCalls   int
+	mutationErr error
 }
 
 func newRetractionCLI() *retractionCLI {
@@ -62,6 +64,7 @@ func (f *retractionCLI) RunJSON(_ context.Context, args ...string) (json.RawMess
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.Contains(joined, "items find --doi") {
+		f.findCalls++
 		if f.findErr != nil {
 			return nil, f.findErr
 		}
@@ -77,6 +80,9 @@ func (f *retractionCLI) RunJSON(_ context.Context, args ...string) (json.RawMess
 		return nil, fmt.Errorf("unexpected RunJSON %q", args)
 	}
 	f.mutation = append(f.mutation, joined)
+	if f.mutationErr != nil {
+		return nil, f.mutationErr
+	}
 	key, tag := args[len(args)-1], args[len(args)-2]
 	have := f.tags[key][tag]
 	status := "applied"
@@ -293,5 +299,85 @@ func TestRetractionTagReconcilerRunsOnlyWhenNoticesChange(t *testing.T) {
 	off.RetractionTags = false
 	if off.RetractionTagReconciler() != nil {
 		t.Fatal("default-off option with an empty ledger built a reconciler")
+	}
+}
+
+func TestRetractionTagReconcilerReportsMissingSource(t *testing.T) {
+	ctx := context.Background()
+	cli := newRetractionCLI()
+	cli.setTag("AAAAAAAA", TagRetracted, "automatic")
+	service := retractionService(t, cli, nil)
+	if err := service.upsertTagState(ctx, retractionLedgerPrefix+"AAAAAAAA", TagRetracted, tagStatusOwned); err != nil {
+		t.Fatal(err)
+	}
+	err := service.RetractionTagReconciler().RunDue(ctx)
+	if err == nil || !strings.Contains(err.Error(), "retraction notices are not available: enable the retraction_watch source") {
+		t.Fatalf("missing source = %v, want an actionable maintenance failure", err)
+	}
+	if cli.findCalls != 0 || len(cli.mutation) != 0 || cli.tagType("AAAAAAAA", TagRetracted) != "automatic" {
+		t.Fatalf("unknown notices changed owned tags: finds %d, mutations %v", cli.findCalls, cli.mutation)
+	}
+	if _, status := tagStateStatus(t, service, retractionLedgerPrefix+"AAAAAAAA"); status != tagStatusOwned {
+		t.Fatalf("ledger status = %q, want ownership preserved", status)
+	}
+}
+
+func TestRetractionTagReconcilerBacksOffFailedWrites(t *testing.T) {
+	ctx := context.Background()
+	cli := newRetractionCLI()
+	cli.addItem("AAAAAAAA", "10.1234/retracted")
+	cli.mutationErr = WithErrorInfo(fmt.Errorf("Zotero HTTP 403"))
+	service := retractionService(t, cli, &fakeRetractions{dois: []string{"10.1234/retracted"}})
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	service.Now = func() time.Time { return now }
+	reconciler := service.RetractionTagReconciler()
+	assertFailure := func() {
+		t.Helper()
+		if err := reconciler.RunDue(ctx); err == nil || ErrorInfoFrom(err).Class != ErrorClassZoteroHTTP4xx {
+			t.Fatalf("RunDue = %v, want the tag write failure to remain visible", err)
+		}
+	}
+	assertFailure()
+	attempts := 1
+	for _, delay := range []time.Duration{
+		5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute,
+		80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 6 * time.Hour, 6 * time.Hour,
+	} {
+		failedAt := now
+		for _, elapsed := range []time.Duration{time.Minute, delay - time.Nanosecond} {
+			now = failedAt.Add(elapsed)
+			if err := reconciler.RunDue(ctx); err != nil {
+				t.Fatalf("backoff pass returned a new error: %v", err)
+			}
+			if err := tagMaintenanceFailure(t, reconciler); err == nil || ErrorInfoFrom(err).Class != ErrorClassZoteroHTTP4xx {
+				t.Fatalf("backoff health = %v, want the tag write failure", err)
+			}
+			if cli.findCalls != attempts || len(cli.mutation) != attempts {
+				t.Fatalf("retry during %s delay: finds %d, mutations %d; want %d", delay, cli.findCalls, len(cli.mutation), attempts)
+			}
+		}
+		now = failedAt.Add(delay)
+		assertFailure()
+		attempts++
+		if cli.findCalls != attempts || len(cli.mutation) != attempts {
+			t.Fatalf("due retry: finds %d, mutations %d; want %d", cli.findCalls, len(cli.mutation), attempts)
+		}
+	}
+	if _, status := tagStateStatus(t, service, retractionLedgerPrefix+"AAAAAAAA"); status != tagStatusPending {
+		t.Fatalf("failed write status = %q, want pending", status)
+	}
+	cli.mutationErr = nil
+	now = now.Add(6 * time.Hour)
+	if err := reconciler.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tagMaintenanceFailure(t, reconciler); err != nil {
+		t.Fatalf("recovered maintenance health = %v, want no failure", err)
+	}
+	if cli.tagType("AAAAAAAA", TagRetracted) != "automatic" {
+		t.Fatal("the due recovery pass did not tag the retracted item")
+	}
+	if _, status := tagStateStatus(t, service, retractionLedgerPrefix+"AAAAAAAA"); status != tagStatusOwned {
+		t.Fatalf("recovered write status = %q, want owned", status)
 	}
 }

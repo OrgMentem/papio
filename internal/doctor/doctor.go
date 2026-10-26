@@ -532,6 +532,12 @@ func checkRetraction(cfg config.Config, add func(string, string, string, string)
 		add("retraction", Warn, "retraction sweep status is invalid", "remove the damaged retraction-cache.json file, then restart the daemon")
 		return
 	}
+	now := time.Now()
+	if status.CheckedAt.After(now) || status.LastFetchErrorAt.After(now) {
+		add("retraction", Warn, "retraction sweep status has a future timestamp",
+			"check the system clock and keep the daemon running through its next maintenance sweep")
+		return
+	}
 	noticeCount := len(status.Notices)
 	if status.LastFetchError != "" {
 		detail := "latest Retraction Watch fetch failed"

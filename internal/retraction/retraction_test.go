@@ -676,6 +676,155 @@ func TestSweepDeduplicatesReadyDOIAndPersistsNotice(t *testing.T) {
 	}
 }
 
+func TestAcknowledgedNoticeStaysSilentAfterCacheLoss(t *testing.T) {
+	for _, damage := range []string{"removed", "corrupt"} {
+		t.Run(damage, func(t *testing.T) {
+			ctx := context.Background()
+			jobs := testStore(t)
+			addReadyDOI(t, jobs, "10.1234/acknowledged", 1)
+			addReadyDOI(t, jobs, "10.1234/new", 2)
+			notices := []csvNotice{{
+				workDOI: "10.1234/acknowledged", noticeDOI: "10.2000/acknowledged", nature: "retraction",
+			}}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeRetractionDataset(t, w, notices...)
+			}))
+			defer server.Close()
+			dataDir := t.TempDir()
+			now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+			notifier := &recordingNotifier{}
+			options := Options{
+				Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+				Client: server.Client(), BaseURL: server.URL, DataDir: dataDir,
+				Notifier: notifier, Now: func() time.Time { return now },
+			}
+			sentinel := New(options)
+			if err := sentinel.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(notifier.events) != 1 {
+				t.Fatalf("first sweep events = %v, want one notice", notifier.events)
+			}
+			if applied, err := sentinel.AcknowledgeRetraction(ctx, "retraction:10.1234/acknowledged"); err != nil || !applied {
+				t.Fatalf("acknowledge = %v, %v", applied, err)
+			}
+			path := filepath.Join(dataDir, cacheFileName)
+			if damage == "removed" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			notices = append(notices, csvNotice{
+				workDOI: "10.1234/new", noticeDOI: "10.2000/new", nature: "retraction",
+			})
+			now = now.Add(25 * time.Hour)
+			restarted := New(options)
+			if err := restarted.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(notifier.events) != 2 {
+				t.Fatalf("events after cache rebuild = %v, want only the new notice added", notifier.events)
+			}
+			event := notifier.events[1]
+			findings, ok := event.Detail["findings"].([]map[string]any)
+			if !ok || event.Count != 1 || len(findings) != 1 || findings[0]["doi"] != "10.1234/new" {
+				t.Fatalf("rebuilt cache notification = %#v, want only the unacknowledged notice", event)
+			}
+			items, err := restarted.SnapshotItems(ctx, nil)
+			if err != nil || len(items) != 1 || items[0].ID != "retraction:10.1234/new" {
+				t.Fatalf("inbox after cache rebuild = %#v, %v; want only the new notice", items, err)
+			}
+			now = now.Add(time.Minute)
+			if err := restarted.RunDue(ctx); err != nil || len(notifier.events) != 2 {
+				t.Fatalf("notification repair = %v, events %v; want no reannouncement", err, notifier.events)
+			}
+		})
+	}
+}
+
+func TestRunDueIgnoresFutureCacheTimestamps(t *testing.T) {
+	for _, field := range []string{"checked_at", "last_fetch_error_at"} {
+		t.Run(field, func(t *testing.T) {
+			ctx := context.Background()
+			jobs := testStore(t)
+			addReadyDOI(t, jobs, "10.1234/future-cache", 1)
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				writeRetractionDataset(t, w, csvNotice{
+					workDOI: "10.1234/future-cache", noticeDOI: "10.2000/notice", nature: "retraction",
+				})
+			}))
+			defer server.Close()
+			now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+			sentinel := New(Options{
+				Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+				Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+				Now: func() time.Time { return now },
+			})
+			cached := cache{Version: cacheVersion, CheckedAt: now.Add(-time.Hour)}
+			if field == "checked_at" {
+				cached.CheckedAt = now.Add(30 * 24 * time.Hour)
+			} else {
+				cached.LastFetchErrorAt = now.Add(30 * 24 * time.Hour)
+				cached.LastFetchError = "Retraction Watch returned HTTP 503"
+			}
+			if err := sentinel.writeCache(cached); err != nil {
+				t.Fatal(err)
+			}
+			if err := sentinel.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 {
+				t.Fatalf("requests = %d, want one fetch despite a future %s", requests, field)
+			}
+			items, err := sentinel.SnapshotItems(ctx, nil)
+			if err != nil || len(items) != 1 || items[0].ID != "retraction:10.1234/future-cache" {
+				t.Fatalf("inbox after clock rollback = %#v, %v; want the new retraction", items, err)
+			}
+			if err := sentinel.RunDue(ctx); err != nil || requests != 1 {
+				t.Fatalf("fresh repaired cache = %v, requests %d; want no second fetch", err, requests)
+			}
+		})
+	}
+}
+
+func TestRunDueBacksOffFailedFetchAfterFutureCacheTimestamp(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/future-cache", 1)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	client := &recordingHTTPClient{status: http.StatusServiceUnavailable}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: client, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	})
+	finding := Finding{DOI: "10.1234/future-cache", Nature: NatureRetraction, NoticedAt: now.Add(-time.Hour)}
+	if err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now.Add(30 * 24 * time.Hour),
+		Notices: map[string]Finding{findingKey(finding): finding},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sentinel.RunDue(ctx); err == nil || client.requests != 1 {
+		t.Fatalf("first fetch = %v, requests %d; want one failed attempt", err, client.requests)
+	}
+	now = now.Add(time.Minute)
+	if err := sentinel.RunDue(ctx); err != nil || client.requests != 1 {
+		t.Fatalf("backoff pass = %v, requests %d; want no retry", err, client.requests)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || items[0].ID != "retraction:10.1234/future-cache" {
+		t.Fatalf("inbox after failed fetch = %#v, %v; want the previous notice preserved", items, err)
+	}
+	now = now.Add(24 * time.Hour)
+	if err := sentinel.RunDue(ctx); err == nil || client.requests != 2 {
+		t.Fatalf("due retry = %v, requests %d; want a second failed attempt", err, client.requests)
+	}
+}
+
 // A notice is recomputed from Crossref for as long as the work stays in the
 // library, so acknowledging one has to survive the next sweep — but only for
 // the notice that was acknowledged.
