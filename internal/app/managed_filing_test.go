@@ -39,6 +39,53 @@ func readyManagedFixture(t *testing.T, svc *Service, request, body string) strin
 	return id
 }
 
+func TestManagedFolderSecondBeginTxFailureReturnsError(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.ManagedFilingFolder = filepath.Join(t.TempDir(), "collection")
+	id := readyManagedFixture(t, svc, "wr_second_begin_failure", "%PDF-1.4\ntransaction failure\n%%EOF")
+	if err := svc.queueManagedFiling(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// Closing the pool after the first transaction starts leaves that
+	// transaction usable, but prevents the post-staging transaction.
+	now := time.Now().UTC()
+	svc.Now = func() time.Time {
+		if err := jobs.S.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+	got, err := svc.fileManaged(ctx, id, svc.ManagedFilingFolder, true)
+	if err == nil || err.Error() != "sql: database is closed" {
+		t.Fatalf("fileManaged error = %v; want closed database error", err)
+	}
+	if got.Attempts != 1 || got.State != "pending" || got.ReceiptPath != "" {
+		t.Fatalf("filing after failed second transaction = %+v", got)
+	}
+
+	// The first transaction must commit the attempt even though publication
+	// cannot start, so reopening the store still exposes pending work.
+	reopened, err := store.Open(ctx, svc.Config.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	var state string
+	var attempts int
+	if err := reopened.DB().QueryRowContext(ctx, `SELECT state, attempts FROM managed_filings WHERE job_id = ? AND destination = ?`, id, svc.ManagedFilingFolder).Scan(&state, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || attempts != 1 {
+		t.Fatalf("persisted filing = %s, %d attempts; want pending, 1 attempt", state, attempts)
+	}
+	entries, err := os.ReadDir(svc.ManagedFilingFolder)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("failed transaction leaves files = %v, %v; want empty folder", entries, err)
+	}
+}
+
 func TestManagedFolderTransientFailureRestartAndExactlyOneArtifactPerJob(t *testing.T) {
 	ctx := context.Background()
 	data := storetest.DataDir(t)
