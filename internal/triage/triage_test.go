@@ -2021,6 +2021,10 @@ func TestDecideAcknowledgesRetractionThroughItsSource(t *testing.T) {
 	service.RegisterSource(source)
 	runner := &watch.Runner{Store: watches2}
 	item := RetractionIDPrefix + "10.1000/retracted"
+	// Every acknowledger reports no rows for an unknown notice.
+	if result, err := service.Decide(ctx, DecisionInput{ItemID: RetractionIDPrefix + "10.1000/unknown", Operation: DecisionDismiss}, runner); err != nil || result.Outcome != DecisionConflict {
+		t.Fatalf("unknown notice = %+v, %v; want conflict", result, err)
+	}
 
 	if result, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); err != nil || result.Outcome != DecisionApplied {
 		t.Fatalf("first dismiss = %+v, %v; want applied", result, err)
@@ -2044,6 +2048,14 @@ func TestDecideAcknowledgesRetractionThroughItsSource(t *testing.T) {
 	source.err = boom
 	if _, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); !errors.Is(err, boom) {
 		t.Fatalf("source error = %v, want it propagated", err)
+	}
+}
+
+func TestWatchMutationErrorPreservesCause(t *testing.T) {
+	cause := errors.New("watch mutation failed")
+	err := &WatchMutationError{err: cause}
+	if err.Error() != cause.Error() || !errors.Is(err, cause) {
+		t.Fatalf("wrapper = %v, want original message and cause", err)
 	}
 }
 
