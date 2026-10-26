@@ -1324,56 +1324,52 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 	}
 }
 
-func TestTriageSnapshotRejectsUnknownBlockedBy(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
+// triageFrame loads a valid triage-snapshot corpus fixture as a mutable frame.
+func triageFrame(t *testing.T, fixture string) (frame map[string]any, items []any) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), fixture))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var frame map[string]any
 	if err := json.Unmarshal(data, &frame); err != nil {
 		t.Fatal(err)
 	}
-	payload := frame["payload"].(map[string]any)
-	items := payload["items"].([]any)
-	items[1].(map[string]any)["blocked_by"] = "captcha"
-	mutated, err := json.Marshal(frame)
+	return frame, frame["payload"].(map[string]any)["items"].([]any)
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "blocked_by") {
-		t.Fatalf("unknown blocked_by err = %v, want rejection", err)
+	return data
+}
+
+// Schema 2 rejects both an unknown blocked_by value and a v3-only one.
+func TestTriageSnapshotSchema2RejectsBlockedByOutsideEnum(t *testing.T) {
+	for _, value := range []string{"captcha", "login"} {
+		frame, items := triageFrame(t, "browser-triage-snapshot-response.json")
+		items[1].(map[string]any)["blocked_by"] = value
+		if _, err := DecodeBrowserMessage(mustMarshal(t, frame)); err == nil || !strings.Contains(err.Error(), "blocked_by") {
+			t.Fatalf("schema-2 blocked_by=%q err = %v, want rejection", value, err)
+		}
 	}
 }
 
 func TestTriageSnapshotSchema1RejectsAccessFieldsButAllowsTheirAbsence(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var frame map[string]any
-	if err := json.Unmarshal(data, &frame); err != nil {
-		t.Fatal(err)
-	}
-	payload := frame["payload"].(map[string]any)
-	payload["schema"] = float64(1)
-	action := payload["items"].([]any)[1].(map[string]any)
+	frame, items := triageFrame(t, "browser-triage-snapshot-response.json")
+	frame["payload"].(map[string]any)["schema"] = float64(1)
+	action := items[1].(map[string]any)
 	delete(action, "requires_auth")
 	delete(action, "blocked_by")
-	legacy, err := json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(legacy); err != nil {
+	if _, err := DecodeBrowserMessage(mustMarshal(t, frame)); err != nil {
 		t.Fatalf("schema-1 snapshot without access fields rejected: %v", err)
 	}
 
 	action["requires_auth"] = true
 	action["blocked_by"] = "paywall"
-	withAccessFields, err := json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(withAccessFields); err == nil || !strings.Contains(err.Error(), "schema 1") {
+	if _, err := DecodeBrowserMessage(mustMarshal(t, frame)); err == nil || !strings.Contains(err.Error(), "schema 1") {
 		t.Fatalf("schema-1 snapshot with access fields err = %v, want rejection", err)
 	}
 }
@@ -1418,56 +1414,24 @@ func TestTriageDeliveryOfferedRoundTrips(t *testing.T) {
 }
 
 func TestTriageSnapshotV3RequiresAttentionAndRouteFields(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response-v3.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	loadFrame := func() map[string]any {
-		var frame map[string]any
-		if err := json.Unmarshal(data, &frame); err != nil {
-			t.Fatal(err)
+	const fixture = "browser-triage-snapshot-response-v3.json"
+	for _, tc := range []struct {
+		item  int
+		field string
+	}{{0, "attention"}, {1, "route_class"}, {1, "auth_requirement"}} {
+		frame, items := triageFrame(t, fixture)
+		delete(items[tc.item].(map[string]any), tc.field)
+		if _, err := DecodeBrowserMessage(mustMarshal(t, frame)); err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Fatalf("v3 item %d missing %s err = %v, want rejection", tc.item, tc.field, err)
 		}
-		return frame
-	}
-
-	// Missing attention on any v3 item is rejected.
-	frame := loadFrame()
-	items := frame["payload"].(map[string]any)["items"].([]any)
-	delete(items[0].(map[string]any), "attention")
-	mutated, err := json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "attention") {
-		t.Fatalf("v3 item missing attention err = %v, want rejection", err)
-	}
-
-	// Missing route_class on a v3 human_action item is rejected.
-	frame = loadFrame()
-	items = frame["payload"].(map[string]any)["items"].([]any)
-	delete(items[1].(map[string]any), "route_class")
-	mutated, err = json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "route_class") {
-		t.Fatalf("v3 human_action missing route_class err = %v, want rejection", err)
-	}
-
-	// Missing auth_requirement on a v3 human_action item is rejected.
-	frame = loadFrame()
-	items = frame["payload"].(map[string]any)["items"].([]any)
-	delete(items[1].(map[string]any), "auth_requirement")
-	mutated, err = json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "auth_requirement") {
-		t.Fatalf("v3 human_action missing auth_requirement err = %v, want rejection", err)
 	}
 
 	// The valid fixture itself decodes and the document_delivery item's
 	// delivery sub-object round-trips.
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
 	message, err := DecodeBrowserMessage(data)
 	if err != nil {
 		t.Fatalf("valid v3 fixture rejected: %v", err)
@@ -1486,44 +1450,10 @@ func TestTriageSnapshotV3RequiresAttentionAndRouteFields(t *testing.T) {
 }
 
 func TestTriageSnapshotDeliveryGatedToDocumentDelivery(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response-v3.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var frame map[string]any
-	if err := json.Unmarshal(data, &frame); err != nil {
-		t.Fatal(err)
-	}
-	items := frame["payload"].(map[string]any)["items"].([]any)
-	verifyIdentityItem := items[1].(map[string]any)
-	verifyIdentityItem["delivery"] = map[string]any{"provider": "illiad", "state": "pending"}
-	mutated, err := json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "delivery") {
+	frame, items := triageFrame(t, "browser-triage-snapshot-response-v3.json")
+	items[1].(map[string]any)["delivery"] = map[string]any{"provider": "illiad", "state": "pending"}
+	if _, err := DecodeBrowserMessage(mustMarshal(t, frame)); err == nil || !strings.Contains(err.Error(), "delivery") {
 		t.Fatalf("delivery on a non-document_delivery item err = %v, want rejection", err)
-	}
-}
-
-func TestTriageSnapshotSchema2RejectsV3BlockedByValues(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var frame map[string]any
-	if err := json.Unmarshal(data, &frame); err != nil {
-		t.Fatal(err)
-	}
-	payload := frame["payload"].(map[string]any)
-	items := payload["items"].([]any)
-	items[1].(map[string]any)["blocked_by"] = "login"
-	mutated, err := json.Marshal(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "blocked_by") {
-		t.Fatalf("schema-2 frame with a v3-only blocked_by value err = %v, want rejection", err)
 	}
 }
 
