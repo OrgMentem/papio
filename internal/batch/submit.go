@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"papio/internal/ipc"
+	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -636,8 +637,9 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		manifestWork := &manifest.Works[manifestWorkIndex]
 		if result.JobID == "" {
 			output.Failed++
-			manifestWork.Status, manifestWork.Error = "submission_failed", "submit"
-			if firstErr == nil {
+			manifestWork.Status = "submission_failed"
+			manifestWork.Error = batchSubmitError(errs[index])
+			if !isOnceConflictRefusal(errs[index]) && firstErr == nil {
 				// Name the work by its position in the operator's input, not
 				// its place among the works left after ownership filtering.
 				label := batchWorkLabel(manifestWorkIndex+1, requests[index])
@@ -675,6 +677,49 @@ func batchWorkLabel(position int, request protocol.WorkRequest) string {
 	default:
 		return fmt.Sprintf("batch work %d", position)
 	}
+}
+
+// batchSubmitError keeps the daemon's refusal text on the failed manifest
+// work. A bare "submit" hides which work clashed and why; the once-only
+// conflict names the live job, and that name is what the operator acts on.
+// The text stays bounded: a refusal carries one line, never a dump.
+func batchSubmitError(err error) string {
+	if err == nil {
+		return "submit"
+	}
+	message := strings.TrimSpace(err.Error())
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "\n", " ")
+	if message == "" {
+		return "submit"
+	}
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	return message
+}
+
+// isOnceConflictRefusal reports whether err is the daemon's typed once-only
+// refusal: the same canonical work is already in flight under another filing
+// intent. That refusal is a terminal per-work outcome, not a chunk error: the
+// work is recorded as submission_failed with the conflict text naming the
+// live job, and the batch (or campaign chunk) still settles. Every other
+// failure keeps today's retry behaviour. Both branches match on the one
+// job.OnceConflictMarker: the typed error where it survives, and its text
+// where only a string crosses (an IPC RemoteError after the daemon boundary,
+// or a plain in-process caller).
+func isOnceConflictRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, job.ErrOnceConflict) {
+		return true
+	}
+	var remote *ipc.RemoteError
+	if errors.As(err, &remote) {
+		return remote.Code == "conflict" && strings.Contains(remote.Message, job.OnceConflictMarker)
+	}
+	return strings.Contains(err.Error(), job.OnceConflictMarker)
 }
 
 // classifyBatchOwnership resolves ownership for a batch through whichever

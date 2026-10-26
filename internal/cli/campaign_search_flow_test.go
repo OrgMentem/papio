@@ -15,8 +15,10 @@ import (
 	"testing"
 
 	"papio/internal/batch"
+	"papio/internal/bibparse"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/ipc"
 	"papio/internal/work"
 )
 
@@ -28,6 +30,10 @@ type flowDaemon struct {
 	// searched counts discovery calls, to prove a refused save never pays for one.
 	searched int
 	works    []discovery.DiscoveredWork
+	// refuseDOI names one work the daemon reports as already in flight under
+	// another filing intent: submit_once_v1 answers it with the typed
+	// once-only conflict instead of a job.
+	refuseDOI string
 }
 
 func (d *flowDaemon) call(_ context.Context, method string, params, result any) error {
@@ -52,9 +58,14 @@ func (d *flowDaemon) call(_ context.Context, method string, params, result any) 
 		}
 		reply = map[string]any{"works": works}
 	case "acquire.submit_once_v1", "acquire.submit_v2":
+		if method == "acquire.submit_once_v1" && d.isRefused(params) {
+			return &ipc.RemoteError{Code: "conflict", Message: "once-only request conflict: once-only filing intent differs (collection) from live job job_live_1 for the same work"}
+		}
 		reply = map[string]any{"job_id": fmt.Sprintf("job_%d", seq)}
 	case "jobs.get":
 		reply = map[string]any{"job": map[string]any{"id": "job_x", "state": "queued"}}
+	case "jobs.disposition":
+		reply = map[string]any{"job_id": "job_x", "state": "queued", "disposition": "active", "changed": false}
 	case "discovery.search":
 		reply = d.works
 	default:
@@ -65,6 +76,26 @@ func (d *flowDaemon) call(_ context.Context, method string, params, result any) 
 		return err
 	}
 	return json.Unmarshal(raw, result)
+}
+
+// isRefused reports whether the daemon must refuse this submit_once work as
+// already in flight under another filing intent.
+func (d *flowDaemon) isRefused(params any) bool {
+	if d.refuseDOI == "" {
+		return false
+	}
+	raw, _ := json.Marshal(params)
+	var req struct {
+		Request struct {
+			Identifiers *struct {
+				DOI string `json:"doi"`
+			} `json:"identifiers"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.Request.Identifiers == nil {
+		return false
+	}
+	return req.Request.Identifiers.DOI == d.refuseDOI
 }
 
 func (d *flowDaemon) count(method string) int {
@@ -330,4 +361,100 @@ func (d *flowDaemonFailingLookup) call(ctx context.Context, method string, param
 		return errors.New("injected ownership lookup failure")
 	}
 	return d.flowDaemon.call(ctx, method, params, result)
+}
+
+// TestCampaignRunAcknowledgesFilingIntentConflict pins the chunk-advance rule
+// for the once-only refusal: a campaign chunk holding one work that is
+// already in flight under another filing intent and 49 normal works is
+// acknowledged anyway — the conflict is a recorded per-work outcome, not a
+// chunk error — so the next run advances to the following chunk instead of
+// retrying the refused chunk forever, and the report keeps the conflict
+// visible against the live job.
+func TestCampaignRunAcknowledgesFilingIntentConflict(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	cfg.Zotio.Executable = "zotio"
+	var bib strings.Builder
+	for i := 1; i <= 51; i++ {
+		fmt.Fprintf(&bib, "@article{w%03d,\n  doi = {10.1000/w%03d},\n  title = {Work %03d},\n  year = {2020}\n}\n", i, i, i)
+	}
+	export := filepath.Join(t.TempDir(), "refs.bib")
+	if err := os.WriteFile(export, []byte(bib.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &flowDaemon{refuseDOI: "10.1000/w001"}
+	out, err := runFlow(t, cfg, d, "campaign", "import", export)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	var imported struct {
+		Manifest campaignManifest `json:"manifest"`
+	}
+	if err := json.Unmarshal([]byte(out), &imported); err != nil {
+		t.Fatalf("import output %q: %v", out, err)
+	}
+	id := imported.Manifest.ID
+	if len(imported.Manifest.Works) != 51 || len(imported.Manifest.Chunks) != 2 {
+		t.Fatalf("import = %d works in %d chunks; want 51 works in 2 chunks", len(imported.Manifest.Works), len(imported.Manifest.Chunks))
+	}
+	out, err = runFlow(t, cfg, d, "campaign", "run", id)
+	if err != nil {
+		t.Fatalf("run chunk 1 with one conflicting work: %v", err)
+	}
+	var first struct {
+		Chunk  int                 `json:"chunk"`
+		Result *batch.SubmitOutput `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &first); err != nil {
+		t.Fatalf("run output %q: %v", out, err)
+	}
+	if first.Chunk != 0 || first.Result == nil || first.Result.Failed != 1 || len(first.Result.Submitted) != 49 {
+		t.Fatalf("chunk 1 result = %+v; want chunk 0 with 1 recorded refusal and 49 submissions", first.Result)
+	}
+	if got := d.count("acquire.submit_once_v1"); got != 50 {
+		t.Fatalf("chunk 1 submitted %d works, want 50", got)
+	}
+	if _, err := runFlow(t, cfg, d, "campaign", "run", id); err != nil {
+		t.Fatalf("run chunk 2: %v", err)
+	}
+	if got := d.count("acquire.submit_once_v1"); got != 51 {
+		t.Fatalf("after chunk 2, submits = %d; want 51 (no retry of the refused chunk)", got)
+	}
+	out, err = runFlow(t, cfg, d, "campaign", "run", id)
+	if err != nil || !strings.Contains(out, `"complete":true`) {
+		t.Fatalf("third run = %q, %v; want the complete marker", out, err)
+	}
+	if got := d.count("acquire.submit_once_v1"); got != 51 {
+		t.Fatalf("a finished campaign resubmitted: %d submits, want 51", got)
+	}
+	out, err = runFlow(t, cfg, d, "campaign", "report", id)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	var report struct {
+		Records []struct {
+			Citation bibparse.Record `json:"citation"`
+			Outcome  string          `json:"outcome"`
+			Reason   string          `json:"reason"`
+		} `json:"records"`
+		Summary map[string]int `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("report output %q: %v", out, err)
+	}
+	found := false
+	for _, record := range report.Records {
+		if record.Citation.DOI == "10.1000/w001" {
+			found = true
+			if record.Outcome != "submission_failed" || !strings.Contains(record.Reason, "job_live_1") {
+				t.Fatalf("conflicting work = outcome %q reason %q; want submission_failed naming job_live_1", record.Outcome, record.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("conflicting work missing from the campaign report")
+	}
+	if report.Summary["submission_failed"] != 1 {
+		t.Fatalf("report summary = %v; want exactly one submission_failed", report.Summary)
+	}
 }
