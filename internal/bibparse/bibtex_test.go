@@ -48,6 +48,19 @@ func TestParseBibTeX(t *testing.T) {
 			},
 		},
 		{
+			name:  "ignores stray at signs before and between entries",
+			input: "% Contact: a@b.org\n@article{first, title={First}, doi={10.1000/first}}\nContact @ or jane@uni.edu\n@article{second, title={Second}}",
+			want: []Record{
+				{SourceKey: "first", Title: "First", DOI: "10.1000/first"},
+				{SourceKey: "second", Title: "Second"},
+			},
+		},
+		{
+			name:    "stray at sign does not hide malformed real entry",
+			input:   "@!\n@article{key, title={unterminated}",
+			wantErr: "bibtex: entry at byte 3: unterminated braced value",
+		},
+		{
 			name: "accepts title-only entry",
 			input: `@misc{untitled,
   title = {A title without an identifier},

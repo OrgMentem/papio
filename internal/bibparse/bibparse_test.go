@@ -74,11 +74,43 @@ func TestDetect(t *testing.T) {
 		{"sniff nbib", "-", "PMID- 1", FormatNBIB},
 		{"sniff csl", "-", "  [ {} ]", FormatCSLJSON},
 		{"empty defaults to jsonl", "-", "", FormatJSONL},
+		{"jsonl takes precedence over later markers", "-", "{\n@article{not a record}\n}", FormatJSONL},
+		{"csl takes precedence over later markers", "-", "[\nTY  - not a record\n]", FormatCSLJSON},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := Detect(tc.path, []byte(tc.data)); got != tc.want {
 				t.Fatalf("Detect = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetectAndParseExportHeaders(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		data   string
+		format Format
+	}{
+		{"bibtex stdin", "-", "% Encoding: UTF-8\n\n@article{a, doi={10.1000/header}}", FormatBibTeX},
+		{"bibtex command", "", "% Encoding: UTF-8\r\n@article{a, doi={10.1000/header}}", FormatBibTeX},
+		{"ris text file", "refs.txt", "Provider: JSTOR\nDatabase: JSTOR\n\nTY  - JOUR\nDO  - 10.1000/header\nER  -\n", FormatRIS},
+		{"ris command", "", "Provider: JSTOR\r\nTY  - JOUR\r\nDO  - 10.1000/header\r\nER  -\r\n", FormatRIS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte(tt.data)
+			format := Detect(tt.path, data)
+			if format != tt.format {
+				t.Fatalf("Detect = %q, want %q", format, tt.format)
+			}
+			records, err := ParseRecords(format, data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 || records[0].DOI != "10.1000/header" {
+				t.Fatalf("records = %+v, want the exported DOI", records)
 			}
 		})
 	}

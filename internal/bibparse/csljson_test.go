@@ -54,6 +54,24 @@ func TestParseCSLJSON(t *testing.T) {
 			},
 		},
 		{
+			name: "EDTF date alongside date parts",
+			data: `[{"DOI":"10.1000/first","issued":"2020-05-01"},{"DOI":"10.1000/second","issued":{"date-parts":[[2023]]}}]`,
+			want: []Record{
+				{DOI: "10.1000/first", Year: 2020},
+				{DOI: "10.1000/second", Year: 2023},
+			},
+		},
+		{
+			name: "uncertain and interval EDTF dates",
+			data: `[{"issued":"2020?"},{"issued":"2021/2022"},{"issued":"20XX"},{"issued":"unknown"}]`,
+			want: []Record{{Year: 2020}, {Year: 2021}, {}, {}},
+		},
+		{
+			name: "unsupported date shapes keep records",
+			data: `[{"DOI":"10.1000/a","issued":true},{"DOI":"10.1000/b","issued":{"date-parts":false}},{"DOI":"10.1000/c","issued":null}]`,
+			want: []Record{{DOI: "10.1000/a"}, {DOI: "10.1000/b"}, {DOI: "10.1000/c"}},
+		},
+		{
 			name: "literal author takes precedence and string year",
 			data: `[{"title":"Proceedings","author":[{"literal":"The Example Consortium","given":"Ignored","family":"Name"}],"issued":{"date-parts":[["2022"]]}}]`,
 			want: []Record{{

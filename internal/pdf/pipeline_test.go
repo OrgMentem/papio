@@ -332,7 +332,7 @@ func TestValidatePipelineTextToolFailureBecomesReview(t *testing.T) {
 	}
 }
 
-// ExtractMetadata returns a hard error only when the context is done, and the
+// ExtractMetadata returns a hard error when the context is done, and the
 // pipeline must not paper over it: a cancelled run has no verdict, and turning
 // one into a report would let a caller act on stages that never completed. The
 // cancellation is triggered by the metadata tool itself, so this asserts
@@ -373,6 +373,35 @@ func TestValidatePipelineMetadataContextErrorPropagates(t *testing.T) {
 	}
 	if report.Metadata != nil || report.Identity.Result != "" {
 		t.Fatalf("report = %+v, want no metadata and no verdict after a cancelled run", report)
+	}
+}
+
+func TestValidatePipelineMetadataTimeoutStillAcceptsValidPDF(t *testing.T) {
+	document := pipelineDocument("Deterministic validation of scholarly article identity.\nAda Lovelace\n2026\ndoi:10.1234/abc.9\n")
+	worker, _ := structuralTool(t, `{"Valid":true,"Pages":2}`)
+	text, _ := textTool(t, document)
+	info, _, metaRan := pipelineInfoTool(t, 2, pipelinePacket, "exec sleep 30")
+	opt := pipelineOptions(0.6)
+	opt.Semantic.Timeout = time.Second
+
+	report, err := Validate(context.Background(), ValidationInput{
+		Path:         writeTempPDF(t),
+		DeclaredMIME: "application/pdf",
+		WorkerBinary: worker,
+		Capability:   Capability{PDFToText: text, PDFInfo: info},
+		Target:       pipelineTarget,
+	}, opt)
+	if err != nil {
+		t.Fatalf("metadata-only timeout must not fail validation: %v", err)
+	}
+	if !toolRan(t, metaRan) {
+		t.Fatal("metadata stage never started")
+	}
+	if !report.Payload.OK || !report.Structural.Valid || report.Text.NeedsReview {
+		t.Fatalf("report = %+v, want valid payload, structure, and text", report)
+	}
+	if len(report.Metadata) != 0 || report.Identity.Result != IdentityPass {
+		t.Fatalf("metadata=%+v identity=%+v, want acceptance on text alone", report.Metadata, report.Identity)
 	}
 }
 

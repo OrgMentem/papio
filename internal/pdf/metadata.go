@@ -4,6 +4,7 @@ package pdf
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"sort"
 	"strings"
 
@@ -129,10 +130,13 @@ var xmpValueContainers = map[string]bool{
 // Absence is not an error at any level: no pdfinfo, an unreadable packet,
 // malformed XML, or a file with no metadata at all each yield empty fields and
 // a nil error, because every one of them means the same thing to the caller —
-// there is no metadata evidence, decide on text alone. A hard error is returned
-// only when the context is done, which the caller must not paper over.
+// there is no metadata evidence, decide on text alone. Cancellation and tool
+// timeouts return errors: neither proves absence, and neither may be cached.
 func ExtractMetadata(ctx context.Context, path string, capability Capability, opt SemanticOptions) (MetadataFields, error) {
 	opt = normalizedSemanticOptions(opt)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if capability.PDFInfo == "" {
 		return nil, nil
 	}
@@ -140,6 +144,9 @@ func ExtractMetadata(ctx context.Context, path string, capability Capability, op
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
 		}
 		return nil, nil
 	}

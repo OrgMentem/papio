@@ -116,22 +116,27 @@ func Detect(path string, data []byte) Format {
 	return sniff(data)
 }
 
-// sniff classifies extensionless input (stdin, tempfiles) by leading content.
+// sniff looks past export headers for the first recognizable record marker.
+// A JSON opener takes precedence over any marker inside its content.
 func sniff(data []byte) Format {
-	trimmed := bytes.TrimLeft(data, " \t\r\n\ufeff")
-	switch {
-	case len(trimmed) == 0:
-		return FormatJSONL
-	case trimmed[0] == '[':
-		return FormatCSLJSON
-	case trimmed[0] == '{':
-		return FormatJSONL
-	case trimmed[0] == '@':
-		return FormatBibTeX
-	case bytes.HasPrefix(trimmed, []byte("TY  -")):
-		return FormatRIS
-	case bytes.HasPrefix(trimmed, []byte("PMID-")):
-		return FormatNBIB
+	for len(data) > 0 {
+		line, rest, _ := bytes.Cut(data, []byte{'\n'})
+		data = rest
+		trimmed := bytes.TrimLeft(line, " \t\r\ufeff")
+		switch {
+		case len(trimmed) == 0:
+			continue
+		case trimmed[0] == '[':
+			return FormatCSLJSON
+		case trimmed[0] == '{':
+			return FormatJSONL
+		case trimmed[0] == '@':
+			return FormatBibTeX
+		case bytes.HasPrefix(trimmed, []byte("TY  -")):
+			return FormatRIS
+		case bytes.HasPrefix(trimmed, []byte("PMID-")):
+			return FormatNBIB
+		}
 	}
 	return FormatJSONL
 }

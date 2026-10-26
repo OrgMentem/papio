@@ -14,7 +14,7 @@ type cslJSONItem struct {
 	PMID   json.RawMessage `json:"PMID"`
 	Title  string          `json:"title"`
 	Author []cslJSONAuthor `json:"author"`
-	Issued cslJSONIssued   `json:"issued"`
+	Issued json.RawMessage `json:"issued"`
 }
 
 type cslJSONAuthor struct {
@@ -61,7 +61,7 @@ func parseCSLJSON(data []byte) ([]Record, error) {
 			PMID:      cslJSONValue(item.PMID),
 			Title:     item.Title,
 			Authors:   cslJSONAuthors(item.Author),
-			Year:      cslJSONYear(item.Issued.DateParts),
+			Year:      cslJSONYear(item.Issued),
 		}
 		records = append(records, record)
 	}
@@ -86,13 +86,30 @@ func cslJSONAuthors(authors []cslJSONAuthor) []string {
 	return result
 }
 
-func cslJSONYear(dateParts []json.RawMessage) int {
-	if len(dateParts) == 0 {
+func cslJSONYear(raw json.RawMessage) int {
+	var date string
+	if err := json.Unmarshal(raw, &date); err == nil {
+		// CSL also permits EDTF strings, including uncertain dates and
+		// intervals. Recover only a complete leading four-digit year.
+		if len(date) < 4 {
+			return 0
+		}
+		for i := range 4 {
+			if date[i] < '0' || date[i] > '9' {
+				return 0
+			}
+		}
+		year, _ := strconv.Atoi(date[:4])
+		return year
+	}
+
+	var issued cslJSONIssued
+	if err := json.Unmarshal(raw, &issued); err != nil || len(issued.DateParts) == 0 {
 		return 0
 	}
 
 	var firstPart []json.RawMessage
-	if err := json.Unmarshal(dateParts[0], &firstPart); err != nil || len(firstPart) == 0 {
+	if err := json.Unmarshal(issued.DateParts[0], &firstPart); err != nil || len(firstPart) == 0 {
 		return 0
 	}
 
