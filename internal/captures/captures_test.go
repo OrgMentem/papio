@@ -362,18 +362,46 @@ func TestStoreHostCannotEscapeCapturesDirectory(t *testing.T) {
 func TestPurge(t *testing.T) {
 	ctx := context.Background()
 	store := New(t.TempDir(), Retention{MaxPerHost: 10, MaxAge: 14 * 24 * time.Hour})
+	paths := make(map[string]string)
 	for _, host := range []string{"sagepub.com", "wiley.com"} {
-		if _, err := store.Store(ctx, host, "observed", "", "", []byte(host)); err != nil {
+		path, err := store.Store(ctx, host, "observed", "", "", []byte(host))
+		if err != nil {
 			t.Fatal(err)
 		}
+		paths[host] = path
 	}
 	removed, err := store.Purge(ctx, "sagepub.com")
 	if err != nil || removed != 1 {
 		t.Fatalf("purge host = (%d, %v), want (1, nil)", removed, err)
 	}
+	for _, path := range []string{paths["sagepub.com"], metadataPath(paths["sagepub.com"])} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("purged capture file %q still exists or cannot be checked: %v", path, err)
+		}
+	}
+	for _, path := range []string{paths["wiley.com"], metadataPath(paths["wiley.com"])} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("kept capture file %q: %v", path, err)
+		}
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Host != "wiley.com" || rows[0].Path != paths["wiley.com"] {
+		t.Fatalf("list after host purge = %+v, %v; want only the kept wiley.com capture", rows, err)
+	}
 	removed, err = store.Purge(ctx, "")
 	if err != nil || removed != 1 {
 		t.Fatalf("purge all = (%d, %v), want (1, nil)", removed, err)
+	}
+	for _, path := range paths {
+		for _, file := range []string{path, metadataPath(path)} {
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Fatalf("purged capture file %q still exists or cannot be checked: %v", file, err)
+			}
+		}
+	}
+	rows, err = store.List(ctx)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("list after purge all = %+v, %v; want no captures", rows, err)
 	}
 }
 
@@ -735,11 +763,13 @@ func TestCorruptSidecarDoesNotBlockListOrPurgeAll(t *testing.T) {
 	dataDir := t.TempDir()
 	store := New(dataDir, Retention{MaxPerHost: 10, MaxAge: 14 * 24 * time.Hour})
 	var bad string
+	var paths []string
 	for _, host := range []string{"sagepub.com", "wiley.com"} {
 		path, err := store.Store(ctx, host, "observed", "", "", []byte(host))
 		if err != nil {
 			t.Fatal(err)
 		}
+		paths = append(paths, path)
 		if host == "wiley.com" {
 			bad = metadataPath(path)
 		}
@@ -757,5 +787,16 @@ func TestCorruptSidecarDoesNotBlockListOrPurgeAll(t *testing.T) {
 	removed, err := store.Purge(ctx, "")
 	if err != nil || removed != 2 {
 		t.Fatalf("purge all = (%d, %v), want (2, nil) despite the corrupt sidecar", removed, err)
+	}
+	for _, path := range paths {
+		for _, file := range []string{path, metadataPath(path)} {
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Fatalf("purged capture file %q still exists or cannot be checked: %v", file, err)
+			}
+		}
+	}
+	rows, err = store.List(ctx)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("list after purge all = %+v, %v; want no captures", rows, err)
 	}
 }
