@@ -43,6 +43,9 @@ const (
 	// front-matter identifier was found, so the grab row remains the durable
 	// triage entity until an operator supplies one.
 	StateParkedNoIdentifier State = "parked_no_identifier"
+	// StateDismissing claims parked -> dismissing -> deletion. It is not
+	// bindable or visible in the inbox; cleanup retries retain this state.
+	StateDismissing State = "dismissing"
 	// StateFailedValidation is terminal: the settled file failed structural
 	// validation (not a valid PDF).
 	StateFailedValidation State = "failed_validation"
@@ -53,7 +56,7 @@ const (
 
 func validState(s State) bool {
 	switch s {
-	case StateAwaitingFile, StateQuarantined, StateIdentified, StateJobCreated, StateParkedNoIdentifier, StateFailedValidation, StateAbandoned:
+	case StateAwaitingFile, StateQuarantined, StateIdentified, StateJobCreated, StateParkedNoIdentifier, StateDismissing, StateFailedValidation, StateAbandoned:
 		return true
 	default:
 		return false
@@ -396,6 +399,8 @@ func (s *Service) MarkQuarantined(ctx context.Context, id, quarantinePath string
 // the wire value to report later ("job_created" for a freshly created job,
 // "already_owned" when the extracted identifier deduplicated onto an
 // already-live job — ADR-0010's ledger dedupe applying naturally).
+// A parked grab can bind directly after the operator supplies an identifier;
+// do not commit an intermediate identified state that cannot be retried.
 func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string) error {
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -405,9 +410,9 @@ func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string)
 	now := store.Now()
 	res, err := tx.ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, updated_at = ?
-		WHERE id = ? AND state IN (?, ?, ?)`,
+		WHERE id = ? AND state IN (?, ?, ?, ?)`,
 		string(StateJobCreated), jobID, outcome, now, id,
-		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
 	if err != nil {
 		return err
 	}
@@ -989,8 +994,8 @@ func (s *Service) PendingNotifications(ctx context.Context, limit int) ([]*Grab,
 	}
 	rows, err := s.store.DB().QueryContext(ctx, `
 		SELECT `+columns+` FROM pdf_grabs
-		WHERE outcome != '' AND notified_at IS NULL
-		ORDER BY updated_at ASC LIMIT ?`, limit)
+		WHERE outcome != '' AND notified_at IS NULL AND state != ?
+		ORDER BY updated_at ASC LIMIT ?`, string(StateDismissing), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,6 +1021,51 @@ func (s *Service) PendingNotifications(ctx context.Context, limit int) ([]*Grab,
 func (s *Service) MarkNotified(ctx context.Context, id string) error {
 	_, err := s.store.DB().ExecContext(ctx, `UPDATE pdf_grabs SET notified_at = ? WHERE id = ?`, store.Now(), id)
 	return err
+}
+
+// DeleteParked durably claims a dismissal before filesystem cleanup. The
+// conditional claim excludes binds, but releases the database connection
+// before cleanup. Failure or a crash leaves a dismissing row for the sweep.
+func (s *Service) DeleteParked(ctx context.Context, id string, cleanup func(string) error) error {
+	var quarantinePath string
+	if err := s.store.DB().QueryRowContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, updated_at = ?
+		WHERE id = ? AND state IN (?, ?)
+		RETURNING quarantine_path`,
+		string(StateDismissing), store.Now(), id,
+		string(StateParkedNoIdentifier), string(StateDismissing)).Scan(&quarantinePath); err != nil {
+		return err
+	}
+	if err := cleanup(quarantinePath); err != nil {
+		return err
+	}
+	// Concurrent retries may both finish cleanup. Deleting an already removed
+	// claim is successful; no transition can bind or revive a dismissing row.
+	_, err := s.store.DB().ExecContext(ctx, `DELETE FROM pdf_grabs WHERE id = ? AND state = ?`,
+		id, string(StateDismissing))
+	return err
+}
+
+// PendingRecovery lists durable work that does not depend on a landing
+// directory: unfinished dismissals and quarantined captures.
+func (s *Service) PendingRecovery(ctx context.Context) ([]*Grab, error) {
+	rows, err := s.store.DB().QueryContext(ctx, `
+		SELECT `+columns+` FROM pdf_grabs
+		WHERE state IN (?, ?) ORDER BY updated_at, id`,
+		string(StateDismissing), string(StateQuarantined))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*Grab
+	for rows.Next() {
+		g, err := scanGrab(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // Delete removes a grab row outright when its triage item is dismissed. It

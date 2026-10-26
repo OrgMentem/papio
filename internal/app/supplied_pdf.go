@@ -488,13 +488,16 @@ func copySuppliedPDF(src string, checked os.FileInfo, dst string, limit int64) (
 // rejectSuppliedPDF re-parks a job whose supplied PDF failed validation in
 // awaiting_human and asks for a different file. Unlike a browser download
 // there is nothing to move aside: no sweep reads the staging directory, and
-// the staged copy is removed when SupplyPDF returns.
+// the staged copy is removed when SupplyPDF returns. The action and the park
+// commit in one transaction: a split commit would leave a stale open prompt
+// on a fetching job nobody is waiting on.
 func (s *Service) rejectSuppliedPDF(ctx context.Context, jobID string, replacementAccess job.AccessClassification) error {
-	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-		"the supplied PDF failed validation; please supply a different file",
-		replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
+	if err := s.Jobs.ParkWithHumanAction(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
+		"manual_download", "the supplied PDF failed validation; please supply a different file",
+		withSuppressionDetail(ctx, map[string]any{"reason": "supplied_pdf_rejected"}), replacementAccess,
+		job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 		return err
 	}
-	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
-		map[string]any{"reason": "supplied_pdf_rejected"})
+	s.notifyParked(ctx, jobID, job.StateAwaitingHuman)
+	return nil
 }
