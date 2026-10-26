@@ -281,6 +281,45 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **Cancelling a job while it downloads no longer stops the daemon.** A cancel
+  does not interrupt a download in flight, so when the download then succeeded
+  the job's state check failed and the error stopped the scheduler and the
+  daemon. The job now stays cancelled, its attempt is closed as cancelled, and
+  the downloaded copy is removed. A failed write of a candidate's or attempt's
+  state during a download is now reported, instead of leaving the job stuck or
+  retrying it in a loop, and a failed read of a landing-page candidate is no
+  longer taken to mean "no such candidate".
+- **Document delivery submits after the downloads run out.** When every
+  download candidate failed and *papio* moved on to a delivery request, the
+  submission always lost its reservation and the error stopped the daemon. The
+  request is now submitted and the job waits for delivery.
+- **`papio delivery confirm-exists` requires a numeric transaction number.** It
+  accepted any text, and a reference that was not a number then failed every
+  later status check with an error that stopped the worker. A non-numeric
+  reference is now `invalid_argument`. A bad reference that is already stored
+  stops the status checks for that request and opens one reconciliation action
+  for you to correct it.
+- **A database failure while filing into the managed folder no longer crashes
+  the daemon.** When the second database transaction could not start, the
+  cleanup of the first one dereferenced a nil transaction and panicked.
+- **A `pdfinfo` that times out or cannot run no longer marks a PDF invalid.**
+  The cross-check reported its own failure as "not a valid PDF", so the
+  candidate was rejected and its downloaded copy deleted. The job now goes to
+  review and keeps the file. A `pdfinfo` that runs and then rejects the file,
+  or reports a page count that disagrees, still marks it invalid.
+- **OpenAIRE registered-service credentials work.** The token exchange is a
+  POST, but it was sent through the GET-only client, so every exchange was
+  refused before it left the machine. It now uses a client that allows this
+  POST with the same address and redirect protections. A blocked address or a
+  refused redirect fails permanently; a large error page from the server is
+  still retried.
+- **A browser effect permit is no longer granted when its database commit
+  fails.** When two requests raced for the same permit, a failed commit was
+  ignored and reported as a successful acquire.
+- **A cancel, dismissal or delivery reconciliation that is only half undone now
+  says so.** When the change was recorded but undoing a later step failed, the
+  error showed the earlier cause (`not_found` or `conflict`), as if nothing had
+  changed. It now reports that the recorded change stands.
 - **Refusals from `jobs refile`, `jobs archive`, `jobs restore`, `jobs filing
   retry`, `jobs redrive` and publisher retry now say why.** Each printed
   `conflict: job state conflict` (or `not_found: record not found` for a
