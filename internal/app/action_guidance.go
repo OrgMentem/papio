@@ -23,9 +23,11 @@ var actionGuidanceDefaultOK = map[string]struct{}{
 }
 
 // HumanActionNextStepFor is the one authority for the next step implied by a
-// human action's Kind and RequiresAuth fields. Every surface with the current
-// action must use it, so a replacement action cannot inherit a command from
+// human action's Kind and RequiresAuth fields. The app, cli and errcat
+// surfaces that print a next step must use it, so a replacement action cannot inherit a command from
 // the transition that created the action it replaced.
+// job.Diagnose projects CanOpenAction and NeedsBrowser separately by action
+// kind (classifyAction), because internal/job cannot import internal/app.
 func HumanActionNextStepFor(action job.HumanAction) HumanActionNextStep {
 	next := HumanActionNextStep{RequiresInstitutionalLogin: action.RequiresAuth}
 	switch action.Kind {

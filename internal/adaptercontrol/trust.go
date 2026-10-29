@@ -10,8 +10,10 @@ import (
 
 // embeddedPublicKey is the ONE place the papio control public key lives: the
 // standard-base64 encoding of the 32-byte Ed25519 public key that
-// `papio-control keygen` prints. Setting it is the only edit needed to turn
-// signed control on; the matching private key never enters this repository.
+// `papio-control keygen` prints. Embedding a key is the build-time half of
+// turning signed control on. At run time it is also gated on updates.check
+// (default off), and the document comes from a persisted copy or a fetch.
+// The matching private key never enters this repository.
 //
 // Empty means this build trusts no control key. Such a build neither fetches
 // the document nor accepts one, and `papio doctor` says so. It is a var, not a
