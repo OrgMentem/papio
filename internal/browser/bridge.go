@@ -9518,13 +9518,17 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 
 // settledFileIn is scanAdoptionDir's directory-scan rule, factored out so
 // SweepGrabs's per-grab landing directory (ADR-0020) shares the exact same
-// settled-file heuristic as ordinary job adoption.
-func (b *Bridge) settledFileIn(dir string) (string, bool) {
+// settled-file heuristic as ordinary job adoption. A missing or unreadable
+// directory is plain "nothing settled" (ok false). The listing's error is
+// still returned, because ErrAdoptionScanTimeout means the directory was never
+// listed — not that it is empty — and the caller must not act on that.
+func (b *Bridge) settledFileIn(dir string) (string, bool, error) {
 	entries, err := b.readAdoptionDir(dir)
 	if err != nil {
-		return "", false // no directory yet, scan suspended/timed out, or unreadable
+		return "", false, err
 	}
-	return settledFileName(entries)
+	name, ok := settledFileName(entries)
+	return name, ok, nil
 }
 
 // settledFileName preserves the shared job/grab ambiguity and partial-write
@@ -9863,7 +9867,16 @@ func (b *Bridge) sweepGrabsIn(ctx context.Context, root string, processed map[st
 			continue // already terminal; nothing left to do here
 		}
 		dir := filepath.Join(root, id)
-		name, ok := b.settledFileIn(dir)
+		name, ok, err := b.settledFileIn(dir)
+		if errors.Is(err, ErrAdoptionScanTimeout) {
+			// The landing directory was never listed (latched, gate held, or
+			// blocked). That is not "empty": a quarantined grab would be
+			// processed from quarantine and its landing directory removed
+			// unseen. Leave the grab — quarantine-only fallback included —
+			// for the next tick.
+			processed[g.ID] = true
+			continue
+		}
 		if !ok && g.State == grab.StateAwaitingFile {
 			continue
 		}
