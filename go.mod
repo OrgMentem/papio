@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/mark3labs/mcp-go v1.3.0
+	github.com/mark3labs/mcp-go v1.4.0
 	github.com/mattn/go-isatty v0.0.24
 	github.com/pdfcpu/pdfcpu v0.16.4
 	github.com/pelletier/go-toml/v2 v2.4.3
@@ -39,7 +39,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/image v0.47.0 // indirect
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/text v0.43.0 // indirect
 	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
