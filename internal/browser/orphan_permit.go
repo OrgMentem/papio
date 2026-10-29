@@ -125,7 +125,7 @@ func (b *Bridge) recoverOrphanedEffectPermit(ctx context.Context) *job.EffectPer
 	}
 	b.mu.Lock()
 	generation := b.arbitration.generation()
-	authorityKnown := !b.materializationGenerationUnavailable && !b.materializationAuthorityUncertain
+	authorityKnown := !b.materializationGenerationUnavailable.Load() && !b.materializationAuthorityUncertain
 	now := b.now()
 	b.mu.Unlock()
 	seen, err := b.inspectOrphanPermitDirectories(permit)

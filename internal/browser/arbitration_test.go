@@ -6,17 +6,17 @@ import "time"
 
 func (a *sessionArbitration) setHolderForTest(session *browserSession, generation int64) {
 	a.holder = session
-	a.epoch = generation
+	a.epoch.Store(generation)
 }
 
 func (a *sessionArbitration) advanceGenerationForTest() {
-	a.epoch++
+	a.epoch.Add(1)
 }
 func (a *sessionArbitration) setGenerationForTest(generation int64) {
-	a.epoch = generation
+	a.epoch.Store(generation)
 }
 func (a *sessionArbitration) retreatGenerationForTest() {
-	a.epoch--
+	a.epoch.Add(-1)
 }
 
 func (a *sessionArbitration) setHolderOnlyForTest(session *browserSession) {

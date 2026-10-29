@@ -33,12 +33,18 @@ type browserSession struct {
 
 // sessionArbitration owns the browser holder state machine. Bridge serializes
 // calls with its mutex, but only these transition methods mutate this state.
+// The mutex-guarded fields have no lock-free reader; epoch and status are the
+// exceptions, so they are atomic.
 type sessionArbitration struct {
-	holder        *browserSession
-	pending       map[string]*browserSession
-	deniedHellos  int
-	takeovers     int
-	epoch         int64
+	holder       *browserSession
+	pending      map[string]*browserSession
+	deniedHellos int
+	takeovers    int
+	// epoch is the durable holder generation. The transition methods write it
+	// under the bridge mutex, but adoption ingestion fences the artifact winner
+	// on it while running outside that mutex by design, so every access is
+	// atomic.
+	epoch         atomic.Int64
 	reservedFor   string
 	reservedUntil time.Time
 	nextEpoch     func() (int64, error)
@@ -96,7 +102,7 @@ func newSessionArbitration(nextEpoch func() (int64, error)) sessionArbitration {
 	}
 }
 
-func (a *sessionArbitration) generation() int64 { return a.epoch }
+func (a *sessionArbitration) generation() int64 { return a.epoch.Load() }
 
 func (a *sessionArbitration) holderSession() *browserSession { return a.holder }
 
@@ -113,7 +119,7 @@ func (a *sessionArbitration) isHolder(sessionID string) bool {
 	return a.holder != nil && a.holder.ID == sessionID
 }
 func (a *sessionArbitration) holderMatches(sessionID string, generation int64) bool {
-	return a.epoch == generation && a.isHolder(sessionID)
+	return a.epoch.Load() == generation && a.isHolder(sessionID)
 }
 
 func (a *sessionArbitration) holderVersion() string {
@@ -155,7 +161,7 @@ func (a *sessionArbitration) hello(session *browserSession, now time.Time, refre
 		if err != nil {
 			transition.generationErr = err
 		} else {
-			a.epoch = generation
+			a.epoch.Store(generation)
 		}
 	}
 	a.clearReloadReservation()
@@ -248,7 +254,7 @@ func (a *sessionArbitration) promote(session *browserSession, dropPrevious bool)
 		if err != nil {
 			transition.generationErr = err
 		} else {
-			a.epoch = generation
+			a.epoch.Store(generation)
 		}
 	}
 	delete(a.pending, session.ID)
@@ -268,7 +274,7 @@ func (a *sessionArbitration) release(sessionID string) (*browserSession, bool) {
 	}
 	departed := a.holder
 	a.holder = nil
-	a.epoch = 0
+	a.epoch.Store(0)
 	return departed, true
 }
 

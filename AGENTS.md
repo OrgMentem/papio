@@ -628,6 +628,16 @@ There is also a link check, because `zensical build` prints a broken link as an
   itself forward must check `queuedOffers` — the session-evidence sweep's source
   exemption in `reofferInstitutionalSiblings` did not, and stranded the only waiting
   paper after a sign-in until `papio actions open`.
+- **Arbitration state is `b.mu`-guarded except what adoption must read.** Adoption
+  ingestion (`ingestAdoptedFile` and everything under it) runs without `b.mu` by design,
+  because it does file I/O and `b.mu` must never be held across that (TCC). Yet
+  `weighArtifact`/`commitArtifact` fence the winner on the holder generation. So
+  `sessionArbitration.epoch`, `Bridge.materializationGenerationUnavailable` and
+  `sessionArbitration.status` are atomics; every other arbitration field (`holder`,
+  `pending`, …) and the reoffer maps (`offered`, `queuedOffers`, `reofferPending`) are
+  read only under `b.mu`. `reofferQueued` is the one reoffer map that commit paths write,
+  under its own leaf lock `reofferQueueMu` (taken after `b.mu` when both are held, never
+  the reverse). A new field that adoption must read needs the same atomic treatment.
 
 ### Firefox / cross-browser extension
 - Firefox MV3 has **no service worker** — background is a classic **event-page iife**
