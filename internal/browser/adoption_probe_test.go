@@ -507,7 +507,7 @@ func TestAdoptionProbePreservesAmbiguityAndGrabSelection(t *testing.T) {
 	b, _, cfg, _ := newBridge(t)
 	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "job-probe")
 	writeAdoptionProbeFile(t, filepath.Join(dir, "wrapper.pdf"), []byte("<html>no PDF</html>"))
-	if name, ok := b.settledFileIn(dir); !ok || name != "wrapper.pdf" {
+	if name, ok, err := b.settledFileIn(dir); err != nil || !ok || name != "wrapper.pdf" {
 		t.Fatal("grab settled-file contract changed")
 	}
 	if _, ok := b.scanAdoptionDir(context.Background(), "job-probe"); ok {
