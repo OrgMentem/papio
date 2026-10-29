@@ -13283,15 +13283,15 @@ func TestMaterializationGenerationRetryOnSameSessionHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	runSync(t, b, materializationHello(t))
-	if !b.materializationGenerationUnavailable {
+	if !b.materializationGenerationUnavailable.Load() {
 		t.Fatal("generation failure did not fail closed")
 	}
 	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_holder_generation_once`); err != nil {
 		t.Fatal(err)
 	}
 	runSync(t, b, materializationHello(t))
-	if b.materializationGenerationUnavailable || b.materializationAuthorityUncertain || b.arbitration.generation() == 0 {
-		t.Fatalf("same-session generation retry did not recover: epoch=%d unavailable=%v uncertain=%v", b.arbitration.generation(), b.materializationGenerationUnavailable, b.materializationAuthorityUncertain)
+	if b.materializationGenerationUnavailable.Load() || b.materializationAuthorityUncertain || b.arbitration.generation() == 0 {
+		t.Fatalf("same-session generation retry did not recover: epoch=%d unavailable=%v uncertain=%v", b.arbitration.generation(), b.materializationGenerationUnavailable.Load(), b.materializationAuthorityUncertain)
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -457,7 +458,9 @@ type Bridge struct {
 	materializationProfileAuthorityUnavailable bool
 	// materializationGenerationUnavailable retries durable holder-generation
 	// allocation before exposing materialization after a transient store error.
-	materializationGenerationUnavailable bool
+	// Holder transitions write it under b.mu; adoption weighs artifacts without
+	// b.mu (see weighArtifact), so it is atomic.
+	materializationGenerationUnavailable atomic.Bool
 	// materializationAuthorityUncertain fails closed after a holder generation
 	// change whose stale-claim reconciliation could not be committed.
 	materializationAuthorityUncertain bool
@@ -995,11 +998,11 @@ func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string)
 	}
 	if transition.generationErr != nil {
 		b.materializationAuthorityUncertain = true
-		b.materializationGenerationUnavailable = true
+		b.materializationGenerationUnavailable.Store(true)
 		log.Printf("papio: materialization holder generation unavailable: %v", transition.generationErr)
 	} else if b.jobs != nil {
 		b.materializationAuthorityUncertain = false
-		b.materializationGenerationUnavailable = false
+		b.materializationGenerationUnavailable.Store(false)
 	}
 	b.offered = map[string]bool{}
 	b.queuedOffers = map[string]bool{}
@@ -1034,7 +1037,7 @@ func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string)
 // A store failure is fail-closed: materialization offers stay disabled until a
 // later holder promotion successfully reconciles the durable fence.
 func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
-	if b.jobs == nil || b.materializationGenerationUnavailable || b.materializationProfileAuthorityUnavailable {
+	if b.jobs == nil || b.materializationGenerationUnavailable.Load() || b.materializationProfileAuthorityUnavailable {
 		return
 	}
 	count, err := b.jobs.AbandonStaleMaterializations(ctx, b.arbitration.generation())
@@ -1053,7 +1056,7 @@ func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
 // tracking after a holder or daemon restart. Only open awaiting-human handoffs
 // can regain focus. An open made without a holder can create its first candidate.
 func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
-	if b.materializationGenerationUnavailable || b.materializationProfileAuthorityUnavailable || b.materializationAuthorityUncertain || b.materializationClaimReconcileUnavailable {
+	if b.materializationGenerationUnavailable.Load() || b.materializationProfileAuthorityUnavailable || b.materializationAuthorityUncertain || b.materializationClaimReconcileUnavailable {
 		return nil
 	}
 	actions, err := b.jobs.ListHumanActions(ctx, true)
@@ -1606,7 +1609,7 @@ func (b *Bridge) institutionalMaterializationAvailable() bool {
 	return b != nil && b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID != legacySessionID &&
 		!b.materializationAuthorityUncertain &&
 		!b.materializationProfileAuthorityUnavailable &&
-		!b.materializationGenerationUnavailable &&
+		!b.materializationGenerationUnavailable.Load() &&
 		!b.materializationClaimReconcileUnavailable &&
 		slices.Contains(b.arbitration.holderSession().Features, institutionalMaterializationFeature) &&
 		slices.Contains(b.arbitration.holderSession().Features, effectPermitFeature)
@@ -4766,7 +4769,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		Outdated:                    compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0,
 		adapterUpgradeRepairPending: len(p.AdapterVersions) != 0,
 	}
-	decision := b.arbitration.hello(session, now, b.materializationGenerationUnavailable)
+	decision := b.arbitration.hello(session, now, b.materializationGenerationUnavailable.Load())
 	if decision.role == sessionRolePending {
 		holder := b.arbitration.holderSession()
 		log.Printf("papio: browser session %s (v%s) denied: session held by %s (v%s)",
@@ -4800,10 +4803,10 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	}
 	if transition.generationErr != nil {
 		b.materializationAuthorityUncertain = true
-		b.materializationGenerationUnavailable = true
+		b.materializationGenerationUnavailable.Store(true)
 		log.Printf("papio: materialization holder generation unavailable: %v", transition.generationErr)
 	} else if transition.generationAttempted {
-		b.materializationGenerationUnavailable = false
+		b.materializationGenerationUnavailable.Store(false)
 	}
 	if transition.changed {
 		b.lastSessionEvidenceAt = map[string]time.Time{}
@@ -7177,7 +7180,7 @@ func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*ar
 	if err != nil {
 		return nil, err
 	}
-	if b.materializationGenerationUnavailable {
+	if b.materializationGenerationUnavailable.Load() {
 		return &artifactFence{digest: digest}, nil
 	}
 	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
@@ -7582,7 +7585,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	if b.jobs == nil {
 		return false, "", nil
 	}
-	if b.materializationGenerationUnavailable {
+	if b.materializationGenerationUnavailable.Load() {
 		return false, "", errors.New("browser holder generation is unavailable")
 	}
 	profile, profileErr := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
@@ -7980,7 +7983,7 @@ func (b *Bridge) resolveProfileGatesForJob(ctx context.Context, observationKey, 
 // Authentication traffic is the precise signal — it is exactly the slow,
 // human-paced interaction that outruns the lease.
 func (b *Bridge) renewMaterializationLease(ctx context.Context, jobID string) {
-	if b.jobs == nil || strings.TrimSpace(jobID) == "" || b.materializationGenerationUnavailable {
+	if b.jobs == nil || strings.TrimSpace(jobID) == "" || b.materializationGenerationUnavailable.Load() {
 		return
 	}
 	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
@@ -8869,7 +8872,7 @@ func hostSafetyDomain(prefix, target string) string {
 // retireFinishedProviderBinding releases the completed route's occupancy.
 // Effect permits are untouched: an unresolved effect still prevents a retry.
 func (b *Bridge) retireFinishedProviderBinding(ctx context.Context, jobID, outcome string) {
-	if !b.materializationGenerationUnavailable {
+	if !b.materializationGenerationUnavailable.Load() {
 		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 		if attemptErr != nil {
 			log.Printf("papio: reading materialization attempt after %s for %s: %v", outcome, jobID, attemptErr)
@@ -8896,7 +8899,7 @@ func (b *Bridge) retireFinishedProviderBinding(ctx context.Context, jobID, outco
 // retireFinishedProviderBinding: the human action is already durable, and the
 // extension repeats the outcome while the page still shows the step.
 func (b *Bridge) parkProviderBindingForHuman(ctx context.Context, jobID, outcome string) {
-	if b.materializationGenerationUnavailable {
+	if b.materializationGenerationUnavailable.Load() {
 		return
 	}
 	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
@@ -12898,7 +12901,7 @@ func (b *Bridge) effectPermitWorkerLive(permit *job.EffectPermit) bool {
 	generation := b.arbitration.generation()
 	now := b.now()
 	return holder != nil && holder.ID != legacySessionID && !holder.Outdated &&
-		!b.materializationGenerationUnavailable && !b.materializationAuthorityUncertain &&
+		!b.materializationGenerationUnavailable.Load() && !b.materializationAuthorityUncertain &&
 		generation > 0 && permit.BrowserHolderGeneration == generation &&
 		permit.Status == job.EffectPermitHeld &&
 		permit.LeaseUntil != nil && permit.LeaseUntil.After(now) &&

@@ -221,7 +221,7 @@ func TestAgentDecisionSyncReconcilesUncertainPermit(t *testing.T) {
 				t.Cleanup(b.CloseAcquisitionBackend)
 				msgs, _ = runSync(t, b, helloWithFeatures(t, "1.2.3", providerDriveEpochV1Feature, effectPermitFeature, agentFallbackFeature))
 			case "generation_unavailable":
-				b.materializationGenerationUnavailable = true
+				b.materializationGenerationUnavailable.Store(true)
 			}
 			if err != nil {
 				t.Fatal(err)
