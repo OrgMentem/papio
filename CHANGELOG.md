@@ -281,6 +281,15 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **`papio_batch_wait` stays within its timeout when a report read stalls.**
+  The wait read each batch report under the agent's own context and only
+  checked its deadline once that read returned, so a report read that never
+  finished held this read-only MCP call open with no bound at all, well past
+  the documented 1–600 second maximum. Every report read and every sleep now
+  runs under the requested `timeout_seconds`: when it expires the tool returns
+  the last report it read with `settled: false`, and when no report arrived at
+  all it fails naming the timeout instead of reporting an empty poll. A
+  cancelled MCP request is still reported as an error.
 - **Windows daemon controls explain a missing named pipe.** `papio daemon status`
   reports that no daemon runs, or names the daemon's startup phase, instead of
   returning a raw pipe error. `papio daemon stop` succeeds when no daemon runs
@@ -1425,6 +1434,40 @@ execution records kept during the initial build.
   when the retry is refused.
 - Delivery inspection no longer accepts a differently cased
   `provider_reference` on operations that must not receive one.
+- **A folder *papio* could not read is no longer treated as an empty one.**
+  Two sweeps used to act on a directory listing that never happened. If
+  reading a **Send PDF to papio** capture's folder failed — a permission or
+  consent refusal, a transient filesystem error, or a listing that ran out of
+  time — *papio* carried on from its own private copy and removed the folder
+  unseen, so a PDF that had landed there went with it. Terminal cleanup had
+  the matching fault: a committed capture whose paper never became ready could
+  have its only remaining copy deleted after a failed listing. Both now leave
+  every byte in place and retry on the next pass, and only a folder that is
+  confirmed gone is read as holding nothing.
+- **A capture interrupted mid-copy no longer looks like your download.**
+  *papio* copies a captured PDF into the job's folder through a hidden
+  temporary file and gives it its final name only once the copy is complete,
+  so the file under that name is never partial. The final name is still never
+  written over: if another file takes it first, the copy fails and the
+  existing file is left untouched. A daemon killed during the copy used to
+  leave a truncated file where the next scan read it as the paper you
+  supplied: it was rejected as invalid and the job asked you to supply a file
+  *papio* already held, and the stump then made the folder ambiguous for every
+  later scan. Nothing is lost by an interrupted copy, and nothing has to be
+  deleted by hand. This needs a drive that can give a file a new name without
+  replacing one, and an exFAT drive on macOS cannot: there the copy into the
+  job's folder never completes. *papio* keeps the capture in its own storage,
+  records the adoption as deferred and retries, and never writes a partial
+  file in place. Keep `download_adoption_root` on an APFS volume on macOS.
+- **An acquired paper no longer looks like unfinished work when the database
+  refuses the last write.** When *papio* accepted a validated PDF it closed
+  the acquisition's attempt record as a best-effort write and dropped any
+  error. A transient failure there left the attempt open forever with nothing
+  saying why, so attempt history and the yield measurements that read it
+  counted a successful acquisition as unfinished. The paper is still ready —
+  the publication is already final and nothing about it changes — and a failed
+  settlement is now recorded on the job as an `attempt.settlement_failed`
+  event (visible in `papio jobs show`) and logged.
 
 ### Security
 - A notification webhook (`notify.webhook_url` or a webhook credential record)

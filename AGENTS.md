@@ -247,7 +247,30 @@ There is also a link check, because `zensical build` prints a broken link as an
   resets it. This used to wedge EVERY daemon RPC (adoption scans ran under the
   bridge mutex — three goroutine dumps in one night's `daemon.log` before diagnosis);
   scans are now bounded+latched so the daemon stays responsive and `papio doctor`
-  names the adoption root's health with the grant remediation. Doctor also **fails**
+  names the adoption root's health with the grant remediation.
+  **A failed adoption listing is inconclusive, never "empty", and
+  `ErrAdoptionScanTimeout` is not the only way one fails.** A permission or
+  consent refusal and a plain I/O error say exactly as little, and the latch
+  returns the timeout *instantly* (the single-flight gate after one deadline)
+  for a directory that is perfectly readable and removable — which is what
+  makes the mistake destructive rather than theoretical. Only `os.ErrNotExist`
+  is conclusive.
+  `sweepGrabsIn` (quarantine-only fallback) and `sweepTerminalAdoptionsIn`
+  (`adoptionDirMayHoldBytes`) both read a failed listing as "bytes may be
+  there", preserve them and retry on the next tick; a sweep that deletes or
+  supersedes landing bytes must never be authorised by a listing that did not
+  happen. Grab bytes also reach an adoption name through a dot-prefixed
+  temporary published by hard link (`copyGrabFile`), or by the platform's
+  exclusive rename (`renameNoReplace`: `renameat2(RENAME_NOREPLACE)`,
+  `renamex_np(RENAME_EXCL)`, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`)
+  on a volume without hard links, because a kill mid-copy otherwise leaves a
+  truncated file at a name the poll scan reads as the user's own download.
+  Never publish there with a plain rename, a check-then-rename, or an in-place
+  write: a rename replaces a file that took the name after `uniqueAdoptionDest`
+  chose it, and an in-place write is the truncated file. With neither primitive
+  the copy fails closed and the source copy stays for a retry. macOS exFAT has
+  neither (both return ENOTSUP, checked natively): that is a documented
+  compatibility limit, not a fallback to fix with an in-place write. Doctor also **fails**
   `adoption_root` outright when the effective root is not a `papio` directory a
   browser could steer into — the pre-fix default was exactly that, and it adopted
   nothing with no error at all. If doctor shows the

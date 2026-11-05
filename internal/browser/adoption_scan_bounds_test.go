@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/config"
 	"papio/internal/grab"
+	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/work"
 )
@@ -101,6 +103,243 @@ func TestSweepGrabsLeavesQuarantinedGrabWhenLandingListingTimesOut(t *testing.T)
 	if err != nil || got == nil || got.State != grab.StateParkedNoIdentifier {
 		t.Fatalf("grab after recovery = %+v, %v; want parked_no_identifier", got, err)
 	}
+}
+
+// A timeout is not the only way a listing fails to happen. A transient
+// permission or I/O failure on grabs/<id> says exactly as little about the
+// directory's contents, and the sweep used to read it as "empty": a quarantined
+// grab then fell through to the quarantine-only fallback, which stages the
+// quarantine copy and removes the landing directory it never saw. Any landed
+// PDF in it — possibly a different file than the quarantined one — went with it.
+func TestSweepGrabsLeavesQuarantinedGrabWhenLandingListingFails(t *testing.T) {
+	disableAutoBindDecision(t)
+	b, _, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Excerpt: "a paper with no identifier"},
+		}, nil
+	}
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Unreadable landing listing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	landing := filepath.Join(cfg.EffectiveAdoptionRoot(), grabsDirName, g.ID)
+	landed := filepath.Join(landing, "a-different-paper.pdf")
+	writeFixturePDF(t, landed)
+	quarantine := filepath.Join(cfg.DataDir, "quarantine", g.ID, "grab.pdf")
+	writeFixturePDF(t, quarantine)
+	if err := b.grabs.MarkQuarantined(ctx, g.ID, quarantine); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the landing directory fails, so the root listing that finds the grab
+	// succeeds: the failure lands mid-loop, after the sweep committed to looking
+	// at this grab. The error returns immediately, so nothing latches and the
+	// quarantine-only recovery pass is reached with the grab still pending.
+	var failLanding atomic.Bool
+	failLanding.Store(true)
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		if dir == landing && failLanding.Load() {
+			return nil, &os.PathError{Op: "open", Path: dir, Err: os.ErrPermission}
+		}
+		return os.ReadDir(dir)
+	}
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if b.adoptionLatchUnhealthy() {
+		t.Fatal("a fast listing error must not latch the bridge")
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %+v, %v", got, err)
+	}
+	if _, err := os.Stat(landed); err != nil {
+		t.Fatalf("landing file consumed without being listed: %v", err)
+	}
+	if _, err := os.Stat(quarantine); err != nil {
+		t.Fatalf("quarantine copy lost: %v", err)
+	}
+	if got.State != grab.StateQuarantined {
+		t.Fatalf("grab state = %s, want quarantined: an unreadable landing directory is not an empty one", got.State)
+	}
+
+	// Deferral, not strand: the next tick that can read the directory finishes
+	// the grab.
+	failLanding.Store(false)
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	got, err = b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil || got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab after recovery = %+v, %v; want parked_no_identifier", got, err)
+	}
+}
+
+// Confirmed absence is the one conclusive answer a failed listing can carry: a
+// landing directory removed under the sweep holds nothing, so the
+// quarantine-only fallback may act on it. This is the half of the rule that
+// must keep working — an old crash can leave a grab whose only copy is in
+// quarantine, and refusing to process those would strand the paper.
+func TestSweepGrabsProcessesQuarantineWhenLandingDirectoryIsGone(t *testing.T) {
+	disableAutoBindDecision(t)
+	b, _, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Excerpt: "a paper with no identifier"},
+		}, nil
+	}
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Vanished landing directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	landing := filepath.Join(cfg.EffectiveAdoptionRoot(), grabsDirName, g.ID)
+	writeFixturePDF(t, filepath.Join(landing, "paper.pdf"))
+	quarantine := filepath.Join(cfg.DataDir, "quarantine", g.ID, "grab.pdf")
+	writeFixturePDF(t, quarantine)
+	if err := b.grabs.MarkQuarantined(ctx, g.ID, quarantine); err != nil {
+		t.Fatal(err)
+	}
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		if dir == landing {
+			return nil, &os.PathError{Op: "open", Path: dir, Err: os.ErrNotExist}
+		}
+		return os.ReadDir(dir)
+	}
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil || got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab = %+v, %v; want parked_no_identifier from the quarantine copy", got, err)
+	}
+}
+
+// Terminal cleanup is the one sweep that deletes bytes, so the two nested
+// listings that authorise it must both have completed. A committed auto-bind
+// whose job never reached ready has no copy in the artifact store: the landing
+// (or rejected) file is it. Reading an unreadable directory as empty turned a
+// transient permission or consent failure into permanent loss of the only copy.
+func TestSweepTerminalAdoptionsKeepsCommittedGrabBytesWhenNestedScanFails(t *testing.T) {
+	type fixture struct {
+		b     *Bridge
+		jobs  *job.Store
+		cfg   config.Config
+		jobID string
+	}
+	// A committed auto-bind (grab job_created) whose job went terminal without
+	// an artifact: exactly the shape the cleanup guard exists for.
+	setup := func(t *testing.T, reqID string) fixture {
+		t.Helper()
+		b, jobs, cfg, _ := newBridge(t)
+		ctx := context.Background()
+		id := parkManualDownload(t, jobs, reqID, handoffWork())
+		bindGrab(t, b, id, "Committed auto-bind", "")
+		if err := jobs.Transition(ctx, id, job.StateAwaitingHuman, job.StateUnavailable,
+			map[string]any{"reason": "exhausted"}, job.WithTerminalReason("no_entitlement")); err != nil {
+			t.Fatal(err)
+		}
+		return fixture{b: b, jobs: jobs, cfg: cfg, jobID: id}
+	}
+
+	t.Run("LandingListingFails", func(t *testing.T) {
+		f := setup(t, "wr_terminal_landing_unreadable")
+		landing := filepath.Join(f.cfg.EffectiveAdoptionRoot(), f.jobID)
+		landed := filepath.Join(landing, "by-hand.pdf")
+		writeFixturePDF(t, landed)
+		f.b.readDir = func(dir string) ([]os.DirEntry, error) {
+			if dir == landing {
+				return nil, &os.PathError{Op: "open", Path: dir, Err: os.ErrPermission}
+			}
+			return os.ReadDir(dir)
+		}
+
+		if err := f.b.SweepTerminalAdoptions(context.Background()); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if _, err := os.Stat(landed); err != nil {
+			t.Fatalf("the only copy of a committed grab's bytes was deleted after an unreadable listing: %v", err)
+		}
+	})
+
+	// The reachable production trigger. A genuine permission denial also fails
+	// the RemoveAll, so the bytes survive by luck; a listing that merely did
+	// not happen in time does not — the latch tripping mid-sweep (or another
+	// goroutine holding the single-flight gate for a full deadline) returns the
+	// timeout instantly for a directory that is perfectly removable.
+	t.Run("LandingListingTimesOut", func(t *testing.T) {
+		compressAdoptionScanDeadline(t)
+		f := setup(t, "wr_terminal_landing_timeout")
+		landing := filepath.Join(f.cfg.EffectiveAdoptionRoot(), f.jobID)
+		landed := filepath.Join(landing, "by-hand.pdf")
+		writeFixturePDF(t, landed)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		unblock := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(unblock)
+		f.b.readDir = func(dir string) ([]os.DirEntry, error) {
+			if dir == landing {
+				<-release
+			}
+			return os.ReadDir(dir)
+		}
+
+		if err := f.b.SweepTerminalAdoptions(context.Background()); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if !f.b.adoptionLatchUnhealthy() {
+			t.Fatal("blocked landing listing did not latch; the test did not exercise the timeout path")
+		}
+		if _, err := os.Stat(landed); err != nil {
+			t.Fatalf("the only copy of a committed grab's bytes was deleted after a timed-out listing: %v", err)
+		}
+	})
+
+	t.Run("RejectedListingFails", func(t *testing.T) {
+		f := setup(t, "wr_terminal_rejected_unreadable")
+		landing := filepath.Join(f.cfg.EffectiveAdoptionRoot(), f.jobID)
+		if err := os.MkdirAll(landing, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Keyed on the directory's shape, not its parent, so this stays a test
+		// of the error rule rather than of where rejected/ is looked for.
+		f.b.readDir = func(dir string) ([]os.DirEntry, error) {
+			if filepath.Base(dir) == f.jobID && filepath.Base(filepath.Dir(dir)) == "rejected" {
+				return nil, &os.PathError{Op: "open", Path: dir, Err: os.ErrPermission}
+			}
+			return os.ReadDir(dir)
+		}
+
+		if err := f.b.SweepTerminalAdoptions(context.Background()); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if _, err := os.Stat(landing); err != nil {
+			t.Fatalf("landing directory collected while the rejected sibling was unreadable: %v", err)
+		}
+	})
+
+	t.Run("BothListingsSucceedEmpty", func(t *testing.T) {
+		f := setup(t, "wr_terminal_empty_collected")
+		landing := filepath.Join(f.cfg.EffectiveAdoptionRoot(), f.jobID)
+		if err := os.MkdirAll(landing, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := f.b.SweepTerminalAdoptions(context.Background()); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if _, err := os.Stat(landing); !os.IsNotExist(err) {
+			t.Fatalf("a committed grab's empty landing directory survived cleanup: %v", err)
+		}
+	})
 }
 
 // The latch check and the single-flight gate are two steps, but the gate alone

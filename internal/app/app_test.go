@@ -1148,6 +1148,67 @@ func seedValidatingCandidate(t *testing.T, svc *Service, jobs *job.Store, wrName
 	return row, candidate, body, tempPath, sha
 }
 
+// The accepted path settles its validate attempt after the publication has
+// already committed, so a failed settlement must neither fail the acquisition
+// nor vanish. It used to vanish: the FinishAttempt error was discarded, which
+// left the attempt row open forever (ended_at/outcome NULL) with nothing on
+// the job naming why, so attempt history and every measurement that reads it
+// saw a successful acquisition as unfinished work. The trigger refuses the
+// settlement UPDATE the way a transient store failure would.
+func TestAcceptedValidationRecordsFailedAttemptSettlement(t *testing.T) {
+	ctx := t.Context()
+	svc, jobs := newTestService(t)
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs,
+		"wr_attempt_settlement_failure", "attempt-settlement", "attempt-settlement")
+	svc.Validate = passValidation()
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER refuse_attempt_settlement BEFORE UPDATE ON attempts
+		BEGIN SELECT RAISE(ABORT, 'injected attempt settlement failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	accepted, parked, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)),
+		SniffedMIME: "application/pdf", ContentType: "application/pdf",
+	})
+	if err != nil || !accepted || parked {
+		t.Fatalf("accepted=%v parked=%v err=%v, want the finalized publication reported as accepted", accepted, parked, err)
+	}
+	got, err := jobs.Get(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("state = %s, want ready: a failed attempt settlement must not undo the publication", got.State)
+	}
+	var attemptID int64
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT id FROM attempts WHERE job_id = ? AND stage = 'validate'`, row.ID).Scan(&attemptID); err != nil {
+		t.Fatal(err)
+	}
+	events, err := jobs.Events(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers := 0
+	for _, event := range events {
+		if event["kind"] != "attempt.settlement_failed" {
+			continue
+		}
+		markers++
+		detail, _ := event["detail"].(map[string]any)
+		id, _ := detail["attempt_id"].(float64)
+		if int64(id) != attemptID || detail["outcome"] != "accepted" || detail["stage"] != "validate" {
+			t.Fatalf("settlement failure marker = %#v, want it to name attempt %d", detail, attemptID)
+		}
+		if detail["error_type"] == "" || detail["error_type"] == nil {
+			t.Fatalf("settlement failure marker carries no error: %#v", detail)
+		}
+	}
+	if markers != 1 {
+		t.Fatalf("attempt.settlement_failed markers = %d, want exactly 1", markers)
+	}
+}
+
 func TestValidationPDFInfoFailureKeepsCandidate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake worker is a POSIX shell script")
@@ -4051,6 +4112,65 @@ func TestDrainHooksCancelsManualRefileAndRecordsOutcome(t *testing.T) {
 	}
 	if detail["status"] != "cancelled" || detail["trigger"] != "manual" {
 		t.Fatalf("cancelled manual filing event = %#v", detail)
+	}
+}
+
+// CancelHooks must stop a hook that was admitted before the shared hook
+// context existed. New pre-initializes the context/cancel pair, but a Service
+// built as a struct literal initializes it lazily inside readyHookContext, so
+// an admitted run can reach that initialization AFTER the cancel. On the old
+// CancelHooks a nil hookCancel read as "no active work to stop": it set
+// hooksClosing, cancelled nothing, and the admitted run then minted its own
+// fresh uncancelled context and kept executing — holding DrainHooks until its
+// own deadline while shutdown drained. The ordering below is that
+// interleaving pinned in sequence rather than raced for.
+func TestCancelHooksStopsHookAdmittedBeforeContextExists(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_hook_cancel_before_context", job.StateReady)
+	const sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, id); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy := &Service{Config: svc.Config, Jobs: jobs, Artifacts: svc.Artifacts, Now: svc.Now}
+	lazy.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(ctx context.Context, _ string, _ []string) hook.Result {
+			<-ctx.Done()
+			return hook.Result{Ran: true, ExitCode: -1, Err: ctx.Err()}
+		},
+	}
+	if lazy.hookCancel != nil {
+		t.Fatal("a struct-literal Service already holds a hook cancel; this test no longer models the lazy path")
+	}
+	if !lazy.beginReadyHook(row.ID) {
+		t.Fatal("beginReadyHook refused the admission")
+	}
+	lazy.CancelHooks()
+	type outcome struct {
+		result RefileResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		defer lazy.endReadyHook(row.ID)
+		result, err := lazy.executeReadyHook(lazy.readyHookContext(), row, sha, "ready")
+		done <- outcome{result: result, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || got.result.Status != "cancelled" {
+			t.Fatalf("admitted hook outcome = %+v, %v, want a cancelled run", got.result, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("hook admitted before the shared context existed never observed CancelHooks")
+	}
+	if !lazy.DrainHooks(5 * time.Second) {
+		t.Fatal("cancelled hook did not release its admission")
 	}
 }
 

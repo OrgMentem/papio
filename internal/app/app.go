@@ -1982,6 +1982,39 @@ func (s *Service) settleCancelledAttempt(ctx context.Context, attempt int64, out
 	}
 }
 
+// settleAcceptedAttempt closes the validate attempt whose publication already
+// committed. It cannot fail the acquisition: the ready transition and the
+// promoted artifact are final by this point, so returning an error here would
+// report a paper papio already has as a failure and send the job back around
+// the retry loop. But a dropped error is not free either — the attempt keeps
+// ended_at/outcome NULL forever, so attempt history, the yield measurements
+// that read it (internal/openalexyield's LostToFinishAttempt), and any
+// recovery pass that looks for open attempts all read a successful
+// acquisition as unfinished work, with nothing on the job naming why. So the
+// settlement runs on a context.WithoutCancel context (FinishAttempt's UPDATE
+// is refused outright for a cancelled one, exactly as settleCancelledAttempt
+// records) and a failure leaves a durable marker on the job instead of
+// nothing at all.
+func (s *Service) settleAcceptedAttempt(ctx context.Context, jobID string, attempt int64, detail string) {
+	if attempt == 0 {
+		return
+	}
+	settleCtx := context.WithoutCancel(ctx)
+	err := s.Jobs.FinishAttempt(settleCtx, attempt, "accepted", 0, detail)
+	if err == nil {
+		return
+	}
+	log.Printf("papio: settling accepted attempt %d for job %s: %v", attempt, jobID, err)
+	if eventErr := s.Jobs.RecordEvent(settleCtx, jobID, "attempt.settlement_failed", map[string]any{
+		"attempt_id": attempt,
+		"stage":      "validate",
+		"outcome":    "accepted",
+		"error_type": safeType(err),
+	}); eventErr != nil {
+		log.Printf("papio: recording attempt settlement failure for job %s: %v", jobID, eventErr)
+	}
+}
+
 // A concurrent cancellation wins over a fetch-phase transition, including
 // exhaustion and parking. Other conflicts and store failures remain errors.
 func (s *Service) settleFetchConflict(ctx context.Context, jobID string, attempt int64, err error) error {
@@ -4832,7 +4865,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 			return false, false, err
 		}
 	}
-	_ = s.Jobs.FinishAttempt(ctx, attempt, "accepted", 0, fmt.Sprintf("sha256=%s", result.SHA256))
+	s.settleAcceptedAttempt(ctx, row.ID, attempt, fmt.Sprintf("sha256=%s", result.SHA256))
 	s.recordStandaloneOutcome(ctx, row)
 	s.autoImportReady(ctx, row)
 	s.runReadyHook(ctx, row, result.SHA256)
@@ -5887,6 +5920,11 @@ func (s *Service) endReadyHook(jobID string) {
 	s.hookWG.Done()
 }
 
+// readyHookContext returns the context every hook run shares, so CancelHooks
+// stops all of them at once. New builds the pair; the lazy branch covers a
+// Service built as a struct literal. CancelHooks builds it too, under the same
+// lock, so an already-cancelled service can never hand out a live context
+// here (see its comment).
 func (s *Service) readyHookContext() context.Context {
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
@@ -5917,14 +5955,23 @@ func (s *Service) CloseHookAdmission() {
 
 // CancelHooks stops active hook commands and prevents new hook runs. Their
 // outcome records remain active through context.WithoutCancel in the executor.
+// The cancellation and the shared context's existence are one step under
+// hookMu: New pre-initializes the pair, but a Service built as a struct
+// literal initializes it lazily in readyHookContext, and a nil hookCancel
+// used to read as "no active work to stop". A run admitted by beginReadyHook
+// before this call then created its own fresh, uncancelled context afterwards
+// and kept executing through shutdown. Creating the pair here instead means
+// the admitted run's readyHookContext either observes this cancelled context
+// or is the one that creates it and is cancelled below — never neither.
 func (s *Service) CancelHooks() {
 	s.hookMu.Lock()
 	s.hooksClosing = true
+	if s.hookCancel == nil {
+		s.hookCtx, s.hookCancel = context.WithCancel(context.Background())
+	}
 	cancel := s.hookCancel
 	s.hookMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	cancel()
 }
 
 func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigger string) (RefileResult, error) {

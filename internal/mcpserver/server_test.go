@@ -4,12 +4,14 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,6 +382,110 @@ func TestBatchWaitToolSettlesAndTimesOut(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBatchWaitBoundsStalledReport pins timeout_seconds as a bound on the
+// whole operation rather than on the gaps between polls: acquire.report runs
+// under a context carrying the deadline, so an unresponsive daemon or socket
+// cannot hold this read-only wait — or the MCP request goroutine serving it —
+// past the requested timeout. The stalled caller fails the test through its
+// own fallback if it is ever handed a context with no bound.
+func TestBatchWaitBoundsStalledReport(t *testing.T) {
+	const unbounded = 30 * time.Second
+	unsettled := batch.Report{
+		BatchID: "batch-deadbeef",
+		Summary: batch.ReportSummary{Outcomes: map[string]int{"in_progress": 1}},
+		Works:   []batch.ReportWork{{Outcome: "in_progress", Reason: job.StateFetching}},
+	}
+	// The clock is frozen and the sleep is instant, so the polling deadline
+	// can never come due on its own; whatever bounds this wait must come from
+	// the context handed to the stalled report call.
+	frozen := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	deps := func(caller callerFunc) toolDependencies {
+		return toolDependencies{
+			caller: caller,
+			now:    func() time.Time { return frozen },
+			wait:   func(context.Context, time.Duration) error { return nil },
+		}
+	}
+	stall := func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(unbounded):
+			return errors.New("acquire.report ran unbounded: its context carried no deadline")
+		}
+	}
+	// reportThenStall answers the first answered calls with an unsettled
+	// report, then blocks like a daemon that never replies.
+	reportThenStall := func(t *testing.T, answered int, calls *atomic.Int32) callerFunc {
+		return callerFunc(func(ctx context.Context, method string, _ any, result any) error {
+			if method != "acquire.report" {
+				t.Errorf("unexpected method %q", method)
+			}
+			if int(calls.Add(1)) > answered {
+				return stall(ctx)
+			}
+			report, ok := result.(*batch.Report)
+			if !ok {
+				t.Errorf("result = %T, want *batch.Report", result)
+				return nil
+			}
+			*report = unsettled
+			return nil
+		})
+	}
+
+	t.Run("timeout returns the latest report", func(t *testing.T) {
+		var calls atomic.Int32
+		c := newTestClient(t, nil, deps(reportThenStall(t, 1, &calls)), nil)
+
+		var output BatchWaitOutput
+		start := time.Now()
+		callToolJSON(t, c, "papio_batch_wait", map[string]any{"batch_id": "batch-deadbeef", "timeout_seconds": 1, "poll_seconds": 1}, &output)
+		if elapsed := time.Since(start); elapsed > unbounded/2 {
+			t.Fatalf("wait took %s, want a return at the 1s timeout", elapsed)
+		}
+		if output.Settled || output.Report == nil || output.Report.BatchID != "batch-deadbeef" || len(output.Report.Works) != 1 {
+			t.Fatalf("wait output = %+v, want the last unsettled report", output)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("acquire.report calls = %d, want 2", calls.Load())
+		}
+	})
+
+	// With no report read at all there is no unsettled result to hand back,
+	// so the timeout names itself instead of reporting a null report as a
+	// successful poll.
+	t.Run("timeout before the first report is an error", func(t *testing.T) {
+		var calls atomic.Int32
+		c := newTestClient(t, nil, deps(reportThenStall(t, 0, &calls)), nil)
+
+		start := time.Now()
+		res := callTool(t, c, "papio_batch_wait", map[string]any{"batch_id": "batch-deadbeef", "timeout_seconds": 1, "poll_seconds": 1})
+		if elapsed := time.Since(start); elapsed > unbounded/2 {
+			t.Fatalf("wait took %s, want a return at the 1s timeout", elapsed)
+		}
+		const want = "batch batch-deadbeef: no report within the 1s timeout"
+		if !res.IsError || !strings.Contains(resultText(res), want) {
+			t.Fatalf("result = error=%v %q, want error %q", res.IsError, resultText(res), want)
+		}
+	})
+
+	// The caller going away is not the wait's own timeout: it has no bounded
+	// result to report, so it surfaces the cancellation.
+	t.Run("caller cancellation is an error", func(t *testing.T) {
+		var calls atomic.Int32
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		output, err := waitForBatch(ctx, deps(reportThenStall(t, 1, &calls)), "batch-deadbeef", 600, 1)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		if output.Report != nil || output.Settled {
+			t.Fatalf("output = %+v, want zero value", output)
+		}
+	})
 }
 
 // TestResourceEnvelope pins the list-resource contract once for every

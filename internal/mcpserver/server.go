@@ -224,12 +224,23 @@ func waitForBatch(ctx context.Context, deps toolDependencies, batchID string, ti
 		pollSeconds = timeoutSeconds
 	}
 
+	// timeoutSeconds bounds the whole operation, not just the gaps between
+	// polls. acquire.report runs in-process through deps.caller (papio mcp
+	// uses api.InProcessCaller), so a report read that does not return — a
+	// stalled handler or store — leaves the call blocked for as long as it
+	// likes, and a deadline consulted only after the call returns is never
+	// reached. That let a documented 1..600 second read-only wait hang forever
+	// and hold the MCP request goroutine. Every report and every sleep
+	// therefore runs under one child context carrying the deadline.
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
 	deadline := deps.now().Add(time.Duration(timeoutSeconds) * time.Second)
 	var output BatchWaitOutput
 	for {
 		var report batch.Report
-		if err := deps.caller(ctx, "acquire.report", api.AcquireReportParams{BatchID: batchID}, &report); err != nil {
-			return BatchWaitOutput{}, err
+		if err := deps.caller(waitCtx, "acquire.report", api.AcquireReportParams{BatchID: batchID}, &report); err != nil {
+			return boundedWaitResult(ctx, waitCtx, output, batchID, timeoutSeconds, err)
 		}
 		output.Report = &report
 		output.Settled = report.Settled()
@@ -245,10 +256,27 @@ func waitForBatch(ctx context.Context, deps toolDependencies, batchID string, ti
 		if delay > remaining {
 			delay = remaining
 		}
-		if err := deps.wait(ctx, delay); err != nil {
-			return BatchWaitOutput{}, err
+		if err := deps.wait(waitCtx, delay); err != nil {
+			return boundedWaitResult(ctx, waitCtx, output, batchID, timeoutSeconds, err)
 		}
 	}
+}
+
+// boundedWaitResult maps a failed report or sleep onto the wait's contract.
+// The timeout expiring is a successful bounded wait, so the latest report
+// read before it — the documented unsettled result — is returned instead of
+// an error; the MCP request being cancelled, and every other RPC failure, is
+// an error. A timeout that fires before the first report has nothing to
+// report, so it names itself rather than returning a null report as if the
+// batch had been polled.
+func boundedWaitResult(ctx, waitCtx context.Context, output BatchWaitOutput, batchID string, timeoutSeconds int, err error) (BatchWaitOutput, error) {
+	if ctx.Err() != nil || waitCtx.Err() == nil {
+		return BatchWaitOutput{}, err
+	}
+	if output.Report == nil {
+		return BatchWaitOutput{}, fmt.Errorf("batch %s: no report within the %ds timeout: %w", batchID, timeoutSeconds, err)
+	}
+	return output, nil
 }
 
 func waitForPoll(ctx context.Context, duration time.Duration) error {

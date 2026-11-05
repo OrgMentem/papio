@@ -513,6 +513,12 @@ type Bridge struct {
 	// renameFile is the local-file move seam; nil uses os.Rename. Tests may
 	// force EXDEV to exercise the copy-and-remove fallback.
 	renameFile func(string, string) error
+	// linkFile and renameNoReplaceFile are copyGrabFile's no-replace
+	// publication seams; nil uses os.Link and renameNoReplace. Tests may race
+	// a destination into place, report hard links unsupported to exercise the
+	// exclusive-rename fallback, or fail both to exercise the fail-closed path.
+	linkFile            func(string, string) error
+	renameNoReplaceFile func(string, string) error
 	// adoptionScanMu guards the field below. It is deliberately its own
 	// lock, never b.mu: a ReadDir call that hangs behind a TCC consent wall
 	// (see scanAdoptionDir) must never hold the session lock, or every other
@@ -9523,8 +9529,10 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 // SweepGrabs's per-grab landing directory (ADR-0020) shares the exact same
 // settled-file heuristic as ordinary job adoption. A missing or unreadable
 // directory is plain "nothing settled" (ok false). The listing's error is
-// still returned, because ErrAdoptionScanTimeout means the directory was never
-// listed — not that it is empty — and the caller must not act on that.
+// still returned, because any failed listing — ErrAdoptionScanTimeout, a
+// permission denial, any other I/O error — means the directory was never
+// listed rather than that it is empty, and the caller must not act on that.
+// Only os.ErrNotExist is conclusive: the directory is confirmed absent.
 func (b *Bridge) settledFileIn(dir string) (string, bool, error) {
 	entries, err := b.readAdoptionDir(dir)
 	if err != nil {
@@ -9722,6 +9730,23 @@ func artifactSafelyStored(state string) bool {
 	return state == job.StateReady || state == job.StateImported
 }
 
+// adoptionDirMayHoldBytes reports whether dir must be treated as still holding
+// bytes nothing else has a copy of. Only a listing that completed proves the
+// answer: a missing directory holds nothing (os.ErrNotExist — the ordinary case
+// for the rejected/ sibling, which usually does not exist at all), and any
+// other failure — ErrAdoptionScanTimeout from the TCC consent wall, a
+// permission denial, any transient I/O error — is inconclusive and counts as
+// holding bytes. Deleting the only copy of a human-supplied or committed
+// auto-bind PDF on the strength of a listing papio could not complete is the
+// fail-closed rule inverted, and the bytes are not recoverable afterwards.
+func (b *Bridge) adoptionDirMayHoldBytes(dir string) bool {
+	entries, err := b.readAdoptionDir(dir)
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	return len(entries) > 0
+}
+
 func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, collectible func(string) bool, liveStages map[string]bool) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
@@ -9761,10 +9786,10 @@ func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, coll
 			// Committed auto-bind whose job never reached ready: bytes are
 			// in adoption/ or rejected/ and recovery keys on the exact filename.
 			// Ready/imported bytes are already in the immutable artifact store.
-			if entries, err := b.readAdoptionDir(filepath.Join(root, e.Name())); err == nil && len(entries) > 0 {
+			if b.adoptionDirMayHoldBytes(filepath.Join(root, e.Name())) {
 				continue
 			}
-			if entries, err := b.readAdoptionDir(filepath.Join(filepath.Dir(root), "rejected", e.Name())); err == nil && len(entries) > 0 {
+			if b.adoptionDirMayHoldBytes(filepath.Join(filepath.Dir(root), "rejected", e.Name())) {
 				continue
 			}
 		}
@@ -9871,13 +9896,20 @@ func (b *Bridge) sweepGrabsIn(ctx context.Context, root string, processed map[st
 		}
 		dir := filepath.Join(root, id)
 		name, ok, err := b.settledFileIn(dir)
-		if errors.Is(err, ErrAdoptionScanTimeout) {
-			// The landing directory was never listed (latched, gate held, or
-			// blocked). That is not "empty": a quarantined grab would be
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			// The landing directory was never listed: latched, gate held or
+			// blocked (ErrAdoptionScanTimeout), or a transient permission/IO
+			// failure. That is not "empty": a quarantined grab would be
 			// processed from quarantine and its landing directory removed
 			// unseen. Leave the grab — quarantine-only fallback included —
-			// for the next tick.
+			// for the next tick. Only a confirmed-absent directory
+			// (os.ErrNotExist, removed under us) proves there is nothing here
+			// to examine, which is the one case the fallback may act on.
 			processed[g.ID] = true
+			if !errors.Is(err, ErrAdoptionScanTimeout) {
+				// The timeout path already logged its latch transition once.
+				log.Printf("papio: pdf grab %s landing directory not readable, deferring: %v", id, err)
+			}
 			continue
 		}
 		if !ok && g.State == grab.StateAwaitingFile {
@@ -10747,33 +10779,75 @@ func classifyMetadataIdentifier(raw string) (kind, value string) {
 	return "", ""
 }
 
+// copyGrabFile copies src's bytes to dst, which only ever exists complete and
+// is never written over. The bytes are written to a dot-prefixed temporary
+// beside dst and fsynced first, because dst is an adoption name a scanner may
+// read at any moment: a daemon killed mid-copy used to leave a TRUNCATED file
+// at the final name, where scanAdoptionDir reads it as the user's settled
+// download — it passes the bounded PDF-header probe, fails validation, and
+// parks the job asking a human to re-supply a file papio already holds in
+// quarantine, while the leftover stump makes every later scan of that
+// directory ambiguous. Every scanner skips dot-prefixed names
+// (settledFileName, stageGrabCopyUnbounded's digest reuse), so an abandoned
+// temporary is invisible rather than ambiguous.
+//
+// The finished temporary is published under dst by an operation that refuses
+// an existing name atomically, so a name created by anyone after
+// uniqueAdoptionDest chose it is refused with ErrExist rather than
+// overwritten; a plain rename would replace it, and a check-then-rename leaves
+// exactly that window open. The first choice is a hard link, the no-replace
+// primitive incident keys, CLI exports and filed copies use. A volume without
+// hard links falls back to the platform's exclusive rename (renameNoReplace).
+// Neither is guaranteed: macOS exFAT (checked on macOS 27.2 with an hdiutil
+// ExFAT image) refuses both with ENOTSUP, so an adoption root there is a
+// compatibility limit, not a working fallback. When neither primitive works
+// the copy fails closed: dst is never created, the temporary is removed, and
+// src — the caller's quarantine or rejected copy — is untouched for a later
+// retry. Writing dst in place is never a fallback, because that is the
+// partial file this function exists to prevent.
 func (b *Bridge) copyGrabFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".papio-stage-*.tmp")
 	if err != nil {
 		_ = in.Close()
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
+	tmpName := tmp.Name()
+	// After a link the temporary is only a second name for dst's bytes, and
+	// after a rename it is gone, so removing it on every path leaves dst
+	// intact.
+	defer func() { _ = os.Remove(tmpName) }()
+	_, copyErr := io.Copy(tmp, in)
 	if copyErr == nil {
-		copyErr = out.Sync()
+		copyErr = tmp.Sync()
 	}
-	closeOutErr := out.Close()
+	closeTmpErr := tmp.Close()
 	closeInErr := in.Close()
-	if copyErr != nil {
-		_ = os.Remove(dst)
-		return copyErr
+	for _, failure := range []error{copyErr, closeTmpErr, closeInErr} {
+		if failure != nil {
+			return failure
+		}
 	}
-	if closeOutErr != nil {
-		_ = os.Remove(dst)
-		return closeOutErr
+	link := b.linkFile
+	if link == nil {
+		link = os.Link
 	}
-	if closeInErr != nil {
-		_ = os.Remove(dst)
-		return closeInErr
+	linkErr := link(tmpName, dst)
+	if linkErr == nil || errors.Is(linkErr, os.ErrExist) {
+		return linkErr
+	}
+	rename := b.renameNoReplaceFile
+	if rename == nil {
+		rename = renameNoReplace
+	}
+	if err := rename(tmpName, dst); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return err
+		}
+		return fmt.Errorf("publishing %s without replacing it: %w", dst, errors.Join(linkErr, err))
 	}
 	return nil
 }
