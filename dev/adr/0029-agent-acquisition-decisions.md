@@ -201,10 +201,12 @@ the model, never instructions; CAPTCHAs and credentials stay with the user, and
 terms follow the user's declared choice. No account creation, purchase or account
 setting change. A new gate must name the harm it prevents and the papers it costs.
 
-The executor in Chrome may use `chrome.debugger` (CDP from the extension, in the
-user's own profile) for trusted input, an accessibility outline across frames and
-screenshots, under the rules in `AGENTS.md` (Automation detection): no
-`Runtime.enable` and reads only in isolated worlds. Firefox has no such API and
-keeps the extension-API executor. Whether `chrome.debugger` attachment changes a
-provider's bot verdict is not yet measured; measure it with `make live-cohort`,
-agent on and agent off, before it becomes the default.
+The executor stays on extension APIs: browser-level navigation and new tabs
+(`tabs.update`/`tabs.create`), content-script clicks and typing, the downloads
+API and the existing viewer capture. `chrome.debugger` (CDP from the extension in
+the user's own profile) is rejected (operator, 2026-11-05): a page can see CDP
+input (pointer events carry `sourceCapabilities: null`, measured by signet) and
+the debugging banner, and a provider's flag would land on the user's own profile,
+home IP and institutional licence. The gain it offered, trusted clicks, answers
+no measured failure: the recorded failures are decisions and reach, not input.
+Add trusted input only when a measured failure class needs it.
