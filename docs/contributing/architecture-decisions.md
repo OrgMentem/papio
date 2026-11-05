@@ -547,9 +547,17 @@ can be configured with `papio config agent set`; the daemon environment remains
 an explicit override. A negotiated navigation capability now follows an observed
 same-origin link in the same tab, verifies the destination DOI and transfers the
 existing download reservation. It preserves the original baseline, expiry,
-permit and inference budget. Unexpected redirects stop the continuation. New
-tabs, cross-origin navigation and native viewers are later work. Browser-store
-acceptance remains unverified.
+permit and inference budget. Unexpected redirects stop the continuation.
+Browser-store acceptance remains unverified.
+
+A 2026-11-05 amendment, decided but not yet implemented, widens the agent's
+reach: it may run before the adapters have failed, choose its own action (a
+click, typing, scrolling, a link to another site or tab, going back) and follow
+the library-resolver-publisher chain across sites, new tabs and PDF viewers.
+The per-page DOI check before each action is dropped, because the PDF identity
+check after the download already decides whether *papio* has the right paper.
+Credentials, CAPTCHAs, purchases and the one-owner-per-download rule are
+unchanged, and every agent refusal will name the rule that refused.
 
 ## One credential service for configured integrations
 

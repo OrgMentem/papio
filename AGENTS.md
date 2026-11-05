@@ -5,7 +5,12 @@ plus a MV3 **browser extension** (`extension/`) that talks to the daemon over a
 **native-messaging host** (`com.orgmentem.papio`) using the `papio-browser/1`
 **protocol** (Go: `internal/protocol`, TS: `extension/src/protocol.ts`, schema:
 `protocol/browser-v1.schema.json`). The extension rides the user's *own*
-authenticated browser session — it never drives a separate/automated browser.
+authenticated browser session; today papio drives no separate browser.
+
+**Read `INTENT.md` before you add a gate, a refusal, a review round or a human step.**
+It holds the owner's own words: maximal automation, his complete list of limits, and
+the rules against the conservative ratchet. Where these notes and that file disagree
+about what papio should do for its user, that file wins; fix these notes.
 
 ## Build & test
 
@@ -714,12 +719,28 @@ There is also a link check, because `zensical build` prints a broken link as an
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets
   `navigator.webdriver = true` → Cloudflare/Turnstile hardens and often becomes unpassable.
-- Chrome via `--remote-debugging-port` alone keeps `navigator.webdriver = false` (only
-  `--enable-automation`, which `puppeteer.launch` adds, sets it). **But** Cloudflare also
-  fingerprints the **CDP attachment itself**, independent of the flag — a fresh profile with
-  a live CDP client still gets challenged on aggressive providers (SAGE, Wiley, T&F).
-- Production papio uses **native messaging + extension APIs only — no CDP/WebDriver** — so
-  `navigator.webdriver` stays false and there's no automation surface. Keep it that way.
+- `navigator.webdriver` is set by `--enable-automation` (which `puppeteer.launch` adds),
+  in headless Chrome, and by `--remote-debugging-pipe` alone in headed Chrome 156. signet
+  launches with `--disable-blink-features=AutomationControlled`, which keeps it false (its
+  `docs/DESIGN.md` section 6, measured 2026-11-04). `chrome.debugger` needs no launch flag.
+- The claim that Cloudflare fingerprints **any CDP attachment** does not hold for a client
+  that never sends `Runtime.enable` and reads the page only in isolated worlds. On
+  2026-11-05, signet's headless Chrome over `--remote-debugging-pipe` (those rules, a
+  persistent profile, no sign-in) opened article pages on SAGE, Wiley and T&F: each showed
+  Cloudflare's "Just a moment..." (403) and cleared it by itself within ~8 s, with no
+  click. ScienceDirect refused the same Chrome with a hard 403 that did not clear; the
+  cause (the profile, or the Mac's VPN egress) is not known. The older observation used
+  `--remote-debugging-port` on a fresh profile, and its client's commands are not recorded.
+- Production papio today uses **native messaging + extension APIs only**, so
+  `navigator.webdriver` stays false. CDP is not banned: `chrome.debugger` from the
+  extension, in the user's own profile, is the planned Chrome executor for the agent
+  (ADR-0029, 2026-11-05 amendment). It shows Chrome's "started debugging this browser"
+  banner while attached, and Firefox has no equivalent. If you add it, follow signet's
+  rules (`~/@dev/signet/docs/DESIGN.md` section 6): never `Runtime.enable`; read only in an
+  isolated world (`Page.createIsolatedWorld`); answer dialogs over CDP; trusted input
+  through `Input.dispatchMouseEvent` with human paths, `force: 0.5` while a button is
+  held, and whole-pixel coordinates. Measure the bot verdict with `make live-cohort`,
+  agent on and off, before making it the default.
 
 ### Dev harness (only for adapter/fixture work — not production)
 - **Chrome 136+ refuses the debug port on the default profile.** Use a dedicated

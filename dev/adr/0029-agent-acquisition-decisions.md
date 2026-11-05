@@ -165,3 +165,46 @@ PDF that Firefox's viewer shows inside a page is captured too. A PDF that a
 page script fetches (`xmlhttprequest`) is outside the capture by design: a
 blocking listener on every script request would wake the event page for each
 one, in every tab.
+
+Agent reach amendment (2026-11-05, decided, not yet implemented): the operator's
+intent, recorded in the repository's root `INTENT.md`, replaces the limits above
+that kept the agent a last-resort, single-origin control picker. The live store
+on 2026-10-29 measured their cost: 202 of 607 browser-reached jobs (33%) got a
+PDF, a person resolved a human action before 195 of 200 browser imports, the
+library route failed in 185 of 253 jobs, and the agent decided in 14 jobs in
+total. The changes:
+
+- The agent may run on any delegated attempt once the deterministic routes have
+  no immediate answer, including discovery and library pages with no DOI claim,
+  not only after packaged adapters and generic extraction have failed.
+- The model chooses the action, not only a control: click or type on an observed
+  element, click at a screenshot point, scroll, wait, go back, follow a link to
+  another origin or into a new tab the page opens, go to a URL, look at a
+  screenshot, done, or blocked with a named blocker. It may see the page's
+  visible text, element names and a screenshot. It still cannot supply code,
+  selectors, save paths, permissions or job transitions.
+- Cross-origin navigation along the resolver chain (discovery service, library
+  resolver, publisher, viewer), new tabs, publisher search and native viewer
+  saving are in scope now, not later milestones.
+- The requirement for fresh matching DOI metadata on each destination before the
+  agent may act is removed. The PDF identity check after the download already
+  decides success and is the gate for a wrong paper.
+- The decision count, wall time and backend deadline become configuration
+  ceilings with the current values as defaults.
+- Every refusal by an agent gate records the gate's name in the job's events, so
+  each gate's cost in papers can be counted.
+
+Kept: the daemon owns credentials, cancellation and inference budgets; dispatch
+stays fenced on the current holder, job and held effect permit; one owner for each
+download; success only through adoption and PDF validation; page text is data for
+the model, never instructions; CAPTCHAs and credentials stay with the user, and
+terms follow the user's declared choice. No account creation, purchase or account
+setting change. A new gate must name the harm it prevents and the papers it costs.
+
+The executor in Chrome may use `chrome.debugger` (CDP from the extension, in the
+user's own profile) for trusted input, an accessibility outline across frames and
+screenshots, under the rules in `AGENTS.md` (Automation detection): no
+`Runtime.enable` and reads only in isolated worlds. Firefox has no such API and
+keeps the extension-API executor. Whether `chrome.debugger` attachment changes a
+provider's bot verdict is not yet measured; measure it with `make live-cohort`,
+agent on and agent off, before it becomes the default.
