@@ -104,6 +104,7 @@ func migrationNumber(t *testing.T, base string) int {
 }
 
 func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
+	t.Parallel()
 	const seed = `
 		INSERT INTO work_requests(id, created_at, desired_version)
 		VALUES ('req-generic', '2026-08-13T00:00:00Z', 'any'),
@@ -173,6 +174,7 @@ func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
 }
 
 func TestSchema33UpgradeRejectsMalformedLegacyStart(t *testing.T) {
+	t.Parallel()
 	dir := schemaFixture(t, 33, `
 		INSERT INTO work_requests(id, created_at, desired_version)
 		VALUES ('req-malformed', '2026-08-13T00:00:00Z', 'any');
@@ -209,6 +211,7 @@ var schemaV1 string
 // alone left out the tables 0002-0012 create, which no database has ever
 // lacked, and 0056 rewrites timestamps in those tables.
 func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := schemaFixture(t, 13, `
 		INSERT INTO zotio_tag_state (item_key, tag, updated_at)
@@ -250,6 +253,7 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 // surface and still has an open handoff action; a candidate row proves the
 // opposite without guessing about historical acknowledgements.
 func TestHandoffEpochRepairNarrowing(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := schemaFixture(t, 33, `
 		INSERT INTO work_requests(id, created_at, desired_version)
@@ -313,6 +317,7 @@ func TestHandoffEpochRepairNarrowing(t *testing.T) {
 }
 
 func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	// t.TempDir() is 0755 under the default umask, and doctor's privacy check
@@ -649,6 +654,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 // cannot retire it either. 0038 rebuilds the table; this pins the repair
 // against a database that actually carries the legacy constraint.
 func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := schemaFixture(t, 33, "")
 	dbPath := filepath.Join(dataDir, "papio.db")
@@ -737,6 +743,7 @@ func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 // real one. So the database must open, keep every row, and go without the index
 // until a human resolves the collision.
 func TestOpenToleratesDuplicateActiveCaptures(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := schemaFixture(t, 33, "")
 	dbPath := filepath.Join(dataDir, "papio.db")

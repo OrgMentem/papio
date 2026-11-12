@@ -9,6 +9,7 @@ import "testing"
 // is exactly what the first feedback round reported. Pin the friendly
 // mappings for every kind the daemon writes today plus the fallback.
 func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		kind   string
 		detail map[string]any
@@ -76,6 +77,7 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 // C1 controls (U+0080-U+009F) get the same treatment: a UTF-8 xterm decodes
 // U+009B/U+009D as CSI/OSC introducers with no ESC byte in the input at all.
 func TestActivityTextStripsTerminalControlBytes(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		filename string
@@ -111,6 +113,7 @@ func TestActivityTextStripsTerminalControlBytes(t *testing.T) {
 // DEL, and C1 all removed; ordinary printable text — including non-ASCII —
 // passes through byte-for-byte untouched.
 func TestStripTerminalControls(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		input string
@@ -146,6 +149,7 @@ func TestStripTerminalControls(t *testing.T) {
 }
 
 func TestFormatActivityAge(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		seconds int64
 		want    string

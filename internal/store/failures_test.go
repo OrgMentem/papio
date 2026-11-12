@@ -8,6 +8,7 @@ import (
 )
 
 func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -69,6 +70,7 @@ func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) 
 }
 
 func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -104,6 +106,7 @@ func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
 // one clock reading must give a deterministic example: the greatest id wins,
 // whatever order SQLite returns the rows in.
 func TestFailureSummariesTruncationBoundaryAndEqualTimestampTieBreak(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {

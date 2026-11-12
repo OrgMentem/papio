@@ -36,6 +36,7 @@ func osFileInfo(t *testing.T, path string) os.FileInfo {
 // URI-special characters in the data directory must neither redirect the
 // database to a different file nor drop the pragmas.
 func TestOpenDataDirWithURISpecialCharacters(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"Research#2026", "what?now", "100%25done", "a%20b#c?d&e=f"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -100,6 +101,7 @@ func TestOpenDataDirWithURISpecialCharacters(t *testing.T) {
 }
 
 func TestFileDSNReadOnlyRoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "Research#2026?x")
 	seedSpecialDir(t, dir)
 	s, err := Open(context.Background(), dir)
@@ -130,6 +132,7 @@ func TestFileDSNReadOnlyRoundTrip(t *testing.T) {
 }
 
 func TestFileDSN(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ path, query, want string }{
 		{"/tmp/a/papio.db", "", "file:/tmp/a/papio.db"},
 		{"/tmp/a#b/p?q%c.db", "mode=ro", "file:/tmp/a%23b/p%3Fq%25c.db?mode=ro"},
