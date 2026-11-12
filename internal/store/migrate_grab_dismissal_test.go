@@ -9,6 +9,7 @@ import (
 )
 
 func TestSchema62GrabDismissalPreservesEligibilitySnapshots(t *testing.T) {
+	t.Parallel()
 	dir := schemaFixture(t, 61, `
 		INSERT INTO pdf_grabs(id, url_host, title, state, quarantine_path, outcome, created_at, updated_at, effect_request_id, bind_provenance)
 		VALUES ('grab_schema62', 'pdf.example.org', 'Captured paper', 'parked_no_identifier', '/quarantine/grab.pdf',

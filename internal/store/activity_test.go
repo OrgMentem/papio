@@ -9,6 +9,7 @@ import (
 )
 
 func TestRecentEventsOrderingCursorJoinAndClamp(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {

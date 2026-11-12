@@ -11,6 +11,7 @@ import (
 )
 
 func TestNotificationLedgerUpsertCoalescesAndReservesOnce(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -54,6 +55,7 @@ func TestNotificationLedgerUpsertCoalescesAndReservesOnce(t *testing.T) {
 }
 
 func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -97,6 +99,7 @@ func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 // sent: the shared row keeps coalescing for the pending webhook leg, while the
 // desktop snapshot preserves exactly what the desktop already delivered.
 func TestNotificationLedgerCoalescesForPendingWebhookAfterDesktopDelivery(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -161,6 +164,7 @@ func TestNotificationLedgerCoalescesForPendingWebhookAfterDesktopDelivery(t *tes
 // A desktop leg that never delivered leaves the snapshot empty, so audit reads
 // fall back to the live count and payload.
 func TestNotificationLedgerUndeliveredDesktopLegKeepsNoSnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -201,6 +205,7 @@ func TestNotificationLedgerUndeliveredDesktopLegKeepsNoSnapshot(t *testing.T) {
 // Every nonterminal desktop transition is a compare-and-swap: a stale caller
 // cannot pull a superseded row back into the drain.
 func TestNotificationLedgerSetDesktopStateRefusesTerminalRows(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -238,6 +243,7 @@ func TestNotificationLedgerSetDesktopStateRefusesTerminalRows(t *testing.T) {
 }
 
 func TestRecordSystemEventIsJobless(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -257,6 +263,7 @@ func TestRecordSystemEventIsJobless(t *testing.T) {
 }
 
 func TestNotificationTimeParseErrorSurfaces(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -381,6 +388,7 @@ func notificationPhaseCount(t *testing.T, db *Store, aggregateKey, phase string)
 }
 
 func TestNotificationLedgerSupersedeCheckpointsRetiresOnlyLiveCheckpoints(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -440,6 +448,7 @@ func TestNotificationLedgerSupersedeCheckpointsRetiresOnlyLiveCheckpoints(t *tes
 }
 
 func TestNotificationLedgerSupersedeAndUpsertCheckpointIsAtomic(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -521,6 +530,7 @@ func TestNotificationLedgerSupersedeAndUpsertCheckpointIsAtomic(t *testing.T) {
 }
 
 func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -603,6 +613,7 @@ func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testin
 // The webhook claim is the at-most-once boundary: one claimant wins, the leg
 // leaves the due set, and failures settle visibly as failed with a stamp.
 func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -665,6 +676,7 @@ func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
 // is not deferred again. Only the claim holder's sending row moves: settled
 // rows and unknown IDs stay put.
 func TestNotificationLedgerDeferWebhookRequeuesClaim(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -772,6 +784,7 @@ func TestNotificationLedgerDeferWebhookRequeuesClaim(t *testing.T) {
 // A successful POST settles as attempted with the same visible stamp the
 // failure path uses, so both outcomes stay distinguishable from pending.
 func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -802,6 +815,7 @@ func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
 // stays frozen. Plain Upsert keeps desktop-leg coalescing: it still merges
 // into the row, because only the webhook snapshot is immutable.
 func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -839,6 +853,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) 
 // A non-pending desktop leg never blocks the webhook generation redirect:
 // the redirect fires on the webhook leg alone.
 func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -873,6 +888,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) 
 // when nothing else differs except time: a later LastAt must queue a fresh
 // generation instead of being suppressed as a replay.
 func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -905,6 +921,7 @@ func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *te
 // settled row instead of opening a new generation, so the lost claim skips
 // delivery and the key POSTs once.
 func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -947,6 +964,7 @@ func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
 // a byte-identical retry of B must return the +1ns row instead of opening
 // a +2ns duplicate.
 func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -1004,6 +1022,7 @@ func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *test
 // upsert merges in SQL (json_patch); the generation path merges in Go, so both
 // must agree or the webhook digest differs from the desktop one.
 func TestNotificationLedgerWebhookMergeKeepsNestedEventDetailFromBothEvents(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -1055,6 +1074,7 @@ func TestNotificationLedgerWebhookMergeKeepsNestedEventDetailFromBothEvents(t *t
 // the incoming payload replaces it instead of the merge failing or dropping the
 // new event.
 func TestMergeWebhookPayloadFallsBackToIncomingWhenEitherSideIsNotAnObject(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct{ stored, incoming string }{
 		"stored array":    {`["x"]`, `{"count":1,"message":"b"}`},
 		"stored scalar":   {`7`, `{"count":1,"message":"b"}`},

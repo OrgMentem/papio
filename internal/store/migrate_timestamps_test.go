@@ -19,6 +19,7 @@ import (
 // grab.Service.Allocate also bound a time.Time directly, which stored Go's
 // String() form in local time.
 func TestOpenRewritesStoredTimestampsToFixedWidth(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := schemaFixture(t, 55, `
 		INSERT INTO events(job_id, at, kind, detail_json) VALUES
@@ -84,6 +85,7 @@ func TestOpenRewritesStoredTimestampsToFixedWidth(t *testing.T) {
 // value time.RFC3339Nano accepts becomes FormatTime of that exact instant,
 // whatever its offset or fraction width, and a value it rejects stays as it is.
 func TestOpenRewritesEveryRFC3339FormToUTCAndLeavesOtherTextAlone(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	converted := map[string]string{
 		// Offsets of both signs, across a day, a month and a year.
