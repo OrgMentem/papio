@@ -10,17 +10,26 @@ import (
 	"math"
 	"net"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// connWatchInterval is how often watchConnClose checks the peer, and so how
+// long a disconnect can go unnoticed.
+const connWatchInterval = 100 * time.Millisecond
+
 // watchConnClose cancels cancel once the peer has fully closed conn. A
 // half-close (the historical framing EOF) or trailing bytes are not a
-// disconnect: only POLLHUP/POLLERR fires. Linux also reports POLLRDHUP for
-// a half-close; it is deliberately not watched. The watch polls a dup'd
-// descriptor so the blocking poll never disturbs the runtime poller, and it
-// ends with the request context (serveConn and shutdown both cancel it,
-// bounding the linger to one poll interval).
+// disconnect. The check asks poll(2) for POLLOUT and reads POLLHUP/POLLERR
+// from the result. It must not watch the read side: macOS reports a drained
+// half-close there as POLLHUP (it maps a requested POLLHUP to its read
+// filter), which cancelled every request as soon as its frame was read. On
+// the write side macOS and Linux both report POLLHUP only once the peer is
+// gone. A connected socket answers POLLOUT at once, so the watch polls
+// without blocking, once per connWatchInterval, on a dup'd descriptor so it
+// never disturbs the runtime poller. It ends with the request context
+// (serveConn and shutdown both cancel it).
 func watchConnClose(ctx context.Context, conn net.Conn, cancel context.CancelFunc) {
 	sc, ok := conn.(interface {
 		SyscallConn() (syscall.RawConn, error)
@@ -55,26 +64,25 @@ func watchConnClose(ctx context.Context, conn net.Conn, cancel context.CancelFun
 			return
 		}
 		fd := int32(watch)
-		for ctx.Err() == nil {
-			var fds [1]unix.PollFd
-			fds[0].Fd = fd
-			fds[0].Events = unix.POLLERR | unix.POLLHUP
-			n, err := unix.Poll(fds[:], 100)
-			if errors.Is(err, syscall.EINTR) {
-				continue
+		ticker := time.NewTicker(connWatchInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
 			}
-			if err != nil {
+			fds := [1]unix.PollFd{{Fd: fd, Events: unix.POLLOUT}}
+			if _, err := unix.Poll(fds[:], 0); err != nil {
+				if errors.Is(err, syscall.EINTR) {
+					continue // check again on the next tick
+				}
 				return
 			}
-			if n == 0 {
-				continue // timeout: re-check the context
-			}
-			if fds[0].Revents&(unix.POLLERR|unix.POLLHUP) != 0 {
+			if fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
 				cancel()
 				return
 			}
-			// Readable without hangup (framing FIN, trailing bytes after
-			// dispatch): the peer is still there. Keep watching.
 		}
 	}()
 }
