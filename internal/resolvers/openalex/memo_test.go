@@ -146,32 +146,62 @@ func TestSiblingRefusesABasisThatCannotAccept(t *testing.T) {
 	}
 }
 
-// A negative DOI memo proves only that the provider does not resolve THAT DOI.
-// It says nothing about whether the caller's own bibliography can find a sibling
-// indexed under a different DOI, so it must not suppress a usable caller basis.
-func TestNegativeMemoDoesNotSuppressACallerBasis(t *testing.T) {
-	var searched bool
-	client := clientFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Query().Get("search") != "" {
-			searched = true
-			return responseFor(200, `{"results":[]}`, nil), nil
-		}
-		return responseFor(404, "", nil), nil
-	})
-	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
-	ctx := context.Background()
-	if _, err := r.Resolve(ctx, work.Work{DOI: "10.9999/unknown.work"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.ResolveSiblings(ctx, work.Work{
-		DOI:     "10.9999/unknown.work",
-		Title:   "A Title The Caller Supplied",
-		Authors: []string{"Andrea Ferrario"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if !searched {
-		t.Fatal("a usable caller basis was suppressed by an unrelated negative DOI memo")
+// A DOI memo — negative or positive but bibliographically incomplete — proves only
+// what the provider returned for THAT lookup. It must not suppress a usable basis
+// the caller supplied for a sibling hop.
+func TestMemoDoesNotSuppressACallerBasis(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		doi       string
+		title     string
+		nonSearch func(*http.Request) (*http.Response, error)
+		wantFatal string
+	}{
+		{
+			name:  "negative memo",
+			doi:   "10.9999/unknown.work",
+			title: "A Title The Caller Supplied",
+			nonSearch: func(*http.Request) (*http.Response, error) {
+				return responseFor(404, "", nil), nil
+			},
+			wantFatal: "a usable caller basis was suppressed by an unrelated negative DOI memo",
+		},
+		{
+			name:  "incomplete positive memo",
+			doi:   "10.1145/3531146.3533202",
+			title: "Shape Trust",
+			nonSearch: func(*http.Request) (*http.Response, error) {
+				// Canonical record: a title, but no authors the canonicalizer can read.
+				return responseFor(200, `{"id":"https://openalex.org/W2741809807","doi":"https://doi.org/10.1145/3531146.3533202","title":"Shape Trust","publication_year":2022,"authorships":[]}`, nil), nil
+			},
+			wantFatal: "an incomplete positive memo suppressed a usable caller basis",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var searched bool
+			client := clientFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Query().Get("search") != "" {
+					searched = true
+					return responseFor(200, `{"results":[]}`, nil), nil
+				}
+				return test.nonSearch(req)
+			})
+			r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
+			ctx := context.Background()
+			if _, err := r.Resolve(ctx, work.Work{DOI: test.doi}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.ResolveSiblings(ctx, work.Work{
+				DOI:     test.doi,
+				Title:   test.title,
+				Authors: []string{"Andrea Ferrario"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !searched {
+				t.Fatal(test.wantFatal)
+			}
+		})
 	}
 }
 
@@ -417,36 +447,6 @@ func TestExactOpenAlexIDLookupRequiresAnEchoedID(t *testing.T) {
 				t.Fatalf("accepted = %v, want %v", got, test.accepts)
 			}
 		})
-	}
-}
-
-// A positive memo wins only if it yields a usable basis. Replacing caller
-// metadata wholesale let a canonical record with no legible authors cancel the
-// hop — the negative-memo defect arriving by the opposite route.
-func TestIncompletePositiveMemoDoesNotSuppressACallerBasis(t *testing.T) {
-	var searched bool
-	client := clientFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Query().Get("search") != "" {
-			searched = true
-			return responseFor(200, `{"results":[]}`, nil), nil
-		}
-		// Canonical record: a title, but no authors the canonicalizer can read.
-		return responseFor(200, `{"id":"https://openalex.org/W2741809807","doi":"https://doi.org/10.1145/3531146.3533202","title":"Shape Trust","publication_year":2022,"authorships":[]}`, nil), nil
-	})
-	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
-	ctx := context.Background()
-	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.ResolveSiblings(ctx, work.Work{
-		DOI:     "10.1145/3531146.3533202",
-		Title:   "Shape Trust",
-		Authors: []string{"Andrea Ferrario"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if !searched {
-		t.Fatal("an incomplete positive memo suppressed a usable caller basis")
 	}
 }
 
