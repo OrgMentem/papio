@@ -88,7 +88,7 @@ func buildSchemaTemplateAt(version int) ([]byte, error) {
 		// here would make store.Open apply it twice. Deriving the bound from the
 		// filename keeps the next migration from silently landing in the fixture
 		// and failing as a duplicate column.
-		n, err := migrationNumberFromBaseErr(base)
+		n, err := migrationNumber(base)
 		if err != nil {
 			_ = raw.Close()
 			return nil, err
@@ -151,16 +151,7 @@ func schemaFixture(t *testing.T, version int, seed string) string {
 }
 
 // migrationNumber reads the NNNN prefix every migration filename carries.
-func migrationNumber(t *testing.T, base string) int {
-	t.Helper()
-	n, err := migrationNumberFromBaseErr(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
-func migrationNumberFromBaseErr(base string) (int, error) {
+func migrationNumber(base string) (int, error) {
 	digits, _, ok := strings.Cut(base, "_")
 	if !ok {
 		return 0, fmt.Errorf("migration %s: want a NNNN_name.sql filename", base)
