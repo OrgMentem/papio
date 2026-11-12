@@ -1574,7 +1574,7 @@ func TestAmbiguousApplyDoesNotInvalidateCachedPlan(t *testing.T) {
 		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 	}
 	cli.applyFn = func(ctx context.Context) (json.RawMessage, error) {
-		return nil, context.DeadlineExceeded
+		return json.RawMessage(`{"partial":true}`), context.DeadlineExceeded
 	}
 	service, jobID := readyPlanService(t, "", cli)
 	plans, err := service.PlanJobs(context.Background(), []string{jobID})
@@ -1583,11 +1583,22 @@ func TestAmbiguousApplyDoesNotInvalidateCachedPlan(t *testing.T) {
 	}
 	plan := plans[0]
 	manifestPath := plan.ManifestPath
-	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancel()
-	time.Sleep(time.Millisecond)
-	if _, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ambiguous apply err = %v", err)
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("applyCalls = %d, want 1", cli.applyCalls)
+	}
+	var ambRaw string
+	if err := service.Store.DB().QueryRow(`SELECT result_json FROM exports WHERE kind='zotio_apply'`).Scan(&ambRaw); err != nil {
+		t.Fatal(err)
+	}
+	var amb ApplyResult
+	if err := json.Unmarshal([]byte(ambRaw), &amb); err != nil {
+		t.Fatal(err)
+	}
+	if amb.Status != "ambiguous" {
+		t.Fatalf("ambiguous apply status = %q, want ambiguous", amb.Status)
 	}
 	if _, err := os.Stat(filepath.Join(service.DataDir, "zotio", "plans", plan.ID+".json")); err != nil {
 		t.Fatalf("ambiguous apply deleted plan: %v", err)
