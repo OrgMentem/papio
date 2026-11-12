@@ -595,7 +595,10 @@ func serveSyncRPC(t *testing.T, handle func(json.RawMessage) ([]byte, *ipc.RPCEr
 	return &ipcSyncer{client: ipc.NewSocketClient(socket), sessionID: "session-under-test"}
 }
 
-func waitForIPCServerReady(ctx context.Context, done <-chan error, socket string, retry time.Duration) error {
+// waitForIPCServerReady is ipc.WaitForSocket that also watches Serve: a bind
+// failure ends Serve before the socket exists, and polling alone would wait out
+// the whole deadline and report that instead of the bind error.
+func waitForIPCServerReady(ctx context.Context, done chan error, socket string, retry time.Duration) error {
 	if retry <= 0 {
 		retry = time.Millisecond
 	}
@@ -612,6 +615,9 @@ func waitForIPCServerReady(ctx context.Context, done <-chan error, socket string
 			return ctx.Err()
 		case serveErr := <-done:
 			timer.Stop()
+			// serveSyncRPC's cleanup reads Serve's result too; hand it back so
+			// that read does not wait out its own stop deadline.
+			done <- serveErr
 			if serveErr != nil {
 				return serveErr
 			}
