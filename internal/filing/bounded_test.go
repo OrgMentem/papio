@@ -34,7 +34,10 @@ func newFixture(t *testing.T) fixture {
 
 // wedge makes the destination's op step block in the "kernel": it ignores the
 // context and returns only when release is closed. The deadline is compressed
-// and everything is restored once the wedged worker has drained.
+// only while the step is wedged: release restores the real one, so I/O a test
+// runs after recovery is judged by it, not by the compressed one (an
+// F_FULLFSYNC on a loaded macOS runner can take longer than 50ms). Everything
+// is restored once the wedged worker has drained.
 func wedge(t *testing.T, op string, deadline time.Duration) (release func(), calls *atomic.Int32) {
 	t.Helper()
 	oldHook, oldDeadline := beforeIO, StallDeadline
@@ -51,6 +54,10 @@ func wedge(t *testing.T, op string, deadline time.Duration) (release func(), cal
 	release = func() {
 		if once.CompareAndSwap(false, true) {
 			close(hold)
+			// No race: only run reads the deadline, on its caller's
+			// goroutine, which here is the one calling release; the
+			// wedged worker never reads it.
+			StallDeadline = oldDeadline
 		}
 	}
 	t.Cleanup(func() {
