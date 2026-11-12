@@ -71,11 +71,10 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 	go func() { ready <- ipc.WaitForSocket(waitCtx, socket, time.Millisecond) }()
 	select {
 	case err := <-done:
-		waitCancel()
-		if err != nil {
-			t.Fatalf("serve test socket: %v", err)
-		}
-		t.Fatal("serve test socket exited before ready")
+		// Hand Serve's result back so the cleanup reports it at once instead
+		// of waiting out its own stop deadline.
+		done <- err
+		t.Fatal("test socket server exited before it became ready")
 	case err := <-ready:
 		if err != nil {
 			t.Fatalf("test socket did not become ready: %v", err)
