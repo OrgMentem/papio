@@ -62,6 +62,35 @@ func dialTestEndpoint(t *testing.T, path string) net.Conn {
 	return conn
 }
 
+// waitForServerReady is WaitForSocket with a Serve completion side channel.
+// Bind failures return from Serve before the socket exists; without selecting on
+// done the poll loop waits out the full context deadline and hides the bind error.
+func waitForServerReady(ctx context.Context, done <-chan error, socket string, retry time.Duration) error {
+	if retry <= 0 {
+		retry = time.Millisecond
+	}
+	for {
+		conn, err := NewSocketClient(socket).Dial(ctx)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case serveErr := <-done:
+			timer.Stop()
+			if serveErr != nil {
+				return serveErr
+			}
+			return fmt.Errorf("server stopped before socket %q was ready", socket)
+		case <-timer.C:
+		}
+	}
+}
+
 func startTestServer(t *testing.T, handler Handler) (string, context.CancelFunc) {
 	t.Helper()
 	socket := filepath.Join(shortTempDir(t), "s")
@@ -71,7 +100,7 @@ func startTestServer(t *testing.T, handler Handler) (string, context.CancelFunc)
 	go func() { done <- server.Serve(ctx) }()
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
 	defer waitCancel()
-	if err := WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
+	if err := waitForServerReady(waitCtx, done, socket, time.Millisecond); err != nil {
 		cancel()
 		t.Fatalf("server did not start: %v", err)
 	}
@@ -339,8 +368,8 @@ func TestServerCancellationClosesIdleConnection(t *testing.T) {
 	go func() { done <- server.Serve(ctx) }()
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
 	defer waitCancel()
-	if err := WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
-		t.Fatalf("WaitForSocket: %v", err)
+	if err := waitForServerReady(waitCtx, done, socket, time.Millisecond); err != nil {
+		t.Fatalf("waitForServerReady: %v", err)
 	}
 	idle := dialTestEndpoint(t, socket)
 	defer func() { _ = idle.Close() }()

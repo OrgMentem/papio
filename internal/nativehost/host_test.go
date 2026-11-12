@@ -457,14 +457,14 @@ func TestDiagLogAppendsAcrossProcessesAndBoundsItself(t *testing.T) {
 	// log past the cap rotates at the next start. Rotation rather than
 	// truncation is what keeps a concurrent sibling host's in-progress trace:
 	// its descriptor follows the inode under the rotated name.
-	if err := os.WriteFile(path, make([]byte, maxDiagLogBytes+1), 0o600); err != nil {
+	if err = os.WriteFile(path, make([]byte, maxDiagLogBytes+1), 0o600); err != nil {
 		t.Fatalf("grow log: %v", err)
 	}
 	log, err := openDiagLog(dir)
 	if err != nil {
 		t.Fatalf("openDiagLog after growth: %v", err)
 	}
-	if err := log.Close(); err != nil {
+	if err = log.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	info, err := os.Stat(path)
@@ -589,10 +589,42 @@ func serveSyncRPC(t *testing.T, handle func(json.RawMessage) ([]byte, *ipc.RPCEr
 	})
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
 	defer waitCancel()
-	if err := ipc.WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
+	if err := waitForIPCServerReady(waitCtx, done, socket, time.Millisecond); err != nil {
 		t.Fatalf("sync endpoint did not become ready: %v", err)
 	}
 	return &ipcSyncer{client: ipc.NewSocketClient(socket), sessionID: "session-under-test"}
+}
+
+// waitForIPCServerReady is ipc.WaitForSocket that also watches Serve: a bind
+// failure ends Serve before the socket exists, and polling alone would wait out
+// the whole deadline and report that instead of the bind error.
+func waitForIPCServerReady(ctx context.Context, done chan error, socket string, retry time.Duration) error {
+	if retry <= 0 {
+		retry = time.Millisecond
+	}
+	for {
+		conn, err := ipc.NewSocketClient(socket).Dial(ctx)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case serveErr := <-done:
+			timer.Stop()
+			// serveSyncRPC's cleanup reads Serve's result too; hand it back so
+			// that read does not wait out its own stop deadline.
+			done <- serveErr
+			if serveErr != nil {
+				return serveErr
+			}
+			return fmt.Errorf("server stopped before socket %q was ready", socket)
+		case <-timer.C:
+		}
+	}
 }
 
 // TestIpcSyncerClassifiesDaemonFailures pins the disposition boundary the host

@@ -15,6 +15,7 @@ import (
 // time order, including inside one second, where time.RFC3339Nano's trimmed
 // fractions reverse it.
 func TestFormatTimeSortsInTimeOrder(t *testing.T) {
+	t.Parallel()
 	second := time.Date(2026, 9, 24, 6, 19, 5, 0, time.UTC)
 	perth := time.FixedZone("AWST", 8*60*60)
 	instants := []time.Time{

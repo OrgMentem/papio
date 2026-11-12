@@ -30,6 +30,7 @@ func setSchemaVersion(t *testing.T, ctx context.Context, dataDir string, version
 }
 
 func TestGuardCapableSchema33RefusesSchema34(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	setSchemaVersion(t, ctx, dataDir, 34)
@@ -48,6 +49,7 @@ func TestGuardCapableSchema33RefusesSchema34(t *testing.T) {
 }
 
 func TestOpenRefusesSchemaNewerThanBinary(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	setSchemaVersion(t, ctx, dataDir, 64)

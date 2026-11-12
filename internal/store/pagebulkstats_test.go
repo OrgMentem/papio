@@ -9,6 +9,7 @@ import (
 )
 
 func TestPageBulkStatsEmptyTableReportsZeroesAndNoDenominator(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
@@ -36,6 +37,7 @@ func TestPageBulkStatsEmptyTableReportsZeroesAndNoDenominator(t *testing.T) {
 }
 
 func TestPageBulkStatsAggregatesScanAndSubmitRowsHonestly(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {

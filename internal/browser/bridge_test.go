@@ -13605,28 +13605,20 @@ func TestFocusHandoffStartsTheNextAttemptForASpentCandidate(t *testing.T) {
 	}
 }
 
-// TestSpentCandidateStopsBeingOffered pins the churn's source. A candidate owned
-// by a finished attempt was re-offered every poll, and each offer could only
-// end in a claim answered 'busy' - measured live 2026-08-20 as a sustained
-// round trip about once a second, per stuck paper, indefinitely.
-func TestSpentCandidateStopsBeingOffered(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
+// spendInstitutionalCandidate focuses jobID, waits for the first offer, then
+// spends the candidate the offer loop will reach for next - the same selection
+// it uses - the way the live papers were spent: claimed, bound, its
+// institutional effect settled, its claim navigated with the diagnostic lease
+// over, and no artifact winner.
+func spendInstitutionalCandidate(t *testing.T, b *Bridge, jobs *job.Store, jobID, requestID string) *job.BrowserCandidate {
+	t.Helper()
 	ctx := context.Background()
-	jobID := parkInstitutional(t, jobs, "spent-offer-suppressed", handoffWork(), "")
-	runSync(t, b, materializationHello(t))
-	// No seeded candidate: the daemon mints its own during the focus, so the
-	// attempt has exactly one, as it does live. A seeded sibling would leave an
-	// older eligible row that the offer loop keeps handing out.
 	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
 		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
 	}
 	if offers, _ := runSync(t, b); firstOfType(offers, protocol.MsgInstitutionalCandidateOffer) == nil {
 		t.Fatalf("first poll offered no candidate: %v", offers)
 	}
-
-	// Spend the candidate the offer loop will reach for next - the same
-	// selection it uses - the way the live papers were spent: claimed, its
-	// claim navigated, the diagnostic lease over, no artifact winner.
 	attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
@@ -13653,7 +13645,7 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 	// which is not the live state at all.
 	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
 		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
-		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-offer-request",
+		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: requestID,
 		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
@@ -13669,6 +13661,22 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 		b.now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
 		t.Fatal(err)
 	}
+	return current
+}
+
+// TestSpentCandidateStopsBeingOffered pins the churn's source. A candidate owned
+// by a finished attempt was re-offered every poll, and each offer could only
+// end in a claim answered 'busy' - measured live 2026-08-20 as a sustained
+// round trip about once a second, per stuck paper, indefinitely.
+func TestSpentCandidateStopsBeingOffered(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "spent-offer-suppressed", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	// No seeded candidate: the daemon mints its own during the focus, so the
+	// attempt has exactly one, as it does live. A seeded sibling would leave an
+	// older eligible row that the offer loop keeps handing out.
+	spendInstitutionalCandidate(t, b, jobs, jobID, "spent-offer-request")
 	if spent, err := jobs.SpentMaterializationCandidate(ctx, jobID); err != nil || !spent {
 		t.Fatalf("attempt not spent after navigating its claim: spent=%v err=%v", spent, err)
 	}
@@ -13687,54 +13695,9 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 // hours. A finished attempt must read as stale so the workflow is dropped.
 func TestSpentCandidateClaimAnswersStaleNotBusy(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "spent-claim-stale", handoffWork(), "")
 	runSync(t, b, materializationHello(t))
-	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
-		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
-	}
-	if offers, _ := runSync(t, b); firstOfType(offers, protocol.MsgInstitutionalCandidateOffer) == nil {
-		t.Fatalf("first poll offered no candidate: %v", offers)
-	}
-	attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	current, err := jobs.CurrentBrowserCandidateForJob(ctx, jobID, attempt)
-	if err != nil || current == nil {
-		t.Fatalf("current candidate: %+v err=%v", current, err)
-	}
-	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: current.ID, JobAttemptRevision: current.JobAttemptRevision,
-		InstitutionProfileRevision: current.InstitutionProfileRevision,
-		RouteRevision:              current.RouteRevision,
-		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.arbitration.generation(),
-		LeaseUntil: b.now().Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), current.InstitutionProfileRevision, 9); err != nil {
-		t.Fatal(err)
-	}
-	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
-		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
-		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-claim-request",
-		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
-		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
-		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
-	}); err != nil || outcome != job.EffectPermitAcquired {
-		t.Fatalf("acquire institutional permit outcome=%v err=%v", outcome, err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE effect_permits SET status='settled' WHERE claim_id=?`, claim.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
-		b.now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
-		t.Fatal(err)
-	}
+	current := spendInstitutionalCandidate(t, b, jobs, jobID, "spent-claim-request")
 
 	// The extension re-drives the correlation it still holds.
 	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
