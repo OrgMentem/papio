@@ -18,7 +18,7 @@ import (
 )
 
 func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
-	dataDir, err := os.MkdirTemp("", "papio-cli-")
+	dataDir, err := os.MkdirTemp("", "pz-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +67,19 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 	})
 	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer waitCancel()
-	if err := ipc.WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
-		t.Fatalf("test socket did not become ready: %v", err)
+	ready := make(chan error, 1)
+	go func() { ready <- ipc.WaitForSocket(waitCtx, socket, time.Millisecond) }()
+	select {
+	case err := <-done:
+		waitCancel()
+		if err != nil {
+			t.Fatalf("serve test socket: %v", err)
+		}
+		t.Fatal("serve test socket exited before ready")
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("test socket did not become ready: %v", err)
+		}
 	}
 
 	var stdout, stderr bytes.Buffer
