@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"papio/internal/config"
@@ -38,21 +39,46 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// schemaFixture builds a database at schema version, as the binary that shipped
-// that version left it, then runs seed against it.
-func schemaFixture(t *testing.T, version int, seed string) string {
-	t.Helper()
+var (
+	schemaTemplateMu sync.Mutex
+	schemaTemplates  = make(map[int]*schemaTemplateCache)
+)
+
+type schemaTemplateCache struct {
+	once  sync.Once
+	bytes []byte
+	err   error
+}
+
+func schemaTemplateAt(version int) *schemaTemplateCache {
+	schemaTemplateMu.Lock()
+	defer schemaTemplateMu.Unlock()
+	c, ok := schemaTemplates[version]
+	if !ok {
+		c = &schemaTemplateCache{}
+		schemaTemplates[version] = c
+	}
+	return c
+}
+
+// buildSchemaTemplateAt replays migrations through version into a fresh database.
+// Seed is applied separately per test because it differs per call site.
+func buildSchemaTemplateAt(version int) ([]byte, error) {
 	ctx := context.Background()
-	dataDir := t.TempDir()
-	dbPath := filepath.Join(dataDir, "papio.db")
+	dir, err := os.MkdirTemp("", "papio-schema-fixture-")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	dbPath := filepath.Join(dir, "papio.db")
 	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	paths, err := filepath.Glob(filepath.Join("migrations", "*.sql"))
 	if err != nil {
 		_ = raw.Close()
-		t.Fatal(err)
+		return nil, err
 	}
 	sort.Strings(paths)
 	for _, path := range paths {
@@ -62,21 +88,56 @@ func schemaFixture(t *testing.T, version int, seed string) string {
 		// here would make store.Open apply it twice. Deriving the bound from the
 		// filename keeps the next migration from silently landing in the fixture
 		// and failing as a duplicate column.
-		if migrationNumber(t, base) > version {
+		n, err := migrationNumberFromBaseErr(base)
+		if err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		if n > version {
 			continue
 		}
 		migration, err := os.ReadFile(path)
 		if err != nil {
 			_ = raw.Close()
-			t.Fatal(err)
+			return nil, err
 		}
 		if _, err := raw.ExecContext(ctx, string(migration)); err != nil {
 			_ = raw.Close()
-			t.Fatalf("apply %s: %v", path, err)
+			return nil, fmt.Errorf("apply %s: %w", path, err)
 		}
 	}
 	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(version)); err != nil {
 		_ = raw.Close()
+		return nil, err
+	}
+	if err := raw.Close(); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(dbPath)
+}
+
+// schemaFixture builds a database at schema version, as the binary that shipped
+// that version left it, then runs seed against it.
+func schemaFixture(t *testing.T, version int, seed string) string {
+	t.Helper()
+	c := schemaTemplateAt(version)
+	c.once.Do(func() {
+		c.bytes, c.err = buildSchemaTemplateAt(version)
+	})
+	if c.err != nil {
+		t.Fatalf("schema-%d template: %v", version, c.err)
+	}
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "papio.db")
+	if err := os.WriteFile(dbPath, c.bytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if seed == "" {
+		return dataDir
+	}
+	ctx := context.Background()
+	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(ctx, seed); err != nil {
@@ -92,15 +153,23 @@ func schemaFixture(t *testing.T, version int, seed string) string {
 // migrationNumber reads the NNNN prefix every migration filename carries.
 func migrationNumber(t *testing.T, base string) int {
 	t.Helper()
+	n, err := migrationNumberFromBaseErr(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func migrationNumberFromBaseErr(base string) (int, error) {
 	digits, _, ok := strings.Cut(base, "_")
 	if !ok {
-		t.Fatalf("migration %s: want a NNNN_name.sql filename", base)
+		return 0, fmt.Errorf("migration %s: want a NNNN_name.sql filename", base)
 	}
 	number, err := strconv.Atoi(digits)
 	if err != nil {
-		t.Fatalf("migration %s: %v", base, err)
+		return 0, fmt.Errorf("migration %s: %w", base, err)
 	}
-	return number
+	return number, nil
 }
 
 func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
