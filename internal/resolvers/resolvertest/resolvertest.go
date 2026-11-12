@@ -2,13 +2,67 @@
 package resolvertest
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/resolver"
+	"papio/internal/work"
 )
+
+// CheckHTTPFailureClassification pins how a resolver maps HTTP failure
+// statuses: 404 is absence (nil, nil), 429 is temporary with the Retry-After
+// wait, 500/503 are temporary, and 401/403 are hard failures.
+func CheckHTTPFailureClassification(t *testing.T, newResolver func(baseURL string) resolver.Resolver, w work.Work) {
+	t.Helper()
+	for _, test := range []struct {
+		name          string
+		status        int
+		retryAfter    string
+		wantNilNil    bool
+		wantTemporary bool
+		wantWait      time.Duration
+	}{
+		{name: "not found is absence", status: http.StatusNotFound, wantNilNil: true},
+		{name: "429 is temporary with wait", status: http.StatusTooManyRequests, retryAfter: "60", wantTemporary: true, wantWait: time.Minute},
+		{name: "429 is temporary with short wait", status: http.StatusTooManyRequests, retryAfter: "7", wantTemporary: true, wantWait: 7 * time.Second},
+		{name: "500 is temporary", status: http.StatusInternalServerError, wantTemporary: true},
+		{name: "503 is temporary", status: http.StatusServiceUnavailable, wantTemporary: true},
+		{name: "401 is a hard failure", status: http.StatusUnauthorized},
+		{name: "403 is a hard failure", status: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+				if test.retryAfter != "" {
+					rw.Header().Set("Retry-After", test.retryAfter)
+				}
+				rw.WriteHeader(test.status)
+			}))
+			defer server.Close()
+
+			cands, err := newResolver(server.URL).Resolve(context.Background(), w)
+			if test.wantNilNil {
+				if err != nil || cands != nil {
+					t.Fatalf("Resolve = (%v, %v), want (nil, nil)", cands, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			wait, temporary := resolver.Temporary(err)
+			if temporary != test.wantTemporary {
+				t.Fatalf("Temporary(%v) = %v, want %v", err, temporary, test.wantTemporary)
+			}
+			if test.wantWait != 0 && wait != test.wantWait {
+				t.Fatalf("retry wait = %v, want %v", wait, test.wantWait)
+			}
+		})
+	}
+}
 
 // CheckParseRetryAfterClampsHugeValues pins the overflow-safe Retry-After
 // parsing: a header large enough to overflow the nanosecond multiply must clamp

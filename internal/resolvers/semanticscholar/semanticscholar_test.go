@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"papio/internal/resolver"
 	"papio/internal/resolvers/resolvertest"
@@ -209,48 +208,9 @@ func TestResolveRejectsConflictingIdentifiers(t *testing.T) {
 }
 
 func TestResolveClassifiesHTTPFailures(t *testing.T) {
-	for _, test := range []struct {
-		name          string
-		status        int
-		retryAfter    string
-		wantNilNil    bool
-		wantTemporary bool
-		wantWait      time.Duration
-	}{
-		{name: "not found is absence", status: http.StatusNotFound, wantNilNil: true},
-		{name: "429 is temporary with wait", status: http.StatusTooManyRequests, retryAfter: "7", wantTemporary: true, wantWait: 7 * time.Second},
-		{name: "500 is temporary", status: http.StatusInternalServerError, wantTemporary: true},
-		{name: "403 is a hard failure", status: http.StatusForbidden},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if test.retryAfter != "" {
-					w.Header().Set("Retry-After", test.retryAfter)
-				}
-				w.WriteHeader(test.status)
-			}))
-			defer server.Close()
-
-			cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
-				Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
-			if test.wantNilNil {
-				if err != nil || cands != nil {
-					t.Fatalf("Resolve = (%v, %v), want (nil, nil)", cands, err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatal("expected an error")
-			}
-			wait, temporary := resolver.Temporary(err)
-			if temporary != test.wantTemporary {
-				t.Fatalf("Temporary(%v) = %v, want %v", err, temporary, test.wantTemporary)
-			}
-			if test.wantWait != 0 && wait != test.wantWait {
-				t.Fatalf("retry wait = %v, want %v", wait, test.wantWait)
-			}
-		})
-	}
+	resolvertest.CheckHTTPFailureClassification(t, func(baseURL string) resolver.Resolver {
+		return NewWithOptions(Options{Client: http.DefaultClient, BaseURL: baseURL})
+	}, work.Work{DOI: "10.5555/example"})
 }
 
 func TestResolveMissingLicenseIsUnknown(t *testing.T) {
