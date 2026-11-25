@@ -5,9 +5,7 @@ and repaired at scale. Companion to ADR-0015, which stands unchanged for
 positive runtime behaviour: this ADR is the suppression-only mechanism its
 "Out of scope" section anticipated ("a separate proposal and a much easier
 one, because it can only reduce automation"), plus the distribution decision
-for the repair pipeline around it. Implementation order, evidence tables, and
-acceptance tests live in `dev/active/adapter-release-latency-plan.md`; when
-that plan ships, this ADR is the durable record.
+for the repair pipeline around it. The acceptance tests below are normative.
 
 Amended by [ADR-0029](0029-agent-acquisition-decisions.md): optional agent
 acquisition may select observed controls without a provider adapter. The
@@ -100,7 +98,7 @@ the sole distribution channel.
    Mozilla treats data sent to native applications as transmission requiring
    declaration and consent; classifying the extension's current
    `page_capture` flow and adopting Firefox 140+ `data_collection_permissions`
-   (custom one-time consent, or disabled capture, on 128–139) is Phase 0
+   (custom one-time consent, or disabled capture, on 128–139) is prerequisite
    work, not a reporting-feature afterthought.
 
 ## Consequences
@@ -114,3 +112,51 @@ the sole distribution channel.
   intolerable in practice, or Zotero's MV3 build survives Chrome review —
   reopening the catalog question starts from the recorded evidence, not from
   scratch.
+
+## Acceptance tests
+
+1. **Execution/observation separation:** seeded secrets, selectors,
+   identifiers, and page-derived URL sentinels never surface in events,
+   captures, logs, reports, control, or extension storage across success,
+   failure, crash, and logging sinks. A daemon route URL may appear only in
+   its solicited `provider_direct_get_request` frame and extension memory;
+   credentials, signed queries, and page-derived URLs never become authority
+   state.
+2. **Control gate and skew:** a fresh install (sequence 0, bundle minimum 0)
+   runs packaged defaults with no control fetch; once any restrictive state
+   is accepted, missing/rolled-back control means no positive effects until
+   recovery on the same session; with mandatory control, no provider offer is
+   released until the holder browser session reports control `applied` at or
+   above the daemon's sequence (non-mandatory control does not need it). Test
+   browser sync of control to the extension separately from the daemon's
+   HTTPS fetch of the signed document.
+3. **Control sequence semantics:** higher-sequence
+   `suspended→active` lifts a suspension; a lower or replayed sequence is
+   rejected; monotone-revocation tests belong to the deferred offline-root work.
+4. **Atomic registry swap (with the deferred positive-activation rollout):** unknown/duplicate/over-cap
+   directives, and crashes both before and after the durable write, release no
+   job and leave the previous active-registry version intact; a tab drive
+   retains the version it started with.
+5. **Transition matrix:** an explicit state/lease/action table drives the
+   assertions — upgrade, rollback, disable, re-enable, holder change,
+   repeated event, failed transaction, and old no-ID events each name their
+   expected job state, lease owner, and action set afterward; leased,
+   adopting, and identity-review jobs remain untouched.
+6. **Consent/profile isolation:** automated tests cover profile persistence and
+   isolation across reconnect and holder switch with zero prompts; manual
+   checklists cover Firefox 140+ built-in and 128–139 custom consent
+   acceptance.
+7. **Report privacy/deletion (deferred automatic reporting):** authorization denial blocks upload;
+   rich capture cannot upload under structural consent; delete produces a
+   tombstone and clears raw objects, indexes, rows, and logs, with backups
+   expiring by the published maximum.
+8. **Zotero hermetic replay (deferred daemon-hosted translator candidate source):** attempted network fails, DOM
+   reads/outputs are recorded under CPU/time/output limits, old/new pinned
+   revisions diff deterministically, and licence exclusion is asserted at the
+   SBOM/source-package level.
+9. **Fatality containment:** injected failure in every new bridge handler is
+   followed by a successful unrelated RPC on the same native session.
+10. **Production composition:** the route and observation paths are exercised
+    through the real background dispatcher, native host, daemon bridge, and
+    planner — not just direct handler calls — because individually tested
+    handlers have repeatedly been unreachable or fatal in composition.

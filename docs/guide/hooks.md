@@ -20,9 +20,16 @@ timeout_seconds = 120   # optional; default 120, range 5..600
 
 Contract:
 
-- **Fires once per ready transition.** Import retries and daemon restarts do not re-fire `on_ready`.
+- **Fires once per ready transition.** Import retries do not re-fire `on_ready`.
+  A daemon restart runs the hook automatically only for an active ready or
+  imported job that has no recorded hook dispatch and whose ready transition
+  is newer than the hook epoch, for example because the daemon stopped before
+  it dispatched. Automatic recovery does not run a job again after a recorded
+  dispatch, and it skips archived jobs. You can still run `papio jobs refile`
+  by hand after a failed dispatch.
 - **Fire-and-forget, best effort.** A slow or failing hook never blocks or
-  fails the job, but filing is not guaranteed. *papio* does not retry hooks.
+  fails the job, but filing is not guaranteed. *papio* does not retry a hook
+  that ran and failed.
 - **Audited.** Each run records a durable `hook.on_ready` job event with
   `status`, `exit_code`, `duration_ms`, and `trigger` (`ready` or `manual`). Hook stdout/stderr is **not**
   recorded (it could carry secrets from your environment) — have your
@@ -65,7 +72,14 @@ Archiving an acquisition prevents new hook execution. A running hook holds a
 durable reservation until its command returns. The diagnostic events are
 `hook.filing_reserved` and `hook.filing_released`, joined by `reservation_id`.
 A crash or a failed release leaves the reservation unresolved, so archive
-fails closed. There is no automatic reconciliation for that reservation.
+fails closed. At the next daemon start, recovery releases a reservation whose
+owner process is gone. It records `hook.filing_released` with reason
+`stale_after_restart`, which clears the hook reservation. Archive can still
+refuse for another reason, for example after a Zotero apply. Recovery releases
+a reservation without owner proof only after the hook timeout, pipe wait, and a
+margin have passed. That age limit needs a positive hook timeout in the current
+configuration. A reservation whose owner is still running stays open until
+that run returns.
 The reservation covers command execution, not background descendants that a
 best-effort script leaves running after its shell exits.
 
@@ -152,8 +166,8 @@ The command runs the same hook with the same `PAPIO_*` environment. It waits
 for that bounded run and records a manual event. It refuses a job whose newest
 filing succeeded, and it refuses a second run while one is active. When the
 hook fails or times out, the command prints the result and exits nonzero, so a
-script can tell the paper is still unfiled. *papio* never retries a filing
-automatically.
+script can tell the paper is still unfiled. *papio* does not retry a failed
+hook filing automatically. Only the managed folder retries on its own.
 
 ## De-duplicating against a non-Zotero library
 
@@ -247,7 +261,10 @@ lists every limit.
     history intact. Resume refuses until a run has succeeded since the watch
     was disabled. `--include-owned` is available only for
     `papio acquire --batch`, meaning "proceed despite ownership uncertainty".
-    `papio doctor` performs a fresh one-shot probe of each source and reports
-    that read's record count and outcome; it does not report daemon cached age,
-    count-collapse detection, or retained failure state.
+    `papio doctor` performs a fresh one-shot probe of each source. When the
+    read succeeds, it reports the record count and the age of the read. A file
+    or command source can fail with a count collapse, a sharp drop from the
+    previously recorded count, which usually means a truncated export. That
+    report does not prove which contents the daemon still uses. Doctor reports
+    the bounded failure reason, not the daemon's retained failure history.
 
