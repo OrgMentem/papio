@@ -98,7 +98,10 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // ServeListener serves an already-created listener, which makes deterministic
-// tests possible without opening a filesystem socket.
+// tests possible without opening a filesystem socket. Whatever the reason it
+// returns (cancellation, a closed listener, a permanent accept error), it has
+// already closed the listener and every active connection, and has waited for
+// their handlers.
 func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error {
 	if s.Handler == nil {
 		return fmt.Errorf("ipc handler is required")
@@ -114,23 +117,22 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 			_ = conn.Close()
 		}
 	}
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			closeAll()
-		case <-done:
-		}
+	// Cancellation must unblock a blocked Accept, so it closes everything from
+	// its own goroutine. The return path below closes everything again
+	// synchronously instead of trusting that goroutine to have run: closeAll
+	// is idempotent and safe to run concurrently with itself.
+	stopWatch := context.AfterFunc(ctx, closeAll)
+	defer func() {
+		stopWatch()
+		closeAll()
+		conns.Wait()
 	}()
-	defer close(done)
-	defer conns.Wait()
 
 	var tempDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				closeAll()
 				return nil
 			}
 			if transientAcceptError(err) {
@@ -151,13 +153,11 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 						default:
 						}
 					}
-					closeAll()
 					return nil
 				case <-timer.C:
 					continue
 				}
 			}
-			closeAll()
 			return fmt.Errorf("accept ipc connection: %w", err)
 		}
 		tempDelay = 0

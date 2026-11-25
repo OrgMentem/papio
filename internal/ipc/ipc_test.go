@@ -618,6 +618,224 @@ func TestServeListenerReturnsPermanentAcceptError(t *testing.T) {
 	}
 }
 
+// gatedListener models a kernel that finished an accept just before the
+// listener closed: Accept returns only what the test hands it, even after
+// Close, so a test can deliver a connection at an exact point of shutdown.
+type gatedListener struct {
+	accepted chan acceptResult
+	entered  chan struct{}
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func newGatedListener() *gatedListener {
+	return &gatedListener{
+		accepted: make(chan acceptResult),
+		entered:  make(chan struct{}, 16),
+		closed:   make(chan struct{}),
+	}
+}
+
+func (l *gatedListener) Accept() (net.Conn, error) {
+	l.entered <- struct{}{}
+	result := <-l.accepted
+	return result.conn, result.err
+}
+
+func (l *gatedListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *gatedListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "gated-listener", Net: "unix"}
+}
+
+func (l *gatedListener) isClosed() bool {
+	select {
+	case <-l.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// requireClosedByServer fails unless the server side of peer's pipe is closed,
+// which a net.Pipe reader sees as EOF.
+func requireClosedByServer(t *testing.T, name string, peer net.Conn) {
+	t.Helper()
+	// net.Pipe refuses SetReadDeadline once the remote end is closed, so bound
+	// the read with a timer instead.
+	result := make(chan error, 1)
+	go func() {
+		_, err := peer.Read(make([]byte, 1))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("%s: read error = %v, want EOF from a server-side close", name, err)
+		}
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		t.Fatalf("%s: server did not close the connection", name)
+	}
+}
+
+func waitServeListener(t *testing.T, done <-chan error, what string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeListener: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ServeListener did not return %s", what)
+	}
+}
+
+func idleHandler() Handler {
+	return HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) { return []byte(`{}`), nil })
+}
+
+// TestServeListenerClosesListenerWhenCancelledBeforeAccept pins the return path
+// that finds the context already cancelled once Accept hands back a connection.
+// That path must close the listener itself before returning, not leave it to a
+// helper goroutine that has had no chance to run: it must also close the
+// connection it was just handed.
+func TestServeListenerClosesListenerWhenCancelledBeforeAccept(t *testing.T) {
+	prev := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	server := &Server{Handler: idleHandler()}
+	for i := range 300 {
+		accepted, peer := net.Pipe()
+		listener := newGatedListener()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		go func() { listener.accepted <- acceptResult{conn: accepted} }()
+		if err := server.ServeListener(ctx, listener); err != nil {
+			t.Fatalf("iteration %d: ServeListener: %v", i, err)
+		}
+		if !listener.isClosed() {
+			t.Fatalf("iteration %d: ServeListener returned with its listener still open", i)
+		}
+		requireClosedByServer(t, "accepted connection", peer)
+		_ = peer.Close()
+	}
+}
+
+// TestServeListenerCancelledBetweenAcceptsClosesEveryConnection cancels the
+// server while one connection is active and delivers a second connection that
+// the kernel accepted before the listener closed. Both must be closed and
+// ServeListener must return.
+func TestServeListenerCancelledBetweenAcceptsClosesEveryConnection(t *testing.T) {
+	prev := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	active, activePeer := net.Pipe()
+	late, latePeer := net.Pipe()
+	t.Cleanup(func() { _ = activePeer.Close(); _ = latePeer.Close() })
+	listener := newGatedListener()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	server := &Server{Handler: idleHandler()}
+	go func() { done <- server.ServeListener(ctx, listener) }()
+
+	<-listener.entered
+	listener.accepted <- acceptResult{conn: active}
+	<-listener.entered // the loop registered the first connection before accepting again
+	cancel()
+	select {
+	case <-listener.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation did not close the listener")
+	}
+	listener.accepted <- acceptResult{conn: late}
+
+	waitServeListener(t, done, "after cancellation with an active connection")
+	requireClosedByServer(t, "active connection", activePeer)
+	requireClosedByServer(t, "late connection", latePeer)
+}
+
+// TestServeListenerCancelledDuringAcceptBackoffClosesActiveConnection cancels
+// while the loop sleeps between transient accept failures.
+func TestServeListenerCancelledDuringAcceptBackoffClosesActiveConnection(t *testing.T) {
+	prev := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	active, activePeer := net.Pipe()
+	t.Cleanup(func() { _ = activePeer.Close() })
+	transient := acceptResult{err: fmt.Errorf("fd pressure: %w", syscall.EMFILE)}
+	listener := newScriptedListener(acceptResult{conn: active}, transient, transient, transient, transient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	server := &Server{Handler: idleHandler()}
+	go func() { done <- server.ServeListener(ctx, listener) }()
+
+	// The fifth accept returns the fourth failure; the loop then sleeps 40ms.
+	for range 5 {
+		select {
+		case <-listener.accepts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ServeListener stopped accepting before the backoff")
+		}
+	}
+	cancel()
+	waitServeListener(t, done, "after cancellation during accept backoff")
+	requireClosedByServer(t, "active connection", activePeer)
+}
+
+// TestServeListenerCancelledWithRequestInFlight cancels while a handler runs:
+// the handler's context must end, its connection must close, and
+// ServeListener must return once the handler does.
+func TestServeListenerCancelledWithRequestInFlight(t *testing.T) {
+	socket := filepath.Join(shortTempDir(t), "s")
+	listener := listenTestEndpoint(t, socket)
+	entered := make(chan struct{})
+	handlerCtxDone := make(chan struct{})
+	server := &Server{Handler: HandlerFunc(func(ctx context.Context, _ Request) ([]byte, *RPCError) {
+		close(entered)
+		<-ctx.Done()
+		close(handlerCtxDone)
+		return nil, &RPCError{Code: "cancelled", Message: "server stopping"}
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- server.ServeListener(ctx, listener) }()
+
+	client := dialTestEndpoint(t, socket)
+	request, err := json.Marshal(Request{Protocol: ProtocolVersion, ID: "request_01", Method: "jobs.get", Params: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	closeWriter, ok := client.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("client connection does not support CloseWrite")
+	}
+	if err := closeWriter.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	waitServeListener(t, done, "after cancellation with a request in flight")
+	select {
+	case <-handlerCtxDone:
+	default:
+		t.Fatal("ServeListener returned before the handler observed cancellation")
+	}
+}
+
 func TestServeConnReadDeadlineReapsStalledClient(t *testing.T) {
 	socket := filepath.Join(shortTempDir(t), "s")
 	listener := listenTestEndpoint(t, socket)
