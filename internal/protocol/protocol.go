@@ -251,16 +251,19 @@ func (wr *WorkRequest) Validate() error {
 	if !hasIdentifiers && !hasTuple {
 		return fmt.Errorf("need identifiers or a title/authors/year tuple")
 	}
-	if wr.Title != "" && (len(wr.Title) < 3 || len(wr.Title) > 500) {
-		return fmt.Errorf("title length %d out of range 3..500", len(wr.Title))
+	if err := checkTextBounds("title", wr.Title, 3, 500); wr.Title != "" && err != nil {
+		return err
 	}
 	if len(wr.Authors) > 100 {
 		return fmt.Errorf("too many authors (%d)", len(wr.Authors))
 	}
 	for _, a := range wr.Authors {
-		if a == "" || len(a) > 200 {
-			return fmt.Errorf("invalid author entry %q", a)
+		if err := checkTextBounds("author entry", a, 1, 200); err != nil {
+			return err
 		}
+	}
+	if err := checkTextBounds("collection", wr.Collection, 0, 200); err != nil {
+		return err
 	}
 	if wr.Year != 0 && (wr.Year < 1000 || wr.Year > 2100) {
 		return fmt.Errorf("year %d out of range", wr.Year)
@@ -277,8 +280,27 @@ func (wr *WorkRequest) Validate() error {
 	if wr.MaxCostUSD != nil && *wr.MaxCostUSD < 0 {
 		return fmt.Errorf("max_cost_usd must be >= 0")
 	}
-	if len(wr.SourcesAllow) > 50 || len(wr.SourcesDeny) > 50 {
-		return fmt.Errorf("source lists capped at 50 entries")
+	for name, list := range map[string][]string{"sources_allow": wr.SourcesAllow, "sources_deny": wr.SourcesDeny} {
+		if len(list) > 50 {
+			return fmt.Errorf("%s capped at 50 entries", name)
+		}
+		for _, source := range list {
+			if err := checkTextBounds(name+" entry", source, 0, 100); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkTextBounds enforces JSON Schema minLength/maxLength, which count Unicode
+// code points, not UTF-8 bytes. A byte count rejects valid multibyte text
+// (a 300-rune CJK title is 900 bytes) and, for minLength, accepts a short
+// multibyte value the schema rejects.
+func checkTextBounds(field, value string, minRunes, maxRunes int) error {
+	n := utf8.RuneCountInString(value)
+	if n < minRunes || n > maxRunes {
+		return fmt.Errorf("%s length %d out of range %d..%d", field, n, minRunes, maxRunes)
 	}
 	return nil
 }
@@ -498,24 +520,42 @@ func (b *AcquisitionBundle) Validate() error {
 	// file, so title/authors are descriptive, not required — but their upper
 	// bounds still apply to any values that are present.
 	if b.ZotioItemKey == "" {
-		if len(b.Identity.Title) < 3 {
+		if utf8.RuneCountInString(b.Identity.Title) < 3 {
 			return fmt.Errorf("identity has no citation title: resolve bibliographic metadata from the identifier or supply title and authors on the work request")
 		}
 		if len(b.Identity.Authors) == 0 {
 			return fmt.Errorf("identity has no citation authors: resolve bibliographic metadata from the identifier or supply title and authors on the work request")
 		}
 	}
-	if len(b.Identity.Title) > 500 {
-		return fmt.Errorf("identity.title length out of range")
+	// minLength 3 holds only when a title is present: an attach bundle may
+	// carry none (see above), so an empty title stays admissible there.
+	if n := utf8.RuneCountInString(b.Identity.Title); n > 500 || (n > 0 && n < 3) {
+		return fmt.Errorf("identity.title length %d out of range 3..500", n)
 	}
 	if len(b.Identity.Authors) > 100 {
 		return fmt.Errorf("identity.authors must have 1..100 entries")
+	}
+	for _, author := range b.Identity.Authors {
+		if err := checkTextBounds("identity.authors entry", author, 1, 200); err != nil {
+			return err
+		}
+	}
+	if len(b.Identity.Evidence) > 20 {
+		return fmt.Errorf("identity.evidence capped at 20 entries")
+	}
+	for _, line := range b.Identity.Evidence {
+		if err := checkTextBounds("identity.evidence entry", line, 0, 300); err != nil {
+			return err
+		}
 	}
 	if b.Identity.Year != 0 && (b.Identity.Year < 1000 || b.Identity.Year > 2100) {
 		return fmt.Errorf("identity.year %d out of range", b.Identity.Year)
 	}
 	if b.Candidate.Source == "" {
 		return fmt.Errorf("candidate.source required")
+	}
+	if err := checkTextBounds("candidate.source", b.Candidate.Source, 1, 100); err != nil {
+		return err
 	}
 	if err := enumRequired("candidate.version", b.Candidate.Version, "published", "accepted", "preprint", "unknown"); err != nil {
 		return err
@@ -525,6 +565,19 @@ func (b *AcquisitionBundle) Validate() error {
 	}
 	if b.Candidate.ReuseLicense == "" {
 		return fmt.Errorf("candidate.reuse_license required (use \"unknown\" when unknown)")
+	}
+	for _, check := range []struct {
+		field, value string
+		max          int
+	}{
+		{"candidate.reuse_license", b.Candidate.ReuseLicense, 100},
+		{"candidate.landing_url", b.Candidate.LandingURL, 2000},
+		{"candidate.source_record_id", b.Candidate.SourceRecordID, 200},
+		{"adapter_version", b.AdapterVersion, 100},
+	} {
+		if err := checkTextBounds(check.field, check.value, 0, check.max); err != nil {
+			return err
+		}
 	}
 	if _, err := time.Parse(time.RFC3339, b.RetrievedAt); err != nil {
 		return fmt.Errorf("retrieved_at: %w", err)
@@ -538,6 +591,12 @@ func (b *AcquisitionBundle) Validate() error {
 	if b.Artifact.MIME == "" {
 		return fmt.Errorf("artifact.mime required")
 	}
+	if err := checkTextBounds("artifact.mime", b.Artifact.MIME, 1, 100); err != nil {
+		return err
+	}
+	if b.Artifact.TextChars < 0 {
+		return fmt.Errorf("artifact.text_chars must be >= 0")
+	}
 	if b.Artifact.PageCount < 1 {
 		return fmt.Errorf("artifact.page_count must be >= 1")
 	}
@@ -549,6 +608,14 @@ func (b *AcquisitionBundle) Validate() error {
 	}
 	if err := enumRequired("validation.identity", b.Validation.Identity, "pass", "user_confirmed"); err != nil {
 		return err
+	}
+	if len(b.Validation.Notes) > 20 {
+		return fmt.Errorf("validation.notes capped at 20 entries")
+	}
+	for _, note := range b.Validation.Notes {
+		if err := checkTextBounds("validation.notes entry", note, 0, 300); err != nil {
+			return err
+		}
 	}
 	if !provenanceRE.MatchString(b.ProvenanceDigest) {
 		return fmt.Errorf("invalid provenance_digest")
