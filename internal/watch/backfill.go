@@ -53,7 +53,7 @@ func (r *Runner) recordSource(name string) (config.LibrarySource, error) {
 
 func (r *Runner) AddGenericBackfill(ctx context.Context, input GenericBackfillInput) (*GenericBackfillWatch, error) {
 	if r == nil || r.Store == nil || !r.holdingsEnabled() {
-		return nil, errors.New("generic backfill requires configured library holdings")
+		return nil, fmt.Errorf("%w: generic backfill requires configured library holdings", ErrNotConfigured)
 	}
 	input.SourceName = strings.TrimSpace(input.SourceName)
 	if len(input.SourceName) < 1 || len(input.SourceName) > 128 {

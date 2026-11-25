@@ -175,7 +175,7 @@ func resolveActionCAS(ctx context.Context, raw json.RawMessage, system *bootstra
 				Outcome string `json:"outcome"`
 			}{Outcome: string(job.ReviewConflict)})
 		}
-		return badParams(err)
+		return failure(err)
 	}
 	if resolution.Outcome == job.ReviewApplied || resolution.Outcome == job.ReviewAlreadyApplied {
 		releaseCaptureLeaseAfterCommit(ctx, system, resolution.JobID)

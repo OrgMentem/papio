@@ -988,7 +988,7 @@ func addWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	created, err := system.Watches.Create(ctx, input)
 	if err != nil {
-		return badParams(err)
+		return watchInputFailure(err)
 	}
 	return marshal(created)
 }
@@ -2323,6 +2323,8 @@ func failure(err error) ([]byte, *ipc.RPCError) {
 		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
 	case errors.Is(err, job.ErrConflict):
 		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
+	case errors.Is(err, job.ErrInvalidReviewInput):
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid review input")}
 	case errors.As(err, &actionKind):
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unsupported human action")}
 	default:

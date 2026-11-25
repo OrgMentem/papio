@@ -92,6 +92,10 @@ func (s *Store) Edit(ctx context.Context, input EditInput) (*Watch, error) {
 // internal fault.
 var ErrInvalidInput = errors.New("invalid watch input")
 
+// ErrNotConfigured marks a request the daemon cannot serve because the
+// configuration it needs is absent.
+var ErrNotConfigured = errors.New("watch feature not configured")
+
 type invalidInputError struct{ message string }
 
 func (e *invalidInputError) Error() string        { return e.message }

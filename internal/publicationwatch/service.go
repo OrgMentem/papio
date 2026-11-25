@@ -23,6 +23,14 @@ import (
 
 const MaxWatches = 50
 
+// ErrInvalidInput marks a refusal caused by the caller's own request. The API
+// layer reports it as invalid_argument instead of an internal fault.
+var ErrInvalidInput = errors.New("invalid publication watch request")
+
+func invalidInput(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalidInput, fmt.Sprintf(format, args...))
+}
+
 // Relations preserves both relation type and direction from the source.
 type Relations interface {
 	PublicationRelations(context.Context, string) ([]enrich.PublicationRelation, error)
@@ -124,7 +132,7 @@ func (s *Service) Add(ctx context.Context, input AddInput) (*Watch, error) {
 	}
 	input.JobID = strings.TrimSpace(input.JobID)
 	if input.JobID == "" || input.CadenceHours < 1 || input.CadenceHours > 87600 {
-		return nil, errors.New("job_id and cadence_hours (1-87600) are required")
+		return nil, invalidInput("job_id and cadence_hours (1-87600) are required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,7 +153,7 @@ func (s *Service) Add(ctx context.Context, input AddInput) (*Watch, error) {
 	 WHERE j.id=? AND j.state IN ('ready','imported') AND c.status='accepted' AND c.version IN ('preprint','accepted')
 	 AND ja.identity_result='pass' AND vr.outcome='pass' AND a.mime='application/pdf' AND a.size_bytes>0`, input.JobID).Scan(&doi, &sha, &version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errors.New("publication opt-in requires a DOI-bearing acquired PDF with passed validation and selected preprint/accepted evidence")
+		return nil, invalidInput("publication opt-in requires a DOI-bearing acquired PDF with passed validation and selected preprint/accepted evidence")
 	}
 	if err != nil {
 		return nil, err
@@ -159,7 +167,7 @@ func (s *Service) Add(ctx context.Context, input AddInput) (*Watch, error) {
 		return nil, err
 	}
 	if count >= MaxWatches {
-		return nil, fmt.Errorf("publication watches are capped at %d", MaxWatches)
+		return nil, invalidInput("publication watches are capped at %d", MaxWatches)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_watches(job_id,source_doi,artifact_sha256,artifact_version,cadence_hours,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(job_id) DO NOTHING`, input.JobID, doi, sha, version, input.CadenceHours, store.FormatTime(s.now())); err != nil {
 		return nil, err
@@ -200,6 +208,10 @@ func (s *Service) Notices(ctx context.Context, watchID int64) ([]Notice, error) 
 	}
 	if watchID <= 0 {
 		return nil, errors.New("publication watch id must be positive")
+	}
+	var exists int
+	if err := s.Store.DB().QueryRowContext(ctx, `SELECT 1 FROM publication_watches WHERE id=?`, watchID).Scan(&exists); err != nil {
+		return nil, err
 	}
 	rows, err := s.Store.DB().QueryContext(ctx, noticeSelect+` WHERE watch_id=? ORDER BY id`, watchID)
 	if err != nil {

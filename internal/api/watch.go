@@ -18,8 +18,11 @@ import (
 // watchInputFailure reports a refusal of the caller's own input as
 // invalid_argument with its message and leaves every other error to failure.
 func watchInputFailure(err error) ([]byte, *ipc.RPCError) {
-	if errors.Is(err, watch.ErrInvalidInput) {
+	if errors.Is(err, watch.ErrInvalidInput) || errors.Is(err, publicationwatch.ErrInvalidInput) {
 		return badParams(err)
+	}
+	if errors.Is(err, watch.ErrNotConfigured) {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "not configured")}
 	}
 	return failure(err)
 }
@@ -67,7 +70,7 @@ func addPublicationWatch(ctx context.Context, raw json.RawMessage, system *boots
 	}
 	result, err := system.PublicationWatches.Add(ctx, input)
 	if err != nil {
-		return failure(err)
+		return watchInputFailure(err)
 	}
 	return marshal(result)
 }

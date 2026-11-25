@@ -554,3 +554,43 @@ func TestSubmitOnceRequiresAccessMode(t *testing.T) {
 		t.Fatalf("acquire.submit_once_v1 without access mode = %#v, want configuration_required", rpcErr)
 	}
 }
+
+func TestWatchAddAndPublicationHandlersClassifyErrors(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	// Caller refusals are invalid_argument.
+	for _, tc := range []struct {
+		method string
+		params any
+	}{
+		{"watch.add", watch.CreateInput{Query: "q", CadenceHours: 0, PerRunCap: 5}},
+		{"publication.watch_add_v1", map[string]any{"job_id": "", "cadence_hours": 24}},
+		{"publication.watch_add_v1", map[string]any{"job_id": "job_missing", "cadence_hours": 24}},
+	} {
+		if rpcErr := callMethod(t, router, tc.method, tc.params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("%s %v = %#v, want invalid_argument", tc.method, tc.params, rpcErr)
+		}
+	}
+	// An unknown publication watch is not_found, not an empty page.
+	if rpcErr := callMethod(t, router, "publication.notices_v1", map[string]any{"id": 9999}, nil); rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("publication.notices_v1 unknown = %#v, want not_found", rpcErr)
+	}
+	// Backfill without configured holdings is a precondition, not internal.
+	system.WatchRunner = &watch.Runner{Store: system.Watches, DataDir: system.Config.DataDir}
+	if rpcErr := callMethod(t, router, "watch.backfill_add_v1", map[string]any{"source_name": "x", "cadence_hours": 24, "per_run_cap": 5}, nil); rpcErr == nil || rpcErr.Code != "precondition_failed" {
+		t.Fatalf("watch.backfill_add_v1 without holdings = %#v, want precondition_failed", rpcErr)
+	}
+	// Storage failure is internal, never invalid_argument.
+	if err := system.Watches.S.DB().Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rpcErr := callMethod(t, router, "watch.add", watch.CreateInput{Query: "q", CadenceHours: 24, PerRunCap: 5}, nil); rpcErr == nil || rpcErr.Code != "internal" {
+		t.Fatalf("watch.add on a closed database = %#v, want internal", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": 1, "verdict": "reject", "expected_revision": 1}, nil); rpcErr == nil || rpcErr.Code != "internal" {
+		t.Fatalf("actions.resolve on a closed database = %#v, want internal", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": 1, "verdict": "accept", "expected_revision": 1}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("actions.resolve accept without sha = %#v, want invalid_argument", rpcErr)
+	}
+}

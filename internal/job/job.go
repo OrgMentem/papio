@@ -283,6 +283,10 @@ var allowed = map[string]map[string]bool{
 // transition is not allowed).
 var ErrConflict = errors.New("job state conflict")
 
+// ErrInvalidReviewInput marks a review resolution the caller's own input
+// refused, as opposed to a storage failure.
+var ErrInvalidReviewInput = errors.New("invalid review input")
+
 // ErrLeaseLost marks a processor context canceled because its lease moved on
 // while it was still working: another worker holds the job now. Unlike an
 // ordinary cancellation it tells WithoutCancel cleanup paths to stand down
@@ -3368,11 +3372,11 @@ func (js *Store) ResolveReview(ctx context.Context, actionID int64, verdict stri
 // still identifies the same open action and quarantined file.
 func (js *Store) ResolveReviewCAS(ctx context.Context, input ResolveReviewInput) (ReviewResolution, error) {
 	if input.ExpectedRevision <= 0 {
-		return ReviewResolution{}, errors.New("expected review revision is required")
+		return ReviewResolution{}, fmt.Errorf("%w: expected review revision is required", ErrInvalidReviewInput)
 	}
 	if input.Verdict == "accept" {
 		if !validSHA256(input.ExpectedSHA256) {
-			return ReviewResolution{}, errors.New("expected SHA-256 is required for accept")
+			return ReviewResolution{}, fmt.Errorf("%w: expected SHA-256 is required for accept", ErrInvalidReviewInput)
 		}
 		input.ExpectedSHA256 = strings.ToLower(strings.TrimSpace(input.ExpectedSHA256))
 	}
@@ -3381,7 +3385,7 @@ func (js *Store) ResolveReviewCAS(ctx context.Context, input ResolveReviewInput)
 
 func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, legacy bool) (ReviewResolution, error) {
 	if input.ActionID <= 0 || (input.Verdict != "accept" && input.Verdict != "reject") {
-		return ReviewResolution{}, fmt.Errorf("invalid review action or verdict")
+		return ReviewResolution{}, fmt.Errorf("%w: invalid review action or verdict", ErrInvalidReviewInput)
 	}
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
