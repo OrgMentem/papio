@@ -7453,6 +7453,22 @@ func (b *Bridge) ingestAdoptedFile(
 	provenance *app.BrowserDeliveryContext,
 	producer *job.ArtifactProducerIdentity,
 ) (int64, error) {
+	if adm := b.nativeAdmissionForFile(ctx, jobID, filename); adm != nil {
+		// Bytes a native admission produced settle only the attempt that
+		// admitted them, however they reach the adoption path.
+		current, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+		if err != nil {
+			return 0, err
+		}
+		if current != adm.JobAttemptRevision {
+			return 0, job.ErrMaterializationStale
+		}
+		ctx = app.WithExpectedAttempt(ctx, adm.JobAttemptRevision)
+		if producer == nil {
+			p := adm.Producer
+			producer = &p
+		}
+	}
 	fence, err := b.weighArtifact(ctx, jobID, filename)
 	if err != nil {
 		return 0, err
@@ -9636,7 +9652,7 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 		}
 		return err
 	}
-	var itemErrs []error
+	itemErrs := []error{b.recoverAdmittedNativeStages(ctx, root, entries)}
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
 			continue
@@ -9653,6 +9669,7 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 		if !sweepAdoptableState(row.State) {
 			continue
 		}
+		b.reclaimNativePart(ctx, root, jobID)
 		name, ok := b.scanAdoptionDir(ctx, jobID)
 		if !ok {
 			// The directory is ambiguous (e.g. contains a pre-existing file
@@ -9676,6 +9693,9 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 			producer = b.attributeOrphanedArtifact(ctx, orphan, name)
 		}
 		if _, err := b.ingestAdoptedFile(ctx, jobID, name, nil, producer); err != nil {
+			if errors.Is(err, job.ErrMaterializationStale) {
+				continue // a native PDF admitted for an earlier attempt: left for the human
+			}
 			if errors.Is(err, errArtifactSuperseded) {
 				// Another delivery already won this attempt. Re-scanning would
 				// refuse the same bytes every tick, so the job is latched out
@@ -9722,10 +9742,10 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 // remove.
 //
 // The effective root also carries native-download staging
-// (native_stage_<reservation>.tmp). A daemon killed between staging and
-// publication leaves a full PDF there that no reservation can ever claim, so
-// staging no live reservation owns is removed once it is older than any
-// reservation could be; it is never imported.
+// (native_stage_<reservation>.tmp). SweepAdoptions republishes staging whose
+// size and SHA256 equal a durable admission; leftover staging no live
+// reservation owns (no admission, or a mismatch) is removed here once it is
+// older than any reservation could be, and is never imported.
 func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 	effective := b.cfg.EffectiveAdoptionRoot()
 	for _, root := range b.cfg.AdoptionRoots() {
@@ -9779,7 +9799,9 @@ func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, coll
 	}
 	for _, e := range entries {
 		if liveStages != nil && abandonedNativeStage(e, liveStages, b.now()) {
-			_ = os.Remove(filepath.Join(root, e.Name()))
+			if b.nativeStageReclaimable(ctx, e.Name()) {
+				_ = os.Remove(filepath.Join(root, e.Name()))
+			}
 			continue
 		}
 		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
@@ -12011,6 +12033,13 @@ jobLoop:
 	// re-sent their cancel on every daemon restart. Retiring only what was
 	// already told keeps the frame above as the browser's notice, and keeps this
 	// best-effort like the reconcile passes: a failure must never block polling.
+	// Reap dead candidate rows so the scheduler's scans stop stepping over them.
+	// It runs BEFORE the claim retirement below: a retired (abandoned) claim row
+	// stays observable for one poll, and the next poll's reap removes it with its
+	// candidate. Best-effort and batch-limited, like the pass below.
+	if _, err := b.jobs.ReapTerminalCandidates(ctx, job.DefaultCandidateReapBatch); err != nil {
+		log.Printf("papio: reaping terminal browser candidates: %v", err)
+	}
 	if len(terminalCancelled) > 0 {
 		if _, err := b.jobs.AbandonTerminalMaterializations(ctx, b.now(), terminalCancelled); err != nil {
 			log.Printf("papio: abandoning terminal materialization claims: %v", err)

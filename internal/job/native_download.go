@@ -265,3 +265,25 @@ func (js *Store) AdmitNativeDownload(ctx context.Context, a NativeDownloadAdmiss
 	}
 	return tx.Commit()
 }
+
+// NativeDownloadAdmissionByReservation returns the durable admission recorded
+// for one reservation, or nil when none exists. Recovery treats it as the only
+// authority for staged bytes: events written without a size or digest decode
+// to zero values, which no staged file can match.
+func (js *Store) NativeDownloadAdmissionByReservation(ctx context.Context, reservationID string) (*NativeDownloadAdmission, error) {
+	var jobID, raw string
+	err := js.S.DB().QueryRowContext(ctx, `SELECT job_id, detail_json FROM events WHERE kind='browser.native_download_admitted'
+		AND json_extract(detail_json,'$.reservation_id')=? ORDER BY seq LIMIT 1`, reservationID).Scan(&jobID, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var a NativeDownloadAdmission
+	if json.Unmarshal([]byte(raw), &a) != nil {
+		return nil, nil
+	}
+	a.JobID = jobID
+	return &a, nil
+}

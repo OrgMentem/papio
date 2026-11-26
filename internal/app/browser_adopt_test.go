@@ -2022,3 +2022,23 @@ func TestCopyHashedRefusesConfinedFileSwappedForSymlink(t *testing.T) {
 		t.Fatalf("refused copy left a quarantine file: %v", err)
 	}
 }
+
+// An attempt fence is applied before prepareMainAdoption can park the job or
+// open a human action: a stale caller changes nothing.
+func TestAdoptDownloadStaleAttemptChangesNothing(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_stale_attempt")
+	before, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = svc.AdoptDownload(WithExpectedAttempt(ctx, 99), id, filepath.Join(svc.Config.EffectiveAdoptionRoot(), id, "x.pdf"))
+	if !errors.Is(err, job.ErrMaterializationStale) {
+		t.Fatalf("err=%v, want stale", err)
+	}
+	after, err := jobs.Events(ctx, id)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("stale adoption wrote events: %d -> %d (%v)", len(before), len(after), err)
+	}
+}

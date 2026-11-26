@@ -17,6 +17,10 @@ import (
 
 var errNativeSource = errors.New("native download source rejected")
 
+// errNativeStageMismatch proves staged bytes are not the admitted bytes. Any
+// other verification failure is transient and proves nothing.
+var errNativeStageMismatch = errors.New("native stage does not match its admission")
+
 // syncNativeDir flushes a pinned directory's entries to stable storage. It is a
 // variable only so tests can observe the publish ordering and fail the flush.
 var syncNativeDir = syncNativeRootDir
@@ -339,6 +343,89 @@ func (r *nativeDownloadRoot) publish(ctx context.Context, jobID, filename string
 	if err := syncNativeDir(jobRoot); err != nil {
 		_ = jobRoot.Remove(filename)
 		return errNativeSource
+	}
+	return nil
+}
+
+// openNativeRecoveryRoot pins the configured landing directory for restart
+// recovery. Unlike snapshotNativeDownloadRoot it records no source baseline:
+// recovery publishes only digest-verified staging and never reads the source.
+func openNativeRecoveryRoot(cfg config.Config) (_ *nativeDownloadRoot, err error) {
+	landing := filepath.Clean(cfg.EffectiveAdoptionRoot())
+	if !filepath.IsAbs(landing) || !config.BrowserSteerableAdoptionRoot(landing) {
+		return nil, errNativeSource
+	}
+	source := filepath.Dir(landing)
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil || resolved == filepath.Dir(resolved) {
+		return nil, errNativeSource
+	}
+	r := &nativeDownloadRoot{sourcePath: resolved, sourceAlias: source, landingPath: filepath.Join(resolved, config.AdoptionDirName), names: map[string]bool{}}
+	defer func() {
+		if err != nil {
+			r.close()
+		}
+	}()
+	if r.source, err = os.OpenRoot(resolved); err != nil {
+		return nil, errNativeSource
+	}
+	if r.sourceInfo, err = r.source.Stat("."); err != nil {
+		return nil, errNativeSource
+	}
+	landingInfo, err := r.source.Lstat(config.AdoptionDirName)
+	if err != nil || !landingInfo.IsDir() || landingInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errNativeSource
+	}
+	if r.landing, err = r.source.OpenRoot(config.AdoptionDirName); err != nil {
+		return nil, errNativeSource
+	}
+	if r.landingInfo, err = r.landing.Stat("."); err != nil || !os.SameFile(landingInfo, r.landingInfo) {
+		return nil, errNativeSource
+	}
+	return r, nil
+}
+
+// verifyStage proves a root-level staging file holds exactly the admitted
+// bytes: a regular file whose size and SHA256 equal the durable admission.
+func (r *nativeDownloadRoot) verifyStage(ctx context.Context, name string, size int64, digest string) error {
+	info, err := r.landing.Lstat(name)
+	if err != nil {
+		return errNativeSource
+	}
+	if !info.Mode().IsRegular() || info.Size() != size || size < 1 {
+		return errNativeStageMismatch
+	}
+	in, err := r.landing.Open(name)
+	if err != nil {
+		return errNativeSource
+	}
+	defer func() { _ = in.Close() }()
+	opened, err := in.Stat()
+	if err != nil || !sameAdoptionFile(info, opened) {
+		return errNativeSource
+	}
+	h := sha256.New()
+	buffer := make([]byte, 64*1024)
+	var total int64
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		n, readErr := in.Read(buffer)
+		total += int64(n)
+		if total > size {
+			return errNativeStageMismatch
+		}
+		_, _ = h.Write(buffer[:n])
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return errNativeSource
+		}
+	}
+	if total != size || hex.EncodeToString(h.Sum(nil)) != digest {
+		return errNativeStageMismatch
 	}
 	return nil
 }

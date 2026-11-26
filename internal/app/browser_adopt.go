@@ -160,6 +160,17 @@ func confineToAdoptionRoots(roots []string, resolved string) error {
 // manual_download action) when the file is rejected so the human can supply a
 // different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
+	// The attempt fence runs before prepareMainAdoption can park the job or
+	// open a human action; the transition re-checks it in its transaction.
+	if expected, _ := ctx.Value(adoptionExpectedAttemptKey{}).(int64); expected != 0 {
+		current, err := s.Jobs.MaterializationAttemptRevision(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if current != expected {
+			return job.ErrMaterializationStale
+		}
+	}
 	row, err := s.prepareMainAdoption(ctx, jobID, func(ctx context.Context) error {
 		return s.parkForAdoption(ctx, jobID, "browser_download_adoption")
 	})
@@ -184,11 +195,14 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		return fmt.Errorf("adoption path rejected: %w", err)
 	}
 	_, err = s.adoptMainPDF(ctx, row, mainPDFOrigin{
-		source:     "browser",
-		url:        "browser://adopted-download",
-		keyPrefix:  "browser-adopt:sha256:",
-		copyInto:   func(dst string) (string, int64, error) { return copyHashed(resolved, dst) },
-		transition: s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible,
+		source:    "browser",
+		url:       "browser://adopted-download",
+		keyPrefix: "browser-adopt:sha256:",
+		copyInto:  func(dst string) (string, int64, error) { return copyHashed(resolved, dst) },
+		transition: func(ctx context.Context, jobID string, candidateID int64) error {
+			attempt, _ := ctx.Value(adoptionExpectedAttemptKey{}).(int64)
+			return s.Jobs.TransitionAwaitingToValidatingIfAdoptEligibleAtAttempt(ctx, jobID, candidateID, attempt)
+		},
 		rejected: func(ctx context.Context, jobID string, access job.AccessClassification) error {
 			return s.rejectAdoptedDownload(ctx, jobID, resolved, access)
 		},
@@ -452,6 +466,15 @@ func (s *Service) rejectAdoptedDownload(ctx context.Context, jobID, path string,
 }
 
 type adoptionCandidateResultKey struct{}
+
+type adoptionExpectedAttemptKey struct{}
+
+// WithExpectedAttempt fences AdoptDownload's awaiting_human -> validating
+// move to one materialization attempt, checked in the same transaction as the
+// move. 0 applies no fence.
+func WithExpectedAttempt(ctx context.Context, attempt int64) context.Context {
+	return context.WithValue(ctx, adoptionExpectedAttemptKey{}, attempt)
+}
 
 type adoptionCandidateResult struct {
 	ID  int64

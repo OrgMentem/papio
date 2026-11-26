@@ -89,6 +89,28 @@ func (js *Store) TransitionAwaitingToValidatingIfAdoptEligible(ctx context.Conte
 	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_browser_download", "browser", nil)
 }
 
+// TransitionAwaitingToValidatingIfAdoptEligibleAtAttempt is the same move
+// fenced to one materialization attempt: inside the transition's transaction
+// the job's attempt revision must equal expectedAttempt, otherwise
+// ErrMaterializationStale is returned and nothing changes. expectedAttempt 0
+// applies no fence.
+func (js *Store) TransitionAwaitingToValidatingIfAdoptEligibleAtAttempt(ctx context.Context, jobID string, candidateID int64, expectedAttempt int64) error {
+	if expectedAttempt == 0 {
+		return js.TransitionAwaitingToValidatingIfAdoptEligible(ctx, jobID, candidateID)
+	}
+	guard := func(ctx context.Context, tx *sql.Tx) error {
+		var retries int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id=? AND kind='job.retry_requested'`, jobID).Scan(&retries); err != nil {
+			return err
+		}
+		if retries+1 != expectedAttempt {
+			return ErrMaterializationStale
+		}
+		return nil
+	}
+	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_browser_download", "browser", guard)
+}
+
 // TransitionAwaitingToValidatingForSuppliedPDF is the same guarded transition
 // for a main PDF the operator supplied from a local file. The recorded reason
 // and source differ, so the job's events never attribute those bytes to the

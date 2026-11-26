@@ -289,16 +289,18 @@ func TestNativeDownloadBoundedIOSingleFlightAndLateCleanup(t *testing.T) {
 	}
 }
 
-// Admission consumes authority before publication. A restart can recover a
-// published artifact using the exact durable producer, but it must never infer
-// completion from a staging file or reconstruct the lost source baseline.
+// Admission consumes authority before publication, and the durable admission
+// is the only authority that survives a crash. A restart recovers a published
+// artifact using the exact durable producer, and republishes an admitted stage
+// only when its size and SHA256 equal the admission. A stage that does not
+// match (digest mismatch) never becomes success, and the lost source baseline
+// is never reconstructed: the job keeps awaiting a human and the terminal
+// sweep reclaims the stage.
 func TestNativeDownloadCrashBoundary(t *testing.T) {
-	for _, published := range []bool{false, true} {
-		name := "admitted only"
-		if published {
-			name = "published"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, mode := range []string{"digest mismatch", "published", "admitted, intact stage"} {
+		published := mode == "published"
+		intact := mode == "admitted, intact stage"
+		t.Run(mode, func(t *testing.T) {
 			b, jobs, id, source, p := nativeAttempt(t)
 			arm := nativeArm(t, b, id, p)
 			if arm.Outcome != "armed" {
@@ -325,6 +327,13 @@ func TestNativeDownloadCrashBoundary(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if mode == "digest mismatch" {
+				corrupt := append([]byte(nil), body...)
+				corrupt[len(corrupt)/2] ^= 0xff
+				if err := os.WriteFile(filepath.Join(source, "papio", staged.name), corrupt, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			r.root.close() // emulate lost handles without deleting crash-left staging
 			restarted := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, b.cfg, b.Version)
 			t.Cleanup(restarted.CloseAcquisitionBackend)
@@ -335,7 +344,7 @@ func TestNativeDownloadCrashBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if published {
+			if published || intact {
 				if row.State != job.StateReady || row.ArtifactSHA256 != staged.digest {
 					t.Fatalf("published bytes not recovered: %+v", row)
 				}
@@ -602,5 +611,201 @@ func TestNativeDownloadActiveReservationCapacity(t *testing.T) {
 		if r.root == nil || r.observation != "" || r.outcome != "" {
 			t.Fatalf("active reservation changed: %+v", r)
 		}
+	}
+}
+
+// admittedNativeCrash leaves a durable admission with an intact stage and no
+// published file, then returns a restarted bridge.
+func admittedNativeCrash(t *testing.T) (restarted *Bridge, jobs *job.Store, id, landing, stageName, digest string) {
+	t.Helper()
+	b, jobs, id, source, p := nativeAttempt(t)
+	arm := nativeArm(t, b, id, p)
+	if arm.Outcome != "armed" {
+		t.Fatal(arm)
+	}
+	body := adoptionProbePDF(handoffWork().DOI)
+	path := filepath.Join(source, "fresh.pdf")
+	writeAdoptionProbeFile(t, path, body)
+	obs := nativeObservation(p, arm, path, len(body))
+	b.mu.Lock()
+	r := b.nativeDownloads[id]
+	delete(b.nativeDownloads, id)
+	b.mu.Unlock()
+	staged, err := r.root.stage(context.Background(), path, r.record.ReservationID, int64(len(body)), b.cfg.Fetch.MaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := job.NativeDownloadAdmission{NativeDownloadReservation: r.record, DownloadID: obs.DownloadID, StartedAtMS: obs.StartedAtMS, ObservationSHA256: nativeDigest(obs), Filename: r.record.ReservationID + ".pdf", SHA256: staged.digest, SizeBytes: staged.size}
+	if err := jobs.AdmitNativeDownload(context.Background(), a, b.now()); err != nil {
+		t.Fatal(err)
+	}
+	r.root.close()
+	restarted = NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, b.cfg, b.Version)
+	t.Cleanup(restarted.CloseAcquisitionBackend)
+	return restarted, jobs, id, filepath.Join(source, "papio"), staged.name, staged.digest
+}
+
+func ageNativeStage(t *testing.T, path string) {
+	t.Helper()
+	old := time.Now().Add(-agentAttemptDuration - time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Recovery is fenced to the admitted attempt: a job retried into a new attempt
+// is never moved by the old attempt's stage.
+func TestNativeStageRecoveryFencedToAdmittedAttempt(t *testing.T) {
+	restarted, jobs, id, landing, stage, _ := admittedNativeCrash(t)
+	if err := jobs.S.AppendEvent(context.Background(), id, "job.retry_requested", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State == job.StateReady || row.ArtifactSHA256 != "" {
+		t.Fatalf("old attempt settled the new one: %+v %v", row, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(landing, id))
+	if len(entries) != 0 {
+		t.Fatalf("stale attempt published bytes: %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(landing, stage)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A crash between creating <reservation>.pdf.part and linking it must not
+// block recovery.
+func TestNativeStageRecoveryReclaimsAbandonedPart(t *testing.T) {
+	restarted, jobs, id, landing, stage, digest := admittedNativeCrash(t)
+	if err := os.MkdirAll(filepath.Join(landing, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reservation := strings.TrimSuffix(strings.TrimPrefix(stage, nativeStagePrefix), nativeStageSuffix)
+	if err := os.WriteFile(filepath.Join(landing, id, reservation+".pdf.part"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State != job.StateReady || row.ArtifactSHA256 != digest {
+		t.Fatalf("part blocked recovery: %+v %v", row, err)
+	}
+}
+
+// A busy IO gate proves nothing: the terminal sweep keeps an admitted stage it
+// could not verify, and a later sweep still recovers it.
+func TestNativeStageKeptWhenGateBusy(t *testing.T) {
+	restarted, jobs, id, landing, stage, digest := admittedNativeCrash(t)
+	stagePath := filepath.Join(landing, stage)
+	ageNativeStage(t, stagePath)
+	gate := restarted.nativeGate()
+	gate <- struct{}{}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.SweepTerminalAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stagePath); err != nil {
+		t.Fatalf("unverifiable admitted stage reclaimed: %v", err)
+	}
+	<-gate
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State != job.StateReady || row.ArtifactSHA256 != digest {
+		t.Fatalf("not recovered after gate freed: %+v %v", row, err)
+	}
+}
+
+// A retry that lands between publish and ingest must leave the new attempt
+// untouched: the adoption transition is fenced to the admitted attempt.
+func TestNativeStageRecoveryRetryBetweenPublishAndIngest(t *testing.T) {
+	restarted, jobs, id, landing, _, _ := admittedNativeCrash(t)
+	publish := publishNativeFile
+	t.Cleanup(func() { publishNativeFile = publish })
+	publishNativeFile = func(r *nativeDownloadRoot, ctx context.Context, jobID, filename string, f nativeStagedFile) error {
+		if err := publish(r, ctx, jobID, filename, f); err != nil {
+			return err
+		}
+		return jobs.S.AppendEvent(ctx, jobID, "job.retry_requested", map[string]any{})
+	}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State != job.StateAwaitingHuman || row.ArtifactSHA256 != "" || row.SelectedCandidateID != 0 {
+		t.Fatalf("new attempt was touched: %+v %v", row, err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(landing, id)); len(entries) != 0 {
+		t.Fatalf("stale bytes left published: %v", entries)
+	}
+}
+
+// A native PDF published before a crash is adopted by the ordinary sweep only
+// for its admitted attempt; after a retry it is left for the human.
+func TestNativePublishedPDFSweepIsAttemptFenced(t *testing.T) {
+	restarted, jobs, id, landing, stage, digest := admittedNativeCrash(t)
+	reservation := strings.TrimSuffix(strings.TrimPrefix(stage, nativeStagePrefix), nativeStageSuffix)
+	if err := os.MkdirAll(filepath.Join(landing, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(landing, stage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(landing, id, reservation+".pdf")
+	if err := os.WriteFile(final, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.S.AppendEvent(context.Background(), id, "job.retry_requested", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State == job.StateReady || row.ArtifactSHA256 != "" || row.SelectedCandidateID != 0 {
+		t.Fatalf("stale native PDF adopted: %+v %v", row, err)
+	}
+	if _, err := os.Stat(final); err != nil {
+		t.Fatalf("file for the human removed: %v", err)
+	}
+	_ = digest
+}
+
+// A crash between the link and the .part removal leaves both names; the sweep
+// must reclaim the part when the final PDF matches its admission.
+func TestNativeFinalPDFWithStalePartIsReclaimed(t *testing.T) {
+	restarted, jobs, id, landing, stage, digest := admittedNativeCrash(t)
+	reservation := strings.TrimSuffix(strings.TrimPrefix(stage, nativeStagePrefix), nativeStageSuffix)
+	if err := os.MkdirAll(filepath.Join(landing, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(landing, stage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(landing, id, reservation+".pdf")
+	if err := os.WriteFile(final, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(final+".part", body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.SweepAdoptions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State != job.StateReady || row.ArtifactSHA256 != digest {
+		t.Fatalf("stale part blocked adoption: %+v %v", row, err)
+	}
+	if _, err := os.Stat(final + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part survived: %v", err)
 	}
 }

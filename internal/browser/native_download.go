@@ -4,21 +4,26 @@ package browser
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/job"
 	"papio/internal/protocol"
 )
 
 // A reservation retains local observations, not acquisition authority. Its
 // one-shot arm/admission is recorded in existing job events. No baseline can
-// be reconstructed after restart, so loss is conservative and never replayed.
+// be reconstructed after restart. The durable admission, not the reservation,
+// is what survives: recoverAdmittedNativeStages republishes a staging file only
+// when its size and SHA256 equal that admission.
 type nativeDownloadReservation struct {
 	record          job.NativeDownloadReservation
 	arm             protocol.NativeDownloadArmRequestV1Payload
@@ -575,7 +580,8 @@ func (b *Bridge) liveNativeStages() map[string]bool {
 // reservation owns and old enough that no retired worker can still be using
 // it. A reservation lives at most agentAttemptDuration, and every IO step on
 // its staging is bounded to seconds, so older unowned staging is a crash
-// leftover. It is never imported: admission cannot be replayed from it.
+// leftover. recoverAdmittedNativeStages has already republished any of it that
+// matches a durable admission by size and digest; what remains is reclaimed.
 func abandonedNativeStage(e os.DirEntry, live map[string]bool, now time.Time) bool {
 	name := e.Name()
 	if !strings.HasPrefix(name, nativeStagePrefix) || !strings.HasSuffix(name, nativeStageSuffix) || live[name] || !e.Type().IsRegular() {
@@ -583,4 +589,175 @@ func abandonedNativeStage(e os.DirEntry, live map[string]bool, now time.Time) bo
 	}
 	info, err := e.Info()
 	return err == nil && now.Sub(info.ModTime()) > agentAttemptDuration
+}
+
+// recoverAdmittedNativeStages finishes native downloads whose daemon died
+// after the durable admission but before the bytes were published. The
+// authority is the admission event alone; the stage is only bytes checked
+// against its size and digest, and the source baseline is never rebuilt. A
+// missing, partial, mismatching or old-format (no digest) stage is left as is:
+// the job keeps awaiting a human and the terminal sweep reclaims the stage.
+func (b *Bridge) recoverAdmittedNativeStages(ctx context.Context, root string, entries []os.DirEntry) error {
+	if b.jobs == nil || filepath.Clean(root) != filepath.Clean(b.cfg.EffectiveAdoptionRoot()) {
+		return nil
+	}
+	var live map[string]bool
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, nativeStagePrefix) || !strings.HasSuffix(name, nativeStageSuffix) || !e.Type().IsRegular() {
+			continue
+		}
+		if live == nil {
+			live = b.liveNativeStages()
+		}
+		if live[name] {
+			continue
+		}
+		reservation := strings.TrimSuffix(strings.TrimPrefix(name, nativeStagePrefix), nativeStageSuffix)
+		admission, err := b.jobs.NativeDownloadAdmissionByReservation(ctx, reservation)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if admission == nil || admission.ReservationID != reservation || admission.Filename != reservation+".pdf" || !filepath.IsLocal(admission.JobID) || filepath.Base(admission.JobID) != admission.JobID {
+			continue
+		}
+		row, err := b.jobs.Get(ctx, admission.JobID)
+		if err != nil || row == nil || !sweepAdoptableState(row.State) {
+			continue
+		}
+		if attempt, err := b.jobs.MaterializationAttemptRevision(ctx, admission.JobID); err != nil || attempt != admission.JobAttemptRevision {
+			continue // admitted for an earlier attempt: never adopt into this one
+		}
+		if _, err := os.Lstat(filepath.Join(root, admission.JobID, admission.Filename)); err == nil || !errors.Is(err, os.ErrNotExist) {
+			continue // already published: the ordinary sweep adopts it
+		}
+		staged := nativeStagedFile{name: name, digest: admission.SHA256, size: admission.SizeBytes}
+		published, err := boundedNativeIO(ctx, b.nativeGate(), nativeIOBudget, func(ctx context.Context) (bool, error) {
+			r, err := openNativeRecoveryRoot(b.cfg)
+			if err != nil {
+				return false, err
+			}
+			defer r.close()
+			// A crash between creating the partial copy and linking it leaves a
+			// .part that fails every exclusive create and blocks the dir scan.
+			// The verified stage is the source of truth; the partial is not.
+			if err := r.landing.Remove(filepath.Join(admission.JobID, admission.Filename+".part")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return false, err
+			}
+			if err := r.verifyStage(ctx, name, staged.size, staged.digest); err != nil {
+				return false, err
+			}
+			if err := publishNativeFile(r, ctx, admission.JobID, admission.Filename, staged); err != nil {
+				return false, err
+			}
+			return true, nil
+		}, func(bool) {})
+		if err != nil || !published {
+			continue // mismatch or transient failure: the stage is kept for the next tick
+		}
+		// A retry may start a new attempt between publish and ingest. The
+		// adoption transition itself is fenced to the admitted attempt, in its
+		// own transaction; stale bytes are withdrawn, never adopted.
+		producer := admission.Producer
+		fenced := app.WithExpectedAttempt(ctx, admission.JobAttemptRevision)
+		if _, err := b.ingestAdoptedFile(fenced, admission.JobID, admission.Filename, nil, &producer); err != nil {
+			if errors.Is(err, job.ErrMaterializationStale) {
+				if full, perr := b.adoptionPath(admission.JobID, admission.Filename); perr == nil {
+					_ = os.Remove(full)
+				}
+				continue
+			}
+			errs = append(errs, err)
+			continue
+		}
+		_ = os.Remove(filepath.Join(root, name))
+	}
+	return errors.Join(errs...)
+}
+
+// nativeStageReclaimable reports whether an abandoned stage may be deleted. An
+// admitted stage of a live job is the only copy recovery can publish, so it is
+// kept unless the job is terminal or the stage is PROVEN not to equal the
+// admission. A lookup error, a busy IO gate or any other transient failure
+// proves nothing and keeps the stage.
+func (b *Bridge) nativeStageReclaimable(ctx context.Context, name string) bool {
+	if b.jobs == nil {
+		return true
+	}
+	reservation := strings.TrimSuffix(strings.TrimPrefix(name, nativeStagePrefix), nativeStageSuffix)
+	admission, err := b.jobs.NativeDownloadAdmissionByReservation(ctx, reservation)
+	if err != nil {
+		return false
+	}
+	if admission == nil {
+		return true
+	}
+	row, err := b.jobs.Get(ctx, admission.JobID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && row == nil) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if job.Terminal(row.State) {
+		return true
+	}
+	_, err = boundedNativeIO(ctx, b.nativeGate(), nativeIOBudget, func(ctx context.Context) (bool, error) {
+		r, err := openNativeRecoveryRoot(b.cfg)
+		if err != nil {
+			return false, err
+		}
+		defer r.close()
+		return true, r.verifyStage(ctx, name, admission.SizeBytes, admission.SHA256)
+	}, func(bool) {})
+	return errors.Is(err, errNativeStageMismatch)
+}
+
+// nativeAdmissionForFile returns the durable admission that produced
+// <jobID>/<filename>, only when the file's bytes equal the admitted digest.
+func (b *Bridge) nativeAdmissionForFile(ctx context.Context, jobID, filename string) *job.NativeDownloadAdmission {
+	if b.jobs == nil || !strings.HasPrefix(filename, "native_") || !strings.HasSuffix(filename, ".pdf") {
+		return nil
+	}
+	admission, err := b.jobs.NativeDownloadAdmissionByReservation(ctx, strings.TrimSuffix(filename, ".pdf"))
+	if err != nil || admission == nil || admission.JobID != jobID || admission.Filename != filename {
+		return nil
+	}
+	full, err := b.adoptionPath(jobID, filename)
+	if err != nil {
+		return nil
+	}
+	if info, err := os.Lstat(full); err != nil || !info.Mode().IsRegular() || info.Size() != admission.SizeBytes {
+		return nil
+	}
+	if digest, err := fileDigest(full); err != nil || digest != admission.SHA256 {
+		return nil
+	}
+	return admission
+}
+
+// reclaimNativePart removes a .part left beside a published native PDF by a
+// crash between the link and the part's removal. settledFileName treats any
+// .part as a browser still writing, so both names would block the directory
+// forever. Only a part whose final PDF equals its admission is removed.
+func (b *Bridge) reclaimNativePart(ctx context.Context, root, jobID string) {
+	if b.jobs == nil || filepath.Clean(root) != filepath.Clean(b.cfg.EffectiveAdoptionRoot()) {
+		return
+	}
+	dir := filepath.Join(root, jobID)
+	entries, err := b.readAdoptionDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "native_") || !strings.HasSuffix(name, ".pdf.part") {
+			continue
+		}
+		if b.nativeAdmissionForFile(ctx, jobID, strings.TrimSuffix(name, ".part")) != nil {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
 }
