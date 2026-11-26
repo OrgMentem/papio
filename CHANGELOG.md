@@ -14,6 +14,8 @@ execution records kept during the initial build.
 - **`zotio tags reconcile` is now hidden from MCP.** It writes Zotero tags immediately with no preview, so it stays a terminal-only command. The daemon already runs the same pass automatically.
 - **`papio` exit statuses now tell a usage error and an unreachable daemon apart.** A bad flag, a wrong argument count, or a missing `--config` file exits `2`. A command that finds no running daemon exits `3`. Every other failure, including an error the daemon returns, still exits `1`. The `--json` error codes and the output text do not change. `papio --help` lists the statuses.
 - **A DOI or OpenAthens handoff now names your library to the browser.** The offer for a DOI route (`https://doi.org/…` or the OpenAthens redirector) already listed the publisher hosts. It now also lists your library's resolver host, last, as the LibKey route already did. The extension uses it to find the library whose live session may release the paper; without it a fresh publisher-first paper was accepted as queued with no tab. No new field crosses the native-messaging wire.
+- **On Windows, a config whose `on_ready` command expands `%PAPIO_*%` directly is now refused.** `cmd.exe` parses the expanded remote text again. This can reject an existing config. Read the values through `$env:` or delayed expansion instead; values reach hooks unchanged.
+- **On Windows, a legacy native-host target record is refused.** Rerun `papio native-host install` to write a record that names the host image.
 
 ### Added
 - **`papio export search <snapshot-file> [--keys k1,k2]` and `papio export campaign <campaign-id>`.** Search results saved with `papio search save` and the works staged in a campaign can now leave *papio* as CSL-JSON, RIS, or BibTeX. Both commands read local files only (no daemon call, no job) and share `--format`, `-o`, `--force`, `--json` and `--include-duplicates` with the other export commands. `--keys` selects snapshot rows and rejects an unknown key. `export campaign` skips source records that failed to parse and reports the count on stderr and as `skipped_source_records` in the `--json` receipt.
@@ -281,6 +283,44 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **`papio search save`, `search acquire` and the campaign commands print prose unless you pass `--json`.** The prose keeps the selection, ownership and cost details. `papio status --json --follow` is documented as NDJSON: one snapshot per line and no final aggregate. A missing query, an invalid watch id and incompatible `acquire` flags exit `2` with `invalid_argument`. `papio config init --json` reports `replaced` as a boolean. `campaign run` prints the receipt first, then reports a manifest write failure with the in-flight state and the reconcile step. Search snapshots no longer replace an existing snapshot and leave no partial file after a crash.
+- **A Windows notification toast no longer breaks on curly quotes.** The toast script now doubles U+2018 to U+201B as well as the ASCII apostrophe.
+- **The `work-request` and bundle validators now match the published schemas.** Length limits count characters, not bytes, and the collection, source-name, evidence, notes, candidate, adapter and artifact bounds are now enforced.
+- **Resolver identity fixes.** OpenAIRE echoes the requested DOI or PMID only when the record lists it. Europe PMC escapes quotes and backslashes in its DOI query and compares normalised DOI and PMID. CORE and Europe PMC share one author matcher that reads UTF-8 initials, `Last, First` and surname-first names. CORE and Crossref landing URLs keep the DOI slash and skip dot-segment DOIs. Semantic Scholar snowball rejects dot-segment seed DOIs. Discovery no longer scores a short title as a confident match.
+- **Delivery reconciliation accepts equivalent DOI and PMID spellings.** It compares normalised identifiers.
+- **The `zotio` import staging name is safe on Windows.** It encodes `:` and stages under `import/`, so an older colon-named file is never scanned.
+- **On Windows, the native host is paired with its daemon target.** The target record names the SHA-256 of the host image it was installed with, and the host refuses a mismatched record. `papio native-host status` reports the problem and the fix. Status and autostart hashing can no longer block the installer's rename, and the host waits a bounded time for its stdin reader when it stops.
+- **Downloads and ready files are now durable.** A native download and a promoted artifact are flushed with their directories before they count as published, and a failed publish withdraws the link so a retry relinks. A failure to record `pdf_sanitized` provenance now stops adoption.
+- **`actions.open` counts distinct jobs.** A repeated job id no longer inflates the focus-handoff count. `job_reject` clears the offered and queued state before it writes the audit entry.
+- **`on_ready` now runs at least once.** On start-up, *papio* replays a dispatch that has no recorded outcome, unless a filing reservation shows a live hook.
+- **The retraction cache fits its limits before it is published.** The sweep caps the cache, trims titles and marks it `truncated`; the writer refuses a cache its reader would reject.
+- **Updated dependencies.** `golang.org/x/crypto` is now v0.59.0 and `mcp-go` is v1.6.0.
+- **Cancelling a job now stops the work that is running for it, at once.** A cancel clears the job's lease, and the lease heartbeat read that as the processor's own normal completion, so the acquisition kept fetching and publishing for a job you had already ended. A job cancelled in the daemon (a cancel, a dismissed handoff, a rejected review) now cancels its running processor immediately. A cancel from another process, and every other lost lease, is still caught by the next heartbeat. A job that reaches `ready` or a parked state by its own worker still lets that worker finish.
+- **A daemon that cannot record its migration phase is no longer killed mid-migration.** If the daemon's status file could not be written, the command that started the daemon still saw `starting` and terminated it at the start deadline, so the next start began the migration again. The daemon now retries the write, clears a stale status it cannot replace, and exits before it reads credentials or opens the database if it can do neither. A command leaves a daemon that holds the data directory with no readable status running.
+- **`papio daemon stop` no longer fails after a successful stop when the daemon's process id is reused.** The command waited on the process id alone, so an unrelated process that took the id kept it waiting until it reported the daemon as still running. It now also compares the process start time.
+- **A published adapter control is reported as accepted only once it is durable.** *papio* flushed the control file but ignored a failure to flush its directory, so a crash could drop a suspension that the daemon had already applied. The failure now refuses the document, keeps the held control, and puts the previous control file back so that a restart cannot load the refused document. The next fetch retries within five minutes.
+- **Stopping the daemon now always closes its listener and every client
+  connection before it returns.** When shutdown raced a connection that had just
+  been accepted, the server could return without having closed its listener,
+  leaving it to a helper goroutine that had not run yet. The listener and every
+  active connection are now closed on every return path.
+- **A power loss can no longer leave a ready paper whose PDF is missing.**
+  *papio* published a validated PDF into `artifacts/` and then committed the
+  `ready` state, but it never flushed the file or the `artifacts/` directory
+  to disk first. A power loss after the commit could keep the `ready` row and
+  lose the file's name or bytes, and the publication journal was already
+  consumed, so restart recovery could not repair it. Promotion now flushes the
+  file before it becomes visible and the directory before it reports success,
+  on the hard-link path, the rename fallback and the reuse of an existing
+  artifact. A flush failure fails the promotion, so the `ready` commit does
+  not happen and the publication journal row stays for a retry.
+- **A corrupt job event is now an error, not an empty event.** Reading a job's
+  event history turned a stored event whose JSON detail no longer decoded into
+  an event with no detail. The guards that read details (import retry caps, the
+  agent decision budget, sibling-search markers) then counted that event as
+  absent and could repeat paid or irreversible work. The read now fails and
+  names the job and event sequence. A `job.created` event from before details
+  were real JSON stays readable.
 - **`papio_batch_wait` stays within its timeout when a report read stalls.**
   The wait read each batch report under the agent's own context and only
   checked its deadline once that read returned, so a report read that never
@@ -1482,6 +1522,16 @@ execution records kept during the initial build.
   no longer persisted.
 - Updated `golang.org/x/net` to v0.60.0 (GO-2026-6603, GO-2026-6610,
   GO-2026-6611, GO-2026-6612, GO-2026-6617; none was reachable from *papio*).
+- **On Windows, the CLI, the native host and the daemon controls now refuse a
+  daemon pipe that another account created.** The named-pipe namespace is shared
+  by every user on the machine and the pipe name is predictable, so another
+  local account could create the pipe first and receive your requests. Each
+  client now reads the pipe's owner before it writes and refuses a pipe that
+  the current user does not own. The daemon creates its pipe with your user SID
+  as owner (an elevated daemon would otherwise own it as the Administrators
+  group). When the daemon finds such a pipe at start-up it says so instead of
+  reporting "ipc socket already in use". Restart a daemon that an older version
+  started so that its pipe carries the explicit owner.
 
 ## [0.22.1] - 2026-09-23
 
