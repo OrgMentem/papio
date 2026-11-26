@@ -35,8 +35,18 @@ var (
 // and releases it only once that process is gone. onWait is told the pid when
 // the exit takes long enough for a person to notice. Where the platform cannot
 // name a socket's peer, StopDaemon only asks the daemon to stop.
+//
+// A process id alone does not name the daemon for that long: once the daemon
+// exits, the system may give its id to an unrelated process. StopDaemon
+// therefore also records when the daemon's process began, and counts a pid
+// whose process began at another time as an exit.
 func StopDaemon(ctx context.Context, socketPath string, shutdown func(context.Context) error, onWait func(pid int)) error {
 	pid := daemonPID(ctx, socketPath)
+	var began uint64
+	var beganKnown bool
+	if pid > 0 {
+		began, beganKnown = processStart(pid)
+	}
 	if unlock := holdStartLock(ctx, startLockPath(socketPath)); unlock != nil {
 		defer unlock()
 	}
@@ -48,7 +58,7 @@ func StopDaemon(ctx context.Context, socketPath string, shutdown func(context.Co
 	}
 	start := time.Now()
 	announced := false
-	for !processExited(pid) {
+	for !daemonGone(pid, began, beganKnown) {
 		waited := time.Since(start)
 		if !announced && waited >= stopNoticeAfter {
 			announced = true
@@ -68,6 +78,25 @@ func StopDaemon(ctx context.Context, socketPath string, shutdown func(context.Co
 		}
 	}
 	return nil
+}
+
+// processStart reports when the process with pid began, in a platform-specific
+// unit that is only compared for equality. It reports false where the platform
+// cannot say. It is a variable so a test can stand in for a recycled pid.
+var processStart = platformProcessStart
+
+// daemonGone reports whether the daemon that had process id pid, and began at
+// began when beganKnown, has exited: no process has the id, or an unrelated
+// process has taken it over.
+func daemonGone(pid int, began uint64, beganKnown bool) bool {
+	if processExited(pid) {
+		return true
+	}
+	if !beganKnown {
+		return false
+	}
+	now, ok := processStart(pid)
+	return ok && now != began
 }
 
 // daemonPID names the process serving socketPath, or 0 when it cannot.

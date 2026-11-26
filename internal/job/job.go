@@ -288,9 +288,10 @@ var ErrConflict = errors.New("job state conflict")
 var ErrInvalidReviewInput = errors.New("invalid review input")
 
 // ErrLeaseLost marks a processor context canceled because its lease moved on
-// while it was still working: another worker holds the job now. Unlike an
-// ordinary cancellation it tells WithoutCancel cleanup paths to stand down
-// rather than settle the attempt against the winner's job.
+// while it was still working: another worker holds the job now, or the job was
+// cancelled out from under it. Unlike an ordinary cancellation it tells
+// WithoutCancel cleanup paths to stand down rather than settle the attempt
+// against the winner's job.
 var ErrLeaseLost = errors.New("job lease lost")
 
 // ErrHumanActionNotFound reports a human action id that names no row. It is a
@@ -488,6 +489,10 @@ type Store struct {
 	// never hand a held job to another owner regardless of lease text.
 	heldMu sync.Mutex
 	held   map[string]string
+
+	// cancelHooks holds the in-process subscribers to a job's move to
+	// cancelled. See OnCancelled.
+	cancelHooks cancelHooks
 }
 
 type oldestListCursor struct {
@@ -1227,6 +1232,9 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 	if releaseLease && txOwner.Valid {
 		js.unholdJobIfHolder(jobID, txOwner.String)
 	}
+	if to == StateCancelled {
+		js.notifyCancelled(jobID)
+	}
 	return nil
 }
 
@@ -1883,21 +1891,29 @@ func (js *Store) Heartbeat(ctx context.Context, jobID, owner string, lease time.
 	// A processor's final transition releases its lease. A heartbeat already
 	// in flight may observe that committed state before processLease cancels its
 	// ticker; treating that completion race as lost ownership makes clean
-	// scheduler shutdown fail nondeterministically.
+	// scheduler shutdown fail nondeterministically, and a processor may keep
+	// working after its own terminal or parked transition (auto-import, ready
+	// hook), so those states stay a normal completion.
 	var state string
 	if err := js.S.DB().QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state); err != nil {
 		return err
 	}
-	if releasesLease(state) {
+	// Cancelled is the exception: a processor never cancels its own job, so a
+	// cancelled job whose lease is gone was cancelled from outside while this
+	// holder was still working. That is a lost lease, and the holder must stop
+	// at the cancellation boundary instead of finishing provider, filesystem
+	// and publication work for a job the user already ended.
+	if state != StateCancelled && releasesLease(state) {
 		js.unholdLease(jobID, owner)
 		return nil
 	}
-	// The lease moved on (a wall-clock jump let another worker steal it, or
-	// recovery rewound it). This process no longer holds the job, so forget
-	// the local hold; the scheduler abandons the attempt quietly instead of
-	// treating a lost lease as a daemon-fatal error.
+	// The lease moved on (a wall-clock jump let another worker steal it,
+	// recovery rewound it, or the job was cancelled). This process no longer
+	// holds the job, so forget the local hold; the scheduler abandons the
+	// attempt quietly instead of treating a lost lease as a daemon-fatal
+	// error.
 	js.unholdLease(jobID, owner)
-	return fmt.Errorf("%w: lease on %s not held by %s", ErrConflict, jobID, owner)
+	return fmt.Errorf("%w: lease on %s not held by %s (job state %s)", ErrConflict, jobID, owner, state)
 }
 
 // Release drops a lease without changing state (job becomes claimable).
@@ -3572,6 +3588,9 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	if txOwner.Valid {
 		js.unholdJobIfHolder(action.JobID, txOwner.String)
 	}
+	if to == StateCancelled {
+		js.notifyCancelled(action.JobID)
+	}
 	return ReviewResolution{Outcome: ReviewApplied, JobID: action.JobID, State: to}, nil
 }
 
@@ -4347,7 +4366,20 @@ func (js *Store) RecheckOrigin(ctx context.Context, jobID string) (string, error
 	return detail.RecheckOf, nil
 }
 
-// Events returns a job's event stream in order.
+// legacyUndecodableDetailKind is the one event kind whose stored detail may
+// legitimately fail to decode: job.created details written before they were
+// real JSON carry Go %q escapes (see RecheckOrigin). No guard reads that
+// detail back through Events, so the damage is cosmetic and bounded to a row
+// that cannot be repaired.
+const legacyUndecodableDetailKind = "job.created"
+
+// Events returns a job's event stream in order. A row whose detail_json does
+// not decode is durable-state corruption, so Events fails with the job id and
+// sequence instead of yielding a nil detail. A nil detail reads exactly like an
+// event that never carried one, and the guards that match on detail (retry
+// caps, decision budgets, permit ids) would then count the event as absent and
+// authorize work its record forbids. Only legacyUndecodableDetailKind is
+// exempt.
 func (js *Store) Events(ctx context.Context, jobID string) ([]map[string]any, error) {
 	rows, err := js.S.DB().QueryContext(ctx,
 		`SELECT seq, at, kind, detail_json FROM events WHERE job_id = ? ORDER BY seq ASC`, jobID)
@@ -4364,7 +4396,13 @@ func (js *Store) Events(ctx context.Context, jobID string) ([]map[string]any, er
 			return nil, err
 		}
 		var d map[string]any
-		_ = json.Unmarshal([]byte(detail), &d)
+		if err := json.Unmarshal([]byte(detail), &d); err != nil {
+			if kind != legacyUndecodableDetailKind {
+				_ = rows.Close()
+				return nil, fmt.Errorf("job %s event %d (%s): corrupt detail_json: %w", jobID, seq, kind, err)
+			}
+			d = nil
+		}
 		out = append(out, map[string]any{"seq": seq, "at": at, "kind": kind, "detail": d})
 	}
 	if err := rows.Close(); err != nil {

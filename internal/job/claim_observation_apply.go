@@ -214,6 +214,19 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	// side reporting why.
 	switch in.EventKind {
 	case "wall_observed", "login_started", "mfa", "challenge":
+		// These four exist to renew a RESERVED lease (§2.2.1). Once
+		// auth_returned has promoted the entry to a human lease, a late
+		// wall/login/mfa/challenge has nothing to renew: a bound human lease
+		// has no deadline, and the entry is never reopened. The refusal below
+		// is the deliberate disposition for a challenge in either interval
+		// after promotion (before or after entitled_landing), pinned by
+		// TestChallengeAfterAuthReturnedIsRejectedAndInert and, for the
+		// post-landing case, TestChallengeAfterEntitledLandingIsRejectedAndInert
+		// in internal/browser. The browser reports the same challenge through
+		// its own challenge_blocked error frame, and the journal is read only
+		// for ordering and owner_closed, so accepting a journal-only row would
+		// record nothing any reader uses. Contrast auth_returned, which has a
+		// late path because it carries evidence the follow-up paths read.
 		if !leaseFound || lease.State != AuthenticationEntryLeaseReserved ||
 			lease.OwnerID != ownerJobID {
 			return fail("rejected", "no live reserved entry for this owner")

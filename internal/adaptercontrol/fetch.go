@@ -80,9 +80,11 @@ type Runner struct {
 }
 
 // RunDue performs one fetch when the last attempt is older than the cadence.
-// Every outcome is recorded in the status file and none is an error: an
-// unreachable or unverifiable endpoint is a status, never a daemon failure,
-// and never relaxes state already held.
+// No outcome is an error: an unreachable or unverifiable endpoint is a status,
+// never a daemon failure, and never relaxes state already held. The outcome is
+// recorded in the status file on a best-effort basis. A status that cannot be
+// written does not fail the pass; the next pass decides from the last status
+// it can read whether a fetch is due, and finding none recent, fetches again.
 func (r *Runner) RunDue(ctx context.Context) error {
 	if r == nil || r.Service == nil || !r.Service.HasKey() {
 		return nil
@@ -97,7 +99,9 @@ func (r *Runner) RunDue(ctx context.Context) error {
 	}
 	current := now().UTC()
 	status := r.Service.Status()
-	if r.Service.Snapshot().State == StateUnavailable || status.LastOutcome == OutcomeFetchFailed {
+	if r.Service.Snapshot().State == StateUnavailable || status.LastOutcome == OutcomeFetchFailed || status.LastOutcome == OutcomePersistFailed {
+		// A control that could not be persisted is not held, so it retries on
+		// the recovery cadence rather than waiting a day.
 		every = min(every, retryEvery)
 	}
 	// A future timestamp (clock rollback, restored data directory) is not recent.

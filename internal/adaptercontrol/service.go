@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"papio/internal/config"
 	"papio/internal/protocol"
 )
 
@@ -150,7 +151,11 @@ type Applied struct {
 // persists it before it becomes canonical. A lower sequence is a replay, and a
 // different document at the held sequence is a conflict; both are refused. A
 // service in StateUnavailable accepts any verified document, which is how a
-// corrupt copy is repaired.
+// corrupt copy is repaired. A document that cannot be made durable, including
+// one whose rename could not be flushed to its directory, is not published:
+// the held control stays as it was, the file on disk goes back to the copy it
+// replaced so that a restart cannot load the refused document, and the error
+// says why.
 func (s *Service) Apply(envelope []byte) (Applied, error) {
 	verified, err := Verify(envelope, s.key)
 	if err != nil {
@@ -169,8 +174,23 @@ func (s *Service) Apply(envelope []byte) (Applied, error) {
 			return Applied{Verified: verified}, fmt.Errorf("%w: sequence %d", ErrSequenceConflict, held)
 		}
 	}
-	if err := writeFileAtomic(s.documentPath(), verified.Envelope); err != nil {
-		return Applied{Verified: verified}, fmt.Errorf("persisting adapter control: %w", err)
+	path := s.documentPath()
+	// The copy being replaced, kept so a replacement that cannot be made
+	// durable can be undone. If it exists but cannot be read, nothing could
+	// restore it, so the replacement does not start: the file stays as it is.
+	previous, readErr := os.ReadFile(path)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return Applied{Verified: verified}, fmt.Errorf("persisting adapter control: the control file being replaced cannot be read, so it could not be restored: %w", readErr)
+	}
+	hadPrevious := readErr == nil
+	if err := writeFileAtomic(path, verified.Envelope); err != nil {
+		err = fmt.Errorf("persisting adapter control: %w", err)
+		if errors.Is(err, errNotFlushed) {
+			if undoErr := undoReplacement(path, previous, hadPrevious); undoErr != nil {
+				err = fmt.Errorf("%w; restoring the control held before: %w", err, undoErr)
+			}
+		}
+		return Applied{Verified: verified}, err
 	}
 	s.snapshot, s.raw = snapshotOf(verified), verified.Envelope
 	return Applied{Changed: true, Verified: verified}, nil
@@ -186,8 +206,19 @@ func (s *Service) heldPayload() []byte {
 
 func (s *Service) documentPath() string { return filepath.Join(s.dir, DocumentFileName) }
 
+// syncDir flushes a directory's entries to stable storage. It is a variable so
+// a test can inject the failure; config.SyncDir is the repository's one
+// implementation, a no-op on Windows where NTFS journals a rename.
+var syncDir = config.SyncDir
+
+// errNotFlushed marks a replacement whose new file is already at its path but
+// whose directory entry could not be flushed, so a crash may keep either copy.
+var errNotFlushed = errors.New("directory entry not flushed")
+
 // writeFileAtomic replaces path with data, mode 0600, through a synced
-// temporary file in the same directory.
+// temporary file in the same directory, then flushes the directory so the
+// rename survives power loss. A directory flush error is returned wrapping
+// errNotFlushed: the new file is in place, but it is not known to be durable.
 func writeFileAtomic(path string, data []byte) error {
 	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -215,9 +246,26 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(name)
 		return err
 	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("%w: syncing %s: %w", errNotFlushed, filepath.Dir(path), err)
+	}
+	return nil
+}
+
+// undoReplacement puts back what a replacement of path overwrote: previous,
+// read before the replacement when hadPrevious, or no file at all when there
+// was none. Without it the refused document would stay at the path the next
+// Open trusts, and a flush that later succeeds would make a document the
+// daemon never accepted the one a restart loads.
+func undoReplacement(path string, previous []byte, hadPrevious bool) error {
+	if hadPrevious {
+		return writeFileAtomic(path, previous)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("%w: syncing %s: %w", errNotFlushed, filepath.Dir(path), err)
 	}
 	return nil
 }

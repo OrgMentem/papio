@@ -29,6 +29,10 @@ const (
 	// upgradingDaemonHoldEnv names the phase the daemon stops in:
 	// "upgrading" (the default) or "checking".
 	upgradingDaemonHoldEnv = "PAPIO_TEST_UPGRADING_DAEMON_HOLD"
+	// upgradingDaemonStatusEnv set to "unwritable" makes every status write
+	// after the claim's first fail, as a status file that cannot be replaced
+	// does.
+	upgradingDaemonStatusEnv = "PAPIO_TEST_UPGRADING_DAEMON_STATUS"
 )
 
 func TestMain(m *testing.M) {
@@ -55,6 +59,10 @@ func upgradingDaemon(socket, dataDir string) int {
 		return 3
 	}
 	defer instance.Release()
+	if os.Getenv(upgradingDaemonStatusEnv) == "unwritable" {
+		writeStatusFile = func(string, Status) error { return errors.New("status file is not writable") }
+		storeWorkStatusWait = 20 * time.Millisecond
+	}
 	hold := os.Getenv(upgradingDaemonHoldEnv)
 	if hold == "" {
 		hold = "upgrading"
@@ -123,6 +131,8 @@ type upgradeFixture struct {
 	hold string
 	// afterHold, when set, runs in Start once the daemon has reached hold.
 	afterHold func()
+	// statusUnwritable makes launched daemons fail to record any phase.
+	statusUnwritable bool
 
 	mu       sync.Mutex
 	launched []*exec.Cmd
@@ -182,6 +192,9 @@ func (f *upgradeFixture) starter(onWait func(Status)) *Autostarter {
 		Command: func(name string, _ ...string) *exec.Cmd {
 			cmd := exec.Command(name)
 			cmd.Env = append(os.Environ(), upgradingDaemonSocketEnv+"="+f.socket, upgradingDaemonDataEnv+"="+f.dataDir, upgradingDaemonHoldEnv+"="+f.hold)
+			if f.statusUnwritable {
+				cmd.Env = append(cmd.Env, upgradingDaemonStatusEnv+"=unwritable")
+			}
 			f.mu.Lock()
 			f.launched = append(f.launched, cmd)
 			f.mu.Unlock()
@@ -477,5 +490,31 @@ func TestStarterSaysWhenItWaitsForTheIntegrityCheck(t *testing.T) {
 	f.release()
 	if err := <-done; err != nil {
 		t.Fatalf("EnsureWithResult after the check: %v\ndaemon output:\n%s", err, f.output())
+	}
+}
+
+// TestStarterDoesNotStopAnUpgradeWhoseStatusCannotBeWritten covers
+// papio-fd19e264bf0e5382: a daemon that is migrating but cannot record it
+// used to leave "starting" in its status file, so the command that launched it
+// terminated it at the start deadline and the next start began the migration
+// again. The daemon now clears the stale status, and a command treats a claim
+// with no readable status as possible store work.
+func TestStarterDoesNotStopAnUpgradeWhoseStatusCannotBeWritten(t *testing.T) {
+	f := newUpgradeFixture(t)
+	f.statusUnwritable = true
+	starter := f.starter(nil)
+	// The start deadline has passed by the time Start returns, so only
+	// MaxWait ends this wait.
+	starter.MaxWait = 300 * time.Millisecond
+	_, err := starter.EnsureWithResult(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "still starting") {
+		t.Fatalf("EnsureWithResult error = %v, want the daemon still starting after MaxWait\ndaemon output:\n%s", err, f.output())
+	}
+	launched := f.launches()
+	if len(launched) != 1 || isProcessGone(t, launched[0]) {
+		t.Fatalf("launched %d daemons, and the migrating one must still be running\ndaemon output:\n%s", len(launched), f.output())
+	}
+	if status, held := ReadInstance(f.dataDir); !held || status.Phase == PhaseStarting {
+		t.Fatalf("instance = %+v held %v, want the daemon holding its claim without a stale starting status", status, held)
 	}
 }

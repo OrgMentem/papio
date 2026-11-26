@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -57,12 +58,20 @@ func legacyDaemon(socket string) int {
 	return 0
 }
 
-// TestStopWaitsForALegacyDaemonToExit covers the first deploy of a binary
-// with the instance claim: the running daemon is older and holds no claim,
-// and it closes its socket before it finishes its work in the store. Stop
-// must wait for that process to exit, and no command may start a new daemon
-// on the same store until it has.
-func TestStopWaitsForALegacyDaemonToExit(t *testing.T) {
+// runningLegacyDaemon is a launched legacyDaemon and the way to talk to it.
+type runningLegacyDaemon struct {
+	socket  string
+	cmd     *exec.Cmd
+	control io.Writer
+	// exited closes once the process is reaped.
+	exited chan struct{}
+	// expect reads one line the daemon printed and checks it.
+	expect func(want string) error
+}
+
+// startLegacyDaemon launches a legacyDaemon and waits until it listens.
+func startLegacyDaemon(t *testing.T) *runningLegacyDaemon {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "papio-stop-")
 	if err != nil {
 		t.Fatal(err)
@@ -111,6 +120,55 @@ func TestStopWaitsForALegacyDaemonToExit(t *testing.T) {
 	if err := expect("listening"); err != nil {
 		t.Fatal(err)
 	}
+	return &runningLegacyDaemon{socket: socket, cmd: legacy, control: control, exited: exited, expect: expect}
+}
+
+// TestStopDoesNotWaitOutARecycledPID covers papio-1080d03291b50f9b: once the
+// daemon exits the system may give its pid to an unrelated process, and a stop
+// that waits on the pid alone then fails after a stop that worked. The legacy
+// daemon stays alive here to stand for that unrelated process, and the start
+// time StopDaemon reads for its pid changes once the daemon has been asked to
+// stop.
+func TestStopDoesNotWaitOutARecycledPID(t *testing.T) {
+	daemon := startLegacyDaemon(t)
+	original, originalWait := processStart, stopExitWait
+	t.Cleanup(func() { processStart, stopExitWait = original, originalWait })
+	// Without the start time the wait would run to this bound and fail.
+	stopExitWait = 2 * time.Second
+	var reads atomic.Int32
+	processStart = func(pid int) (uint64, bool) {
+		if pid != daemon.cmd.Process.Pid {
+			return original(pid)
+		}
+		if reads.Add(1) == 1 {
+			return 1, true
+		}
+		return 2, true
+	}
+	err := StopDaemon(context.Background(), daemon.socket, func(context.Context) error {
+		if _, err := daemon.control.Write([]byte("stop\n")); err != nil {
+			return err
+		}
+		return daemon.expect("stopping")
+	}, nil)
+	if err != nil {
+		t.Fatalf("StopDaemon = %v; want nil: the daemon's pid belongs to another process now", err)
+	}
+	select {
+	case <-daemon.exited:
+		t.Fatal("the stand-in process exited; the test no longer models a live process on a recycled pid")
+	default:
+	}
+}
+
+// TestStopWaitsForALegacyDaemonToExit covers the first deploy of a binary
+// with the instance claim: the running daemon is older and holds no claim,
+// and it closes its socket before it finishes its work in the store. Stop
+// must wait for that process to exit, and no command may start a new daemon
+// on the same store until it has.
+func TestStopWaitsForALegacyDaemonToExit(t *testing.T) {
+	daemon := startLegacyDaemon(t)
+	socket, legacy, control, exited, expect := daemon.socket, daemon.cmd, daemon.control, daemon.exited, daemon.expect
 
 	waiting := make(chan int, 1)
 	stopped := make(chan error, 1)

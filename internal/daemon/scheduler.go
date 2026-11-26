@@ -199,6 +199,25 @@ type Scheduler struct {
 
 	maintenanceMu  sync.Mutex
 	maintenanceErr map[string]error
+
+	// active holds the processors running now, by job ID, so a cancellation
+	// committed in this process can stop them at once. A job can have more
+	// than one: a worker may park a job and keep working on its tail while
+	// another worker claims the job once it resumes.
+	activeMu sync.Mutex
+	active   map[string]map[*activeProcessor]struct{}
+}
+
+// activeProcessor is one running processor's way to be stopped. It is a
+// pointer so that a finished processor removes only its own entry, not that of
+// another worker running the same job.
+type activeProcessor struct{ cancel context.CancelCauseFunc }
+
+// cancelNotifier is implemented by a LeaseStore that reports, in this process,
+// each job it commits as cancelled. job.Store does. A store without it leaves
+// the lease heartbeat as the only way a processor learns of a cancellation.
+type cancelNotifier interface {
+	OnCancelled(hook func(jobID string)) (unsubscribe func())
 }
 
 // NewScheduler validates configuration and returns a scheduler ready for Run.
@@ -266,6 +285,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// queued work recovery remains available if cleanup is temporarily blocked.
 	_ = s.Store.CloseStaleHumanActions(ctx)
 	s.sweepTerminalQuarantine(ctx)
+	if notifier, ok := s.Store.(cancelNotifier); ok {
+		unsubscribe := notifier.OnCancelled(s.stopCancelled)
+		defer unsubscribe()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	maintenanceDone := make(chan struct{})
@@ -543,7 +566,8 @@ func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string
 						return
 					}
 					if errors.Is(err, job.ErrConflict) {
-						// The lease moved on: mark the cause so WithoutCancel
+						// The lease moved on, or the job was cancelled out from
+						// under the processor: mark the cause so WithoutCancel
 						// cleanup paths in the processor stand down instead
 						// of settling against the winner's job.
 						cancelCause(job.ErrLeaseLost)
@@ -560,22 +584,30 @@ func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string
 		}
 	}()
 
+	entry := s.startActive(row.ID, cancelCause)
 	processErr := s.Processor.Process(jobCtx, row)
+	s.finishActive(row.ID, entry)
+	// A processor stopped because its lease was lost, by a heartbeat or by a
+	// cancellation committed here, abandons its attempt quietly below.
+	leaseLost := errors.Is(context.Cause(jobCtx), job.ErrLeaseLost)
 	cancelCause(nil)
 	<-stopped
 	select {
 	case err := <-heartbeatErr:
 		// A lost lease is not a daemon failure: after a wall-clock jump the
 		// lease text can expire under a live holder and another local
-		// worker takes the job. The loser abandons its attempt quietly so
-		// the winner runs it once; anything else (a dead store) still
-		// stops the daemon.
+		// worker takes the job, or a user cancels the job while it runs.
+		// The loser abandons its attempt quietly so the winner runs it
+		// once; anything else (a dead store) still stops the daemon.
 		if errors.Is(err, job.ErrConflict) {
 			processErr = nil
 		} else if processErr == nil || (errors.Is(processErr, context.Canceled) && ctx.Err() == nil) {
 			processErr = fmt.Errorf("heartbeat job %s: %w", row.ID, err)
 		}
 	default:
+	}
+	if leaseLost {
+		processErr = nil
 	}
 	if ctx.Err() == nil {
 		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
@@ -586,6 +618,48 @@ func (s *Scheduler) processLease(ctx context.Context, row *job.Row, owner string
 		}
 	}
 	return processErr
+}
+
+// startActive records that the processor for jobID can now be stopped by
+// cancel, and returns the entry finishActive removes.
+func (s *Scheduler) startActive(jobID string, cancel context.CancelCauseFunc) *activeProcessor {
+	entry := &activeProcessor{cancel: cancel}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.active == nil {
+		s.active = make(map[string]map[*activeProcessor]struct{})
+	}
+	if s.active[jobID] == nil {
+		s.active[jobID] = make(map[*activeProcessor]struct{})
+	}
+	s.active[jobID][entry] = struct{}{}
+	return entry
+}
+
+// finishActive removes entry, and no other processor of the same job.
+func (s *Scheduler) finishActive(jobID string, entry *activeProcessor) {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	delete(s.active[jobID], entry)
+	if len(s.active[jobID]) == 0 {
+		delete(s.active, jobID)
+	}
+}
+
+// stopCancelled stops every processor this scheduler runs for jobID with the
+// lost-lease cause: the job was cancelled out from under them, exactly as the
+// lease heartbeat reports it, only without waiting for the next tick. It runs
+// on the cancelling goroutine and only signals.
+func (s *Scheduler) stopCancelled(jobID string) {
+	s.activeMu.Lock()
+	entries := make([]*activeProcessor, 0, len(s.active[jobID]))
+	for entry := range s.active[jobID] {
+		entries = append(entries, entry)
+	}
+	s.activeMu.Unlock()
+	for _, entry := range entries {
+		entry.cancel(job.ErrLeaseLost)
+	}
 }
 
 func waitContext(ctx context.Context, d time.Duration) error {

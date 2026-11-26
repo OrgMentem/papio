@@ -180,15 +180,42 @@ func AcquireInstance(dataDir, socketPath string) (*Instance, error) {
 
 // SetPhase records that the daemon has reached phase. A phase at or before
 // the recorded one is ignored, because a daemon only moves forward: a store
-// opened again while the daemon serves must not report it as checking.
+// opened again while the daemon serves must not report it as checking. A
+// failure to record is logged and the daemon carries on; use BeginStoreWork
+// for a phase whose record the daemon must not start without.
 func (i *Instance) SetPhase(phase Phase) {
-	i.advance(Status{Phase: phase})
+	i.advanceLogged(Status{Phase: phase})
+}
+
+// advanceLogged is advance for the callers that cannot act on its error.
+func (i *Instance) advanceLogged(next Status) {
+	if err := i.advance(next); err != nil {
+		// #nosec G706 -- the error names this package's constants and the
+		// daemon's own status file.
+		log.Printf("papio: %v", err)
+	}
+}
+
+// BeginStoreWork records that the daemon is about to start phase, a startup
+// step that runs as long as the keychain or the database needs, and refuses to
+// go on when it cannot. A command that launched the daemon stops it at its
+// start deadline while its status still says "starting", so a daemon that
+// cannot tell waiting commands that it is busy must not begin the work: the
+// error is the daemon's reason to exit before it does.
+func (i *Instance) BeginStoreWork(phase Phase) error {
+	if !phase.storeWork() {
+		return fmt.Errorf("daemon phase %s is not store work", phase)
+	}
+	return i.advance(Status{Phase: phase})
 }
 
 // StoreTrace reports the slow steps of the daemon's store open as its phase.
+// BeginStoreWork has already announced store work before the store opens, so
+// a step that cannot be recorded here only leaves the earlier phase, still
+// store work, in the status.
 func (i *Instance) StoreTrace() *store.OpenTrace {
 	return &store.OpenTrace{
-		Migrating: func(from, _ int) { i.advance(Status{Phase: PhaseUpgrading, FromSchema: from}) },
+		Migrating: func(from, _ int) { i.advanceLogged(Status{Phase: PhaseUpgrading, FromSchema: from}) },
 		Checking:  func() { i.SetPhase(PhaseChecking) },
 	}
 }
@@ -209,26 +236,82 @@ func (i *Instance) Release() {
 	_ = i.lock.Close()
 }
 
-func (i *Instance) advance(next Status) {
+func (i *Instance) advance(next Status) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.released || phaseOrder[next.Phase] <= phaseOrder[i.status.Phase] {
-		return
+		return nil
 	}
 	next.PID, next.Socket = i.status.PID, i.status.Socket
+	if next.Phase.storeWork() {
+		// A phase that could not be announced is not entered.
+		if err := i.recordStoreWork(next); err != nil {
+			return err
+		}
+		i.status = next
+		return nil
+	}
 	i.status = next
 	i.record()
+	return nil
 }
 
 // record writes the status file. The status only tells waiting commands what
 // they wait for, and the lock is the claim, so a failed write is logged and
 // the daemon carries on.
 func (i *Instance) record() {
-	if err := writeStatus(i.statusPath, i.status); err != nil {
+	if err := writeStatusFile(i.statusPath, i.status); err != nil {
 		// #nosec G706 -- the phase is one of this package's constants and the
 		// error names this daemon's own status file.
 		log.Printf("papio: recording daemon phase %s: %v", i.status.Phase, err)
 	}
+}
+
+// The file operations record and recordStoreWork make on the status file. A
+// test replaces them to make the status file unwritable or unremovable.
+var (
+	writeStatusFile  = writeStatus
+	removeStatusFile = os.Remove
+)
+
+// How long recordStoreWork keeps trying, and how long it waits between tries.
+// The wait stays well under Autostarter's start deadline, which no store work
+// may be running when it passes unannounced.
+var (
+	storeWorkStatusWait  = time.Second
+	storeWorkStatusRetry = 10 * time.Millisecond
+)
+
+// recordStoreWork writes the store-work status before that work starts. A
+// command that launched this daemon stops it at its start deadline while the
+// status still says "starting", so a status that misses a migration or a
+// keychain read would get the daemon killed part way through the work. A
+// failed write is therefore retried, and one that stays failed removes the
+// stale status: a waiting command treats a claim with no readable status as
+// possible store work and leaves the daemon running, where a leftover
+// "starting" would not stop it. When the status can be neither replaced nor
+// removed the error says so, and the daemon must not begin the work.
+func (i *Instance) recordStoreWork(next Status) error {
+	deadline := time.Now().Add(storeWorkStatusWait)
+	var writeErr error
+	for {
+		if writeErr = writeStatusFile(i.statusPath, next); writeErr == nil {
+			return nil
+		}
+		if !time.Now().Add(storeWorkStatusRetry).Before(deadline) {
+			break
+		}
+		time.Sleep(storeWorkStatusRetry)
+	}
+	// #nosec G706 -- the phase is one of this package's constants and the
+	// error names this daemon's own status file.
+	log.Printf("papio: recording daemon phase %s: %v; clearing the stale status", next.Phase, writeErr)
+	// #nosec G703 -- statusPath is in the data directory AcquireInstance was
+	// given, as the lock file is.
+	if err := removeStatusFile(i.statusPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("daemon phase %s cannot be recorded (%w) or its stale status cleared (%v); waiting commands could not tell it from a hung start", next.Phase, writeErr, err)
+	}
+	return nil
 }
 
 // writeStatus replaces the status file whole, so a reader never sees half of

@@ -128,6 +128,56 @@ func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
 	}
 }
 
+// An idle child is one that reports no store work. Both wait-ending paths other
+// than the start deadline must still stop it, or a command that gave up leaves
+// a hung daemon behind (papio-c7c5e6cec44985f6).
+
+func TestAutostarterTerminatesIdleChildWhenCallerCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The first probe precedes the launch; the one after it cancels the
+	// caller, so abandon sees a live child that has recorded nothing.
+	ready := func(cmd *exec.Cmd) error {
+		if cmd != nil {
+			cancel()
+		}
+		return errors.New("not ready")
+	}
+	starter, command := autostarterFixture(t, []string{"sleep", "30"}, 0, ready)
+	starter.StartTimeout = time.Hour
+	_, err := starter.EnsureWithResult(ctx)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait for daemon socket") {
+		t.Fatalf("EnsureWithResult error = %v, want a wait for daemon socket error wrapping context.Canceled", err)
+	}
+	launched := command()
+	if launched == nil || launched.Process == nil {
+		t.Fatal("no process was launched")
+	}
+	if !isProcessGone(t, launched) {
+		_ = syscall.Kill(-launched.Process.Pid, syscall.SIGKILL)
+		t.Fatalf("idle daemon pid %d is still running after its caller gave up", launched.Process.Pid)
+	}
+}
+
+func TestAutostarterTerminatesIdleChildWhenMaxWaitPasses(t *testing.T) {
+	starter, command := autostarterFixture(t, []string{"sleep", "30"}, 0, neverReady)
+	// Only MaxWait may end this wait.
+	starter.StartTimeout = time.Hour
+	starter.MaxWait = 150 * time.Millisecond
+	_, err := starter.EnsureWithResult(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "did not become ready within 150ms") {
+		t.Fatalf("EnsureWithResult error = %v, want the daemon did not become ready within MaxWait", err)
+	}
+	launched := command()
+	if launched == nil || launched.Process == nil {
+		t.Fatal("no process was launched")
+	}
+	if !isProcessGone(t, launched) {
+		_ = syscall.Kill(-launched.Process.Pid, syscall.SIGKILL)
+		t.Fatalf("idle daemon pid %d is still running after MaxWait", launched.Process.Pid)
+	}
+}
+
 func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
 	ready := func(cmd *exec.Cmd) error {
 		if cmd == nil || cmd.Process == nil {

@@ -34,7 +34,9 @@ type Autostarter struct {
 	// StartTimeout is how long a daemon this call started may take to reach
 	// its socket before it is treated as hung and terminated. A daemon that
 	// reports it is upgrading or checking its database is never terminated:
-	// that work takes as long as the database needs.
+	// that work takes as long as the database needs. Neither is one that
+	// holds the instance claim with no readable status, which cannot be
+	// told from one doing that work.
 	StartTimeout time.Duration
 	// MaxWait bounds the whole call: waiting for another command that is
 	// starting the daemon, and for a daemon that is upgrading its database or
@@ -252,13 +254,16 @@ func (w *startWait) worthAnnouncing(phase Phase) bool {
 }
 
 // recheckStoreWork reads the instance again just before this call would
-// terminate child, and reports whether child has begun store work since the
-// wait loop last looked. Without it a daemon that recorded "upgrading" a
-// moment after the last read would be stopped part way through a migration.
+// terminate child, and reports whether child may be doing store work: it has
+// begun it since the wait loop last looked, or its status cannot be read at
+// all. Without the first, a daemon that recorded "upgrading" a moment after
+// the last read would be stopped part way through a migration; without the
+// second, so would one whose status file could not be written, which the
+// daemon clears rather than leave saying "starting".
 func (w *startWait) recheckStoreWork(child *daemonChild) bool {
 	status, held := ReadInstance(w.cfg.DataDir)
 	child.noteStoreWork(status, held)
-	return child.busy
+	return child.busy || (held && status.PID == 0)
 }
 
 // pause waits one retry interval, unless the caller's context ends or MaxWait

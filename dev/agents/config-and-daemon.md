@@ -107,7 +107,10 @@ Read this reference before work in this area. Paths in code spans and commands a
   `--socket` for a claimed directory exits without opening the database. Autostart
   (`internal/daemon/autostart.go`) never launches a daemon while the lock is held,
   terminates its own child at `StartTimeout` only while the child still reports
-  `starting` (it re-reads the phase right before any signal), and gives up on an
+  `starting` (it re-reads the phase right before any signal; a claim held with no
+  readable status counts as store work, and a daemon that cannot write a
+  store-work phase retries, then deletes the stale status instead of leaving
+  `starting` behind, and exits before reading credentials if it can do neither), and gives up on an
   `upgrading`/`checking` daemon after `MaxWait` (10 min) without stopping it. This
   replaced a 5 s socket deadline that SIGTERMed the daemon partway through migration
   0056 (~600k timestamps, 20-30 s); the migration rolled back and the next starter,
@@ -115,7 +118,8 @@ Read this reference before work in this area. Paths in code spans and commands a
   scratch. A daemon from before the claim holds no lock, so `papio daemon stop`
   (`daemon.StopDaemon`) reads the serving pid from the socket's peer credentials,
   holds `papio.sock.start.lock` (which every autostart takes, old binaries too) and
-  returns only once that pid has exited, up to 2 min. Consequences: `daemon stop`
+  returns only once that pid has exited (or belongs to a process that began at
+  another time, so a recycled pid does not fail a successful stop), up to 2 min. Consequences: `daemon stop`
   no longer returns while the daemon drains; a daemon with no socket says what it is
   doing in `papio.daemon.json`; and `papio mcp`/`papio init`, which open the store
   in-process, do not take the lock.
