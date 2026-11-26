@@ -45,6 +45,10 @@ import (
 // daemon-initiated frames (job_offer, cancel) while stdin is idle.
 const pollInterval = 2 * time.Second
 
+// readerJoinGrace bounds how long run waits for its stdin reader to stop after
+// closing stdin. A variable so tests can shorten it.
+var readerJoinGrace = time.Second
+
 // syncMethod is the daemon RPC the bridge forwards browser frames through.
 const syncMethod = "browser.sync"
 
@@ -179,6 +183,12 @@ type Syncer interface {
 // Run is the papio-native-host entrypoint. It loads config, refuses a missing
 // or mismatched browser extension identity, ensures the daemon is running, and
 // relays frames between the browser and the daemon until stdin closes or ctx is cancelled.
+//
+// Run takes ownership of stdin: when the relay ends for any reason, including a
+// protocol error or cancellation while the browser is idle, it closes stdin if
+// it is an io.Closer so the blocked reader stops, and waits up to
+// readerJoinGrace for that reader. A stdin that cannot be woken by Close (a
+// blocking os.Stdin) is left to the process exit that follows Run.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (err error) {
 	// The host is entered by basename, so `papio-native-host --version` would
 	// otherwise be parsed as an extension origin and rejected. Chrome always
@@ -191,6 +201,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stdout, "papio "+api.Version)
 		return nil
 	}
+	// Fix this process's image identity before anything slow runs, so an
+	// install that swaps the host file afterwards cannot change which image
+	// the daemon-target record is validated against (Windows only).
+	pinRunningHost()
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -389,7 +403,10 @@ func (b *bridge) run(ctx context.Context) error {
 
 	frames := make(chan []byte)
 	readErr := make(chan error, 1)
+	stopReader := make(chan struct{})
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		for {
 			frame, err := readFrame(b.stdin)
 			if err != nil {
@@ -398,9 +415,26 @@ func (b *bridge) run(ctx context.Context) error {
 			}
 			select {
 			case frames <- frame:
-			case <-ctx.Done():
+			case <-stopReader:
 				return
 			}
+		}
+	}()
+	// Registered after the poll cleanup, so it runs first. Closing stdin is the
+	// only way to wake a Read blocked on a pipe, so the bridge owns it for the
+	// duration of run. Close runs in its own goroutine and the wait is bounded
+	// from the start: a Close that blocks, or a descriptor that ignores it (a
+	// blocking os.Stdin), cannot be woken, and the process is about to exit.
+	defer func() {
+		close(stopReader)
+		timer := time.NewTimer(readerJoinGrace)
+		defer timer.Stop()
+		if closer, ok := b.stdin.(io.Closer); ok {
+			go func() { _ = closer.Close() }()
+		}
+		select {
+		case <-readerDone:
+		case <-timer.C:
 		}
 	}()
 

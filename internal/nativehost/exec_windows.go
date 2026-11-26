@@ -5,6 +5,8 @@
 package nativehost
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -49,26 +51,35 @@ func InstallExecutable(realExe string) (string, error) {
 	}
 	defer unlock()
 
-	// Prepare the target before touching the installed image, and publish it
-	// atomically so an error cannot truncate the previous daemon target.
+	// Stage the host image first: the target record names its digest, so the
+	// record can only be written once the image bytes are known. Nothing
+	// installed is touched until both are staged.
+	staged, digest, err := stageExecutable(realExe, filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(staged) }()
 	target, err := os.CreateTemp(filepath.Dir(path), ".papio-native-host-target-*")
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = os.Remove(target.Name()) }()
-	if _, err := io.WriteString(target, realExe); err != nil {
+	if _, err := io.WriteString(target, formatTargetRecord(realExe, digest)); err != nil {
 		_ = target.Close()
 		return "", err
 	}
 	if err := target.Close(); err != nil {
 		return "", err
 	}
-	backup, err := copyExecutable(realExe, path)
+	backup, err := publishExecutable(staged, path)
 	if err != nil {
 		return "", err
 	}
-	// These are separate publications: a browser can launch the new image
-	// before its daemon target is updated.
+	// These are separate publications, so a crash or a browser launch between
+	// them sees a new image beside the old record. The record names the digest
+	// of the image it belongs to, and the host refuses a pair that disagrees
+	// (verifyHostPair), so that window fails closed instead of autostarting a
+	// daemon from the wrong install.
 	if err := os.Rename(target.Name(), targetPath()); err != nil {
 		return "", errors.Join(err, rollbackExecutable(path, backup))
 	}
@@ -92,30 +103,33 @@ func lockExecutableInstall(path string) (func(), error) {
 	return func() { _ = windows.CloseHandle(handle) }, nil
 }
 
-// copyExecutable stages a complete image, then publishes it at the fixed path.
-// The caller holds the install lock and keeps the returned backup until the
-// daemon target is also published. Running Windows images can be renamed aside
-// but cannot be overwritten or necessarily deleted until their process exits.
-func copyExecutable(src, dst string) (string, error) {
+// stageExecutable copies src into a complete private image in dir and returns
+// its path and SHA-256 digest. The caller holds the install lock, publishes the
+// image with publishExecutable, and keeps the returned backup until the daemon
+// target is also published. Running Windows images can be renamed aside but
+// cannot be overwritten or necessarily deleted until their process exits.
+func stageExecutable(src, dir string) (string, string, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".papio-native-host-*.exe")
+	tmp, err := os.CreateTemp(dir, ".papio-native-host-*.exe")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	if _, err := io.Copy(tmp, in); err != nil {
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hash), in); err != nil {
 		_ = tmp.Close()
-		return "", err
+		_ = os.Remove(name)
+		return "", "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return "", err
+		_ = os.Remove(name)
+		return "", "", err
 	}
-	return publishExecutable(name, dst)
+	return name, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 const executableBackupPrefix = ".papio-native-host-backup-"
@@ -220,15 +234,11 @@ func RemoveExecutable() ([]string, error) {
 	return removed, nil
 }
 
-// ExecTarget reports the recorded real executable and whether both it and the
-// host copy currently exist.
+// ExecTarget reports the recorded real executable and whether the host copy,
+// the target, and the record binding them to that host image all agree.
 func ExecTarget() (string, bool) {
-	data, err := os.ReadFile(targetPath())
+	target, err := installedPair()
 	if err != nil {
-		return "", false
-	}
-	target := strings.TrimSpace(string(data))
-	if _, err := os.Stat(ExecPath()); err != nil {
 		return target, false
 	}
 	// #nosec G703 -- target is the path native-host install recorded in this
@@ -239,16 +249,70 @@ func ExecTarget() (string, bool) {
 	return target, true
 }
 
+// ExecTargetProblem explains why a present host and record are refused as a
+// pair, or returns "" when they agree or either is simply absent. It lets
+// status say "reinstall" instead of reporting only a missing target.
+func ExecTargetProblem() string {
+	if _, err := installedPair(); errors.Is(err, errHostPairMismatch) {
+		return err.Error()
+	}
+	return ""
+}
+
+// installedPair returns the recorded daemon target when the record belongs to
+// the host image installed at ExecPath.
+func installedPair() (string, error) {
+	data, err := readFileShared(targetPath())
+	if err != nil {
+		return "", err
+	}
+	digest, err := digestFile(ExecPath())
+	if err != nil {
+		return "", err
+	}
+	return verifyHostPair(data, digest)
+}
+
+// pinRunningHost records the digest of this process's own image; the host calls
+// it first thing so a later install cannot change which image it validates.
+func pinRunningHost() {
+	if exe, err := os.Executable(); err == nil {
+		pinHostImage(exe)
+	}
+}
+
+// openShared opens path for reading with FILE_SHARE_DELETE. Go's os.Open omits
+// it on Windows, so a concurrent status or autostart hash would make the
+// installer's rename of the file fail with a sharing violation.
+func openShared(path string) (*os.File, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(handle), path), nil
+}
+
 // resolveDaemonExecutable returns the real papio binary recorded at install
-// time so the autostarted daemon is a distinct binary from the host copy.
+// time so the autostarted daemon is a distinct binary from the host copy. It
+// refuses a record that does not belong to the image this host started from.
 func resolveDaemonExecutable() (string, error) {
-	data, err := os.ReadFile(targetPath())
+	data, err := readFileShared(targetPath())
 	if err != nil {
 		return "", fmt.Errorf("read native-host daemon target (run papio native-host install): %w", err)
 	}
-	target := strings.TrimSpace(string(data))
-	if target == "" {
-		return "", fmt.Errorf("native-host daemon target is empty (run papio native-host install)")
+	digest, err := runningHostDigest(ExecPath())
+	if err != nil {
+		return "", fmt.Errorf("hash native-host image: %w", err)
+	}
+	target, err := verifyHostPair(data, digest)
+	if err != nil {
+		return "", fmt.Errorf("native-host daemon target: %w", err)
 	}
 	return resolveExecutablePath(target)
 }

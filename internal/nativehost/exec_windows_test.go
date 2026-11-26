@@ -23,6 +23,8 @@ import (
 func windowsExecDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	pinnedImage.Store(nil) // a host pin from an earlier test must not leak in
+	t.Cleanup(func() { pinnedImage.Store(nil) })
 	t.Setenv("PAPIO_CONFIG_DIR", dir)
 	if ExecPath() != filepath.Join(dir, "bin", "papio-native-host.exe") {
 		t.Fatalf("ExecPath() = %q, want fixed host path inside %q", ExecPath(), dir)
@@ -44,6 +46,78 @@ func assertWindowsExecBytes(t *testing.T, path, want string) {
 	got, err := os.ReadFile(path)
 	if err != nil || string(got) != want {
 		t.Fatalf("ReadFile(%q) = %q, %v; want %q", path, got, err, want)
+	}
+}
+
+// assertWindowsTargetRecord requires the daemon target record to name want.
+func assertWindowsTargetRecord(t *testing.T, want string) {
+	t.Helper()
+	data, err := os.ReadFile(targetPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := parseTargetRecord(data); err != nil || got != want {
+		t.Fatalf("target record = %q, %v; want %q", got, err, want)
+	}
+}
+
+// A crash after the new host image is published but before its record is
+// renamed must leave a pair the host refuses, not the old daemon target.
+func TestWindowsExecutableRefusesMixedPairAfterPartialInstall(t *testing.T) {
+	bin := windowsExecDir(t)
+	old := windowsExecSource(t, "old image")
+	if _, err := InstallExecutable(old); err != nil {
+		t.Fatal(err)
+	}
+	if target, ok := ExecTarget(); target != old || !ok {
+		t.Fatalf("ExecTarget() = %q, %v; want %q, true", target, ok, old)
+	}
+	staged, _, err := stageExecutable(windowsExecSource(t, "new image"), bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publishExecutable(staged, ExecPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ExecTarget(); ok {
+		t.Fatal("ExecTarget() accepted a new host image with the previous install's record")
+	}
+	if target, err := resolveDaemonExecutable(); !errors.Is(err, errHostPairMismatch) {
+		t.Fatalf("resolveDaemonExecutable() = %q, %v; want errHostPairMismatch", target, err)
+	}
+}
+
+// A running old host must keep validating against the image it started from:
+// an install that swaps the host file afterwards cannot make it accept the new
+// record.
+func TestWindowsRunningHostRefusesRecordAfterSwap(t *testing.T) {
+	windowsExecDir(t)
+	old := windowsExecSource(t, "old image")
+	if _, err := InstallExecutable(old); err != nil {
+		t.Fatal(err)
+	}
+	pinHostImage(ExecPath())
+	if _, err := InstallExecutable(windowsExecSource(t, "new image")); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := resolveDaemonExecutable(); !errors.Is(err, errHostPairMismatch) {
+		t.Fatalf("running old host resolved %q, %v after a swap; want errHostPairMismatch", target, err)
+	}
+	if problem := ExecTargetProblem(); problem != "" {
+		t.Fatalf("ExecTargetProblem() = %q for a consistent install", problem)
+	}
+}
+
+func TestWindowsExecTargetProblemNamesMixedPair(t *testing.T) {
+	windowsExecDir(t)
+	if _, err := InstallExecutable(windowsExecSource(t, "image")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath(), []byte(windowsExecSource(t, "legacy")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if problem := ExecTargetProblem(); !strings.Contains(problem, "native-host install") {
+		t.Fatalf("ExecTargetProblem() = %q; want a reinstall hint", problem)
 	}
 }
 
@@ -70,7 +144,7 @@ func TestWindowsExecutableInstallAndReplace(t *testing.T) {
 		}
 		assertWindowsExecBytes(t, path, contents)
 		assertWindowsExecBytes(t, source, contents)
-		assertWindowsExecBytes(t, targetPath(), source)
+		assertWindowsTargetRecord(t, source)
 		if target, ok := ExecTarget(); target != source || !ok {
 			t.Fatalf("ExecTarget() = %q, %v; want %q, true", target, ok, source)
 		}
@@ -110,7 +184,7 @@ func TestWindowsExecutableInstallErrorsPreserveExisting(t *testing.T) {
 			if path, err := InstallExecutable(source); path != "" || err == nil {
 				t.Fatalf("InstallExecutable() = %q, %v; want failure", path, err)
 			}
-			assertWindowsExecBytes(t, targetPath(), old)
+			assertWindowsTargetRecord(t, old)
 			if invalid != "directory destination" {
 				assertWindowsExecBytes(t, ExecPath(), "old image")
 			} else if info, err := os.Stat(ExecPath()); err != nil || !info.IsDir() {
@@ -158,7 +232,7 @@ func TestWindowsExecutableRollsBackTargetPublicationFailure(t *testing.T) {
 				if _, err := InstallExecutable(old); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.WriteFile(targetPath(), []byte(old), 0o600); err != nil {
+			} else if err := os.WriteFile(targetPath(), []byte(formatTargetRecord(old, "stale")), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			closeHandle := denyWindowsExecRename(t, targetPath())
@@ -172,7 +246,7 @@ func TestWindowsExecutableRollsBackTargetPublicationFailure(t *testing.T) {
 			if !errors.Is(renameErr, windows.ERROR_SHARING_VIOLATION) && !errors.Is(renameErr, windows.ERROR_ACCESS_DENIED) {
 				t.Fatalf("target publication error = %v; want a Windows locked-replacement error", renameErr)
 			}
-			assertWindowsExecBytes(t, targetPath(), old)
+			assertWindowsTargetRecord(t, old)
 			if existing {
 				assertWindowsExecBytes(t, ExecPath(), "old image")
 			} else if _, err := os.Stat(ExecPath()); !errors.Is(err, os.ErrNotExist) {
@@ -373,7 +447,7 @@ func TestWindowsExecutableReplacesRunningHost(t *testing.T) {
 	if _, err := InstallExecutable(newImage); err != nil {
 		t.Fatalf("upgrade with two running prior images: %v", err)
 	}
-	assertWindowsExecBytes(t, targetPath(), newImage)
+	assertWindowsTargetRecord(t, newImage)
 	finishNew()
 	finishOld()
 	if _, err := InstallExecutable(newImage); err != nil {
@@ -399,7 +473,7 @@ func TestWindowsExecutableInstallLockAcrossProcesses(t *testing.T) {
 		t.Fatalf("contending InstallExecutable() = %q, %v; want sharing error", path, err)
 	}
 	assertWindowsExecBytes(t, ExecPath(), "old image")
-	assertWindowsExecBytes(t, targetPath(), old)
+	assertWindowsTargetRecord(t, old)
 	finish()
 	if _, err := InstallExecutable(newImage); err != nil {
 		t.Fatalf("install after lock-owning process exited: %v", err)

@@ -249,6 +249,122 @@ func TestPollWriteFailureTerminatesRun(t *testing.T) {
 	}
 }
 
+// blockingStdin is a stdin whose Read blocks until Close, like an idle browser
+// pipe. returned records that the reader goroutine has left Read.
+type blockingStdin struct {
+	closed   chan struct{}
+	once     sync.Once
+	returned atomic.Bool
+}
+
+func newBlockingStdin() *blockingStdin { return &blockingStdin{closed: make(chan struct{})} }
+
+func (s *blockingStdin) Read([]byte) (int, error) {
+	<-s.closed
+	s.returned.Store(true)
+	return 0, io.ErrClosedPipe
+}
+
+func (s *blockingStdin) Close() error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+
+// stuckStdin ignores Close: Close blocks and Read never returns, like a
+// descriptor that cannot be woken. release lets the test goroutines finish.
+type stuckStdin struct{ release chan struct{} }
+
+func (s stuckStdin) Read([]byte) (int, error) { <-s.release; return 0, io.EOF }
+func (s stuckStdin) Close() error             { <-s.release; return nil }
+
+// TestRunShutdownIsBoundedWhenStdinCloseBlocks: neither a blocked Close nor an
+// unwakeable Read may hold run past the join grace.
+func TestRunShutdownIsBoundedWhenStdinCloseBlocks(t *testing.T) {
+	previous := readerJoinGrace
+	readerJoinGrace = 50 * time.Millisecond
+	t.Cleanup(func() { readerJoinGrace = previous })
+	stdin := stuckStdin{release: make(chan struct{})}
+	t.Cleanup(func() { close(stdin.release) })
+	fake := &fakeSyncer{onSync: func([]json.RawMessage) ([]json.RawMessage, error) {
+		return nil, transportSyncFailure(errors.New("daemon socket closed"))
+	}}
+	b := newBridge(fake, stdin, io.Discard, io.Discard)
+	b.pollInterval = 5 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- b.run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("run returned nil, want the poll transport failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return while stdin Close blocked")
+	}
+}
+
+// TestRunJoinsStdinReaderBeforeReturning: a fatal exit with stdin still open
+// must not leave the reader goroutine blocked in Read after run returns.
+func TestRunJoinsStdinReaderBeforeReturning(t *testing.T) {
+	stdin := newBlockingStdin()
+	t.Cleanup(func() { _ = stdin.Close() })
+	fake := &fakeSyncer{onSync: func([]json.RawMessage) ([]json.RawMessage, error) {
+		return nil, transportSyncFailure(errors.New("daemon socket closed"))
+	}}
+	b := newBridge(fake, stdin, io.Discard, io.Discard)
+	b.pollInterval = 5 * time.Millisecond
+
+	if err := b.run(context.Background()); err == nil {
+		t.Fatal("run returned nil, want the poll transport failure")
+	}
+	if !stdin.returned.Load() {
+		t.Fatal("run returned while its stdin reader was still blocked in Read")
+	}
+}
+
+// TestPollSyncFailureDisposition: an application failure on an idle poll is
+// transient and polling continues; a transport failure ends the bridge.
+func TestPollSyncFailureDisposition(t *testing.T) {
+	t.Run("application failure keeps polling", func(t *testing.T) {
+		stdin := newBlockingStdin()
+		var calls atomic.Int32
+		third := make(chan struct{})
+		fake := &fakeSyncer{onSync: func([]json.RawMessage) ([]json.RawMessage, error) {
+			if calls.Add(1) == 3 {
+				close(third)
+			}
+			return nil, applicationSyncFailure(errors.New("stale review action"))
+		}}
+		b := newBridge(fake, stdin, io.Discard, io.Discard)
+		b.pollInterval = 5 * time.Millisecond
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- b.run(ctx) }()
+		select {
+		case <-third:
+		case err := <-done:
+			t.Fatalf("run ended after a poll application failure: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("polling stopped after an application failure")
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("run after cancel = %v, want nil", err)
+		}
+	})
+
+	t.Run("transport failure is fatal", func(t *testing.T) {
+		fake := &fakeSyncer{onSync: func([]json.RawMessage) ([]json.RawMessage, error) {
+			return nil, transportSyncFailure(errors.New("daemon socket closed"))
+		}}
+		b := newBridge(fake, newBlockingStdin(), io.Discard, io.Discard)
+		b.pollInterval = 5 * time.Millisecond
+		if err := b.run(context.Background()); err == nil {
+			t.Fatal("run returned nil after a poll transport failure")
+		}
+	})
+}
+
 // TestValidateOrigin accepts only exact configured Chrome origins or Firefox IDs.
 func TestValidateOrigin(t *testing.T) {
 	const chromeID = "abcdefghijklmnopabcdefghijklmnop"

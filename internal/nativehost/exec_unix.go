@@ -85,3 +85,12 @@ func resolveDaemonExecutable() (string, error) {
 	}
 	return resolveExecutablePath(exe)
 }
+
+// ExecTargetProblem is Windows-only: a symlink cannot disagree with its target.
+func ExecTargetProblem() string { return "" }
+
+// pinRunningHost is a no-op: the symlink always resolves to the current binary.
+func pinRunningHost() {}
+
+// openShared opens path for reading; Unix needs no sharing flags.
+func openShared(path string) (*os.File, error) { return os.Open(path) }

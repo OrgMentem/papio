@@ -312,7 +312,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			firefoxManifestPresent := firefoxManErr == nil
 			symlinkPath := nativehost.ExecPath()
 			symlinkTarget, targetExists := nativehost.ExecTarget()
-			return opt.printResult(map[string]any{
+			result := map[string]any{
 				"manifest_path":            manifestPath,
 				"manifest_present":         manifestPresent,
 				"extension_id":             cfg.Browser.ExtensionID,
@@ -324,8 +324,14 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 				"symlink_target":           symlinkTarget,
 				"target_exists":            targetExists,
 				"browsers":                 browsers,
-			}, "manifest: %s (present=%t)\nextension_id: %s\nfirefox manifest: %s (present=%t)\nfirefox_extension_id: %s\nsymlink: %s -> %s (target_exists=%t)",
+			}
+			text := fmt.Sprintf("manifest: %s (present=%t)\nextension_id: %s\nfirefox manifest: %s (present=%t)\nfirefox_extension_id: %s\nsymlink: %s -> %s (target_exists=%t)",
 				manifestPath, manifestPresent, cfg.Browser.ExtensionID, firefoxManifestPath, firefoxManifestPresent, cfg.Browser.FirefoxExtensionID, symlinkPath, symlinkTarget, targetExists)
+			if problem := nativehost.ExecTargetProblem(); problem != "" {
+				result["target_problem"] = problem
+				text += "\nproblem: " + problem
+			}
+			return opt.printResult(result, "%s", text)
 		},
 	}
 	status.Flags().StringVar(&manifestDir, "manifest-dir", "", "override the Chrome native-messaging manifest directory")
