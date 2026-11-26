@@ -1880,3 +1880,40 @@ func opaqueMaterializationID(prefix string) (string, error) {
 	}
 	return prefix + "_" + hex.EncodeToString(raw[:]), nil
 }
+
+// DefaultCandidateReapBatch bounds how many candidate rows one poll sweep
+// deletes.
+const DefaultCandidateReapBatch = 200
+
+// ReapTerminalCandidates deletes browser_candidates rows whose job is terminal
+// and that nothing still depends on, at most limit rows per call. It is
+// idempotent: a second call finds nothing left to delete.
+//
+// A candidate is kept when any of these holds:
+//   - ANY materialization_claims row references it, live or retired. Retired
+//     claims are still read (OperatorClosedSurfaceJobs), and the claim table's
+//     ON DELETE CASCADE must never fire from here. Every effect permit reaches a
+//     candidate only through its claim, so this also covers in-flight permits;
+//   - an artifact_winners row references it. Winners stay as provenance, and
+//     that foreign key has no cascade.
+//
+// No other foreign key points at browser_candidates.
+func (js *Store) ReapTerminalCandidates(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = DefaultCandidateReapBatch
+	}
+	res, err := js.S.DB().ExecContext(ctx, `
+		DELETE FROM browser_candidates WHERE id IN (
+		  SELECT c.id FROM browser_candidates c
+		    JOIN jobs j ON j.id=c.job_id
+		   WHERE j.state IN ('cancelled','failed','imported','ready','unavailable')
+		     AND NOT EXISTS (SELECT 1 FROM artifact_winners w WHERE w.candidate_id=c.id)
+		     AND NOT EXISTS (SELECT 1 FROM materialization_claims m WHERE m.candidate_id=c.id)
+		   ORDER BY c.created_at, c.id
+		   LIMIT ?)`, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}

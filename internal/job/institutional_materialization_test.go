@@ -1266,3 +1266,106 @@ func TestNextMaterializationHolderGenerationIsDurableAndMonotonic(t *testing.T) 
 		t.Fatalf("counter after refusal = %d, want %d retained", held, maxGeneration)
 	}
 }
+
+func TestReapTerminalCandidatesKeepsReferencedAndIsBatchLimited(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	profile := institutionalProfile(t, js, "library", "digest-reap", "auth-reap")
+	newJob := func(key string) string {
+		id, err := js.CreateRequest(ctx, key, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := js.S.DB().ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := func() int {
+		var n int
+		if err := js.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM browser_candidates`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	exists := func(id string) bool {
+		var n int
+		if err := js.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM browser_candidates WHERE id=?`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+	claim := func(id string) *MaterializationClaim {
+		c, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+			CandidateID: id, BrowserHolderGeneration: 4, JobAttemptRevision: 1,
+			InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
+			MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	terminal := newJob("reap-terminal")
+	live := newJob("reap-live")
+
+	institutionalCandidate(t, js, profile, "cand-live-job", live)
+	institutionalCandidate(t, js, profile, "cand-winner", terminal)
+	institutionalCandidate(t, js, profile, "cand-claimed", terminal)
+	institutionalCandidate(t, js, profile, "cand-permit", terminal)
+	institutionalCandidate(t, js, profile, "cand-settled", terminal)
+	exec(`INSERT INTO artifact_winners (candidate_id, job_id, job_attempt_revision, browser_holder_generation, sha256, created_at)
+		VALUES ('cand-winner', ?, 1, 3, 'sha-reap', ?)`, terminal, store.Now())
+	claim("cand-claimed")
+	permitClaim := claim("cand-permit")
+	exec(`UPDATE materialization_claims SET phase='abandoned' WHERE id=?`, permitClaim.ID)
+	exec(`INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-reap', ?, 1, 4, 'domain-reap', 'institutional', ?, ?, 1, 'req-reap', 'held', ?, ?, ?)`,
+		terminal, permitClaim.ID, permitClaim.BindingID, store.Now(), store.Now(), store.Now())
+	settled := claim("cand-settled")
+	exec(`UPDATE materialization_claims SET phase='settled' WHERE id=?`, settled.ID)
+
+	if err := js.Cancel(ctx, terminal, TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	// Terminal-job rows with no references: more than one batch.
+	for _, id := range []string{"cand-dead-1", "cand-dead-2", "cand-dead-3"} {
+		institutionalCandidate(t, js, profile, id, terminal)
+	}
+	total := count()
+
+	n, err := js.ReapTerminalCandidates(ctx, 2)
+	if err != nil || n != 2 {
+		t.Fatalf("first reap n=%d err=%v, want 2", n, err)
+	}
+	if count() != total-2 {
+		t.Fatalf("batch limit violated: %d rows, want %d", count(), total-2)
+	}
+	for {
+		n, err = js.ReapTerminalCandidates(ctx, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	for _, id := range []string{"cand-live-job", "cand-winner", "cand-claimed", "cand-permit", "cand-settled"} {
+		if !exists(id) {
+			t.Fatalf("candidate %s was reaped", id)
+		}
+	}
+	for _, id := range []string{"cand-dead-1", "cand-dead-2", "cand-dead-3"} {
+		if exists(id) {
+			t.Fatalf("candidate %s survived", id)
+		}
+	}
+	if n, err := js.ReapTerminalCandidates(ctx, 10); err != nil || n != 0 {
+		t.Fatalf("second run n=%d err=%v, want no-op", n, err)
+	}
+}
