@@ -2,7 +2,10 @@
 // Package artifact owns the quarantine area and the immutable content-addressed
 // store: validated files are atomically published to artifacts/<sha256>.pdf by
 // hard link on supported filesystems (rename where hard links are unsupported)
-// and never mutated afterward. Quarantine cleanup after publication is
+// and never mutated afterward. The file is flushed before it becomes visible
+// and the artifacts directory is flushed before Promote reports success, so a
+// caller that commits a database row after Promote never points at a name or
+// bytes that a power loss can revert. Quarantine cleanup after publication is
 // best-effort and destination-authoritative, so a surviving quarantine name
 // does not mean the artifact is unpublished. Re-fetching the same bytes is a
 // no-op by construction, which is what makes crash recovery duplicate-free.
@@ -19,6 +22,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"papio/internal/config"
 )
 
 // Layout under the data directory.
@@ -29,10 +34,17 @@ const (
 
 // linkFile lets tests simulate filesystems that do not support hard links.
 // chmodFile and removeFile let tests inject pre- and post-publication failures.
+// syncFile and syncDir let tests inject durability failures and observe the
+// order of the flushes around publication. config.SyncDir is a no-op on
+// Windows, which cannot flush a directory through a handle: the durability of
+// a published name there rests on NTFS journaling its link and rename
+// metadata, while the file's bytes are still flushed by syncRegularFile.
 var (
 	linkFile   = os.Link
 	chmodFile  = os.Chmod
 	removeFile = os.Remove
+	syncFile   = syncRegularFile
+	syncDir    = config.SyncDir
 )
 
 // Store manages quarantine and immutable artifact paths under dataDir.
@@ -99,6 +111,14 @@ func (s *Store) ArtifactPath(sha string) (string, error) {
 // destination. On filesystems without hard-link support, Promote checks that
 // the destination is absent before renaming instead; that fallback is weaker
 // against cross-process publication races.
+//
+// Promote flushes the quarantine file before publication and the artifacts
+// directory after it, on every success path including the reuse of an existing
+// destination, so a concurrent publisher's name is durable too. A flush
+// failure fails the call: the caller must not record the artifact as
+// published. After a directory-flush failure the destination may already be
+// visible and the quarantine file still exists, so a retry converges through
+// the existing-destination path.
 func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool, err error) {
 	dest, err := s.ArtifactPath(expectedSHA)
 	if err != nil {
@@ -113,6 +133,13 @@ func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool
 	}
 	if sha != expectedSHA {
 		return "", false, fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
+	}
+
+	// The bytes must be on stable storage before any name can expose them: a
+	// link or rename that survives a power loss while the data does not would
+	// publish a truncated artifact under its full-content hash name.
+	if err := syncFile(tempPath); err != nil {
+		return "", false, fmt.Errorf("syncing quarantine file: %w", err)
 	}
 
 	// Apply read-only mode before the artifact becomes visible, so it is never
@@ -154,11 +181,18 @@ func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool
 	} else {
 		created = true
 	}
-	// Publication is complete. Temp cleanup is best-effort: a failure to
-	// remove the (now hard-linked or duplicate) quarantine file must not be
-	// reported as a promotion failure because the artifact IS published.
-	// Callers that roll back artifact metadata on Promote failure would
-	// incorrectly delete a valid artifact if cleanup were treated as fatal.
+	// The publication (or the reuse of another publisher's destination) is
+	// visible; make its directory entry durable before reporting success.
+	// Failure leaves the destination and the quarantine file in place, which
+	// is the state a retry or crash recovery expects.
+	if err := syncDir(filepath.Dir(dest)); err != nil {
+		return "", false, fmt.Errorf("syncing artifact directory: %w", err)
+	}
+	// Temp cleanup is best-effort: a failure to remove the (now hard-linked or
+	// duplicate) quarantine file must not be reported as a promotion failure
+	// because the artifact IS published. Callers that roll back artifact
+	// metadata on Promote failure would incorrectly delete a valid artifact if
+	// cleanup were treated as fatal.
 	if !renamed {
 		_ = removeFile(tempPath)
 		if created {
@@ -201,6 +235,26 @@ func (s *Store) Verify(sha string) error {
 	}
 	if got != sha {
 		return fmt.Errorf("artifact %s is corrupt: content hash %s (size %d)", sha, got, size)
+	}
+	return nil
+}
+
+// SyncPublished flushes an already-published artifact's bytes and its
+// directory entry. Crash recovery calls it before committing a journal row
+// whose destination already exists: the interrupted Promote may have exposed
+// the name before its flushes ran, so the name's durability is unproven until
+// this succeeds. A failure means the artifact must not yet be recorded as
+// published.
+func (s *Store) SyncPublished(sha string) error {
+	dest, err := s.ArtifactPath(sha)
+	if err != nil {
+		return err
+	}
+	if err := syncFile(dest); err != nil {
+		return fmt.Errorf("syncing published artifact: %w", err)
+	}
+	if err := syncDir(filepath.Dir(dest)); err != nil {
+		return fmt.Errorf("syncing artifact directory: %w", err)
 	}
 	return nil
 }

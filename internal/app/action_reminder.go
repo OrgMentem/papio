@@ -186,6 +186,7 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 			// window instead of waiting out a backoff for an alert that never
 			// queued. The pending-digest ledger replaces that identical retry.
 			log.Printf("papio: routing action reminder: %v", err)
+			record(fmt.Errorf("routing action reminder: %w", err))
 			return firstErr
 		}
 		// The route queued the alert; only now advance each action's backoff,

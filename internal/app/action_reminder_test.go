@@ -384,8 +384,8 @@ func TestActionReminderRecoversARouteThatOutlivedItsMarkers(t *testing.T) {
 	// The alert fails to queue, so no action.reminder event records it and the
 	// next pass retries the route instead of honoring a backoff.
 	sink.routeErr = errReminderRouteCrash
-	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
-		t.Fatal(err)
+	if err := svc.ActionReminder().RunDue(context.Background()); !errors.Is(err, errReminderRouteCrash) {
+		t.Fatalf("RunDue = %v, want the routing failure surfaced", err)
 	}
 	if len(sink.reminders) != 0 {
 		t.Fatalf("reminders = %q, want none after the failed route", sink.reminders)

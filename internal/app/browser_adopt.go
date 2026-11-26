@@ -60,8 +60,11 @@ func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string) err
 			err = s.Jobs.Transition(ctx, jobID, prev, job.StateAwaitingHuman,
 				map[string]any{"reason": reason})
 			if err == nil {
+				// The park committed but its action did not: an awaiting_human
+				// job with no open action is an orphaned park, so surface the
+				// failure instead of reporting the job parked.
 				if _, aErr := s.Jobs.OpenHumanAction(ctx, jobID, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); aErr != nil {
-					return nil
+					return fmt.Errorf("opening human action for job %s after adoption park: %w", jobID, aErr)
 				}
 				return nil
 			}

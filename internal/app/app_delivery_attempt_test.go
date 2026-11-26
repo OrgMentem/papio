@@ -47,45 +47,40 @@ func TestAmbiguousPostLeavesAMarker(t *testing.T) {
 	}
 }
 
-// TestCancelJobOrphansAnAmbiguousOfferedRow proves cancelling a job whose
-// POST outcome is unknown does not drop the row as never submitted.
-func TestCancelJobOrphansAnAmbiguousOfferedRow(t *testing.T) {
-	p := newAmbiguousProvider(t, http.StatusServiceUnavailable, "provider outcome unavailable")
-	svc, jobs, deliverySvc := newAmbiguousDeliveryService(t, p)
-	ctx := context.Background()
-	id, row := parkAmbiguousJob(t, svc, jobs, deliverySvc, "wr_amb_cancel", "10.1000/amb-cancel")
-
-	if err := svc.CancelJob(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
-		t.Fatal(err)
+// TestCancelJobOrphansAmbiguousRows proves cancelling a job whose POST outcome
+// is unknown does not drop the offered row as never submitted, whether or not
+// the attempt marker is still set.
+func TestCancelJobOrphansAmbiguousRows(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestID      string
+		doi            string
+		releaseAttempt bool
+	}{
+		{"with_attempt_marker", "wr_amb_cancel", "10.1000/amb-cancel", false},
+		{"without_attempt_marker", "wr_amb_legacy", "10.1000/amb-legacy", true},
 	}
-	got, err := deliverySvc.Get(ctx, row.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateUnknownOutcome {
-		t.Fatalf("row state = %q, want unknown_outcome so reconciliation can still find it", got.State)
-	}
-}
-
-// TestCancelJobOrphansAnAmbiguousRowWithoutAMarker covers a row an earlier
-// daemon left behind: an ambiguous classification event but no attempt marker.
-func TestCancelJobOrphansAnAmbiguousRowWithoutAMarker(t *testing.T) {
-	p := newAmbiguousProvider(t, http.StatusServiceUnavailable, "provider outcome unavailable")
-	svc, jobs, deliverySvc := newAmbiguousDeliveryService(t, p)
-	ctx := context.Background()
-	id, row := parkAmbiguousJob(t, svc, jobs, deliverySvc, "wr_amb_legacy", "10.1000/amb-legacy")
-	if err := deliverySvc.ReleaseSubmissionAttempt(ctx, row.ID); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := svc.CancelJob(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
-		t.Fatal(err)
-	}
-	got, err := deliverySvc.Get(ctx, row.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateUnknownOutcome {
-		t.Fatalf("row state = %q, want unknown_outcome for an ambiguous row with no marker", got.State)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newAmbiguousProvider(t, http.StatusServiceUnavailable, "provider outcome unavailable")
+			svc, jobs, deliverySvc := newAmbiguousDeliveryService(t, p)
+			ctx := context.Background()
+			id, row := parkAmbiguousJob(t, svc, jobs, deliverySvc, tc.requestID, tc.doi)
+			if tc.releaseAttempt {
+				if err := deliverySvc.ReleaseSubmissionAttempt(ctx, row.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := svc.CancelJob(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
+				t.Fatal(err)
+			}
+			got, err := deliverySvc.Get(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != delivery.StateUnknownOutcome {
+				t.Fatalf("row state = %q, want unknown_outcome", got.State)
+			}
+		})
 	}
 }

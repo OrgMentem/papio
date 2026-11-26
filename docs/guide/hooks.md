@@ -22,10 +22,12 @@ Contract:
 
 - **Fires once per ready transition.** Import retries do not re-fire `on_ready`.
   A daemon restart runs the hook automatically only for an active ready or
-  imported job that has no recorded hook dispatch and whose ready transition
+  imported job that has no recorded hook outcome and whose ready transition
   is newer than the hook epoch, for example because the daemon stopped before
-  it dispatched. Automatic recovery does not run a job again after a recorded
-  dispatch, and it skips archived jobs. You can still run `papio jobs refile`
+  it dispatched or while the hook ran. Recovery runs the hook at least once,
+  so a crash between a dispatch and the hook's recorded outcome can run it
+  twice. Automatic recovery does not run a job again after a recorded
+  outcome, and it skips archived jobs. You can still run `papio jobs refile`
   by hand after a failed dispatch.
 - **Fire-and-forget, best effort.** A slow or failing hook never blocks or
   fails the job, but filing is not guaranteed. *papio* does not retry a hook

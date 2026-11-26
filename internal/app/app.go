@@ -495,8 +495,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return err
 	}
 	if row.State == job.StateReady {
-		s.recoverMissingReadyHook(ctx, row)
-		return nil
+		return s.recoverMissingReadyHook(ctx, row)
 	}
 
 	// Attribute every credit this pass spends to this job. Set once here, at
@@ -1245,7 +1244,14 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 		return nil, plan, "", nil
 	}
 	basis := siblingSearchBasis(row.Work)
-	if s.siblingSearchRecorded(ctx, row.ID, basis) {
+	recorded, recordedErr := s.siblingSearchRecorded(ctx, row.ID, basis)
+	if recordedErr != nil {
+		// An unreadable event store is not proof that the search already ran:
+		// returning "nothing found" would let the caller settle the job as
+		// exhausted on a storage fault. Abort the pass so it is retried.
+		return nil, plan, "", recordedErr
+	}
+	if recorded {
 		return nil, plan, "", nil
 	}
 	searched := false
@@ -1386,21 +1392,21 @@ func siblingSearchBasis(w work.Work) string {
 }
 
 // siblingSearchRecorded reports whether this job already completed a fuzzy
-// search for this basis. It fails CLOSED in every direction it can: skipping a
-// ten-credit query papio cannot prove it needs is the cheap error, and the free
-// typed relations above it still run.
+// search for this basis. An unreadable event stream is returned as an error,
+// never as "recorded": that would suppress the sibling search and let the job
+// settle as exhausted on a storage fault.
 //
-// "Every direction" includes an unreadable detail, which is not hypothetical:
-// Jobs.Events decodes each detail with `_ = json.Unmarshal(...)` and yields a
-// nil map on failure, so a truncated or corrupt row would otherwise leave
-// basis "" — matching nothing, buying the search again, and doing it precisely
-// when storage is already misbehaving. A marker of the right kind is proof a
-// search happened; only a marker whose basis is legible and different is
-// evidence that this particular question is new.
-func (s *Service) siblingSearchRecorded(ctx context.Context, jobID, basis string) bool {
+// An unreadable detail fails CLOSED, which is not hypothetical: a truncated or
+// corrupt row decoded to a nil map would leave basis "" — matching nothing,
+// buying the search again, and doing it precisely when storage is already
+// misbehaving. Jobs.Events therefore refuses such a row outright, and the
+// error above aborts the pass. A marker whose detail decodes to nothing is
+// still proof a search happened; only a marker whose basis is legible and
+// different is evidence that this particular question is new.
+func (s *Service) siblingSearchRecorded(ctx context.Context, jobID, basis string) (bool, error) {
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
-		return true
+		return false, fmt.Errorf("reading sibling-search events: %w", err)
 	}
 	for _, event := range events {
 		if kind, _ := event["kind"].(string); kind != siblingSearchEventKind {
@@ -1408,14 +1414,14 @@ func (s *Service) siblingSearchRecorded(ctx context.Context, jobID, basis string
 		}
 		detail, ok := event["detail"].(map[string]any)
 		if !ok {
-			return true
+			return true, nil
 		}
 		recorded, ok := detail["basis"].(string)
 		if !ok || recorded == "" || recorded == basis {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // recordSiblingSearch persists the basis just searched. A failure to record is
@@ -1979,6 +1985,28 @@ func (s *Service) settleCancelledAttempt(ctx context.Context, attempt int64, out
 	}
 	if err := s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, outcome, 0, detail); err != nil {
 		log.Printf("papio: settling cancelled attempt %d: %v", attempt, err)
+	}
+}
+
+// settleRejectedValidationAttempt closes a validate attempt for an outcome
+// (park, rejection) that the job's state already carries. The outcome is
+// committed independently of the attempt row, so a failed settlement is never
+// returned: an error here would make callers skip the rejection handling for
+// an outcome that already happened and strand the job. The settlement runs on
+// a non-cancellable context; if it still fails, an attempt.settlement_failed
+// job event records the attempt id and intended outcome so the open row is
+// auditable (no sweep closes stale open attempts, so the event is the record).
+func (s *Service) settleRejectedValidationAttempt(ctx context.Context, jobID string, attempt int64, outcome, detail string) {
+	live := context.WithoutCancel(ctx)
+	err := s.Jobs.FinishAttempt(live, attempt, outcome, 0, detail)
+	if err == nil {
+		return
+	}
+	log.Printf("papio: settling validate attempt %d for job %s as %s: %v", attempt, jobID, outcome, err)
+	if eventErr := s.Jobs.RecordEvent(live, jobID, "attempt.settlement_failed", map[string]any{
+		"attempt_id": attempt, "intended_outcome": outcome, "detail": detail, "error": safeType(err),
+	}); eventErr != nil {
+		log.Printf("papio: recording attempt.settlement_failed for job %s attempt %d: %v", jobID, attempt, eventErr)
 	}
 }
 
@@ -3111,7 +3139,7 @@ func deliveryCutoverDetail(ctx context.Context, detail map[string]any) map[strin
 // (terminal, awaiting_human, mid-fetch) is refused with job.ErrConflict before
 // any request row exists or any POST is sent: the post-POST record would not
 // match such a job, leaving a provider request papio cannot track.
-func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRouteResult, error) {
+func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (result DeliveryRouteResult, retErr error) {
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return DeliveryRouteResult{}, err
@@ -3136,7 +3164,13 @@ func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRou
 		}
 		// Release on every exit: a route failure leaves the job resolving, and
 		// the scheduler must be able to recover it rather than wait out the lease.
-		defer func() { _ = s.Jobs.Release(context.WithoutCancel(ctx), jobID, owner) }()
+		// A failed release is reported: the job then stays leased until expiry,
+		// and the caller must not read the route result as a clean outcome.
+		defer func() {
+			if releaseErr := s.Jobs.Release(context.WithoutCancel(ctx), jobID, owner); releaseErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("releasing manual delivery lease for job %s: %w", jobID, releaseErr))
+			}
+		}()
 		if err := s.Jobs.Transition(ctx, jobID, claimed.State, job.StateResolving,
 			map[string]any{"reason": "manual_delivery_submit"}); err != nil {
 			return DeliveryRouteResult{}, err
@@ -4477,6 +4511,8 @@ func DeliveryReconciliationActionDetail(existing *delivery.Request) string {
 // rewrite, returning the replacement fetch result and report only when the
 // rewrite is clean. It reports false for every other case, so the caller's
 // unsafe_pdf review stays the answer whenever this cannot make the file safe.
+// A failure to record the job.pdf_sanitized provenance event is returned as an
+// error: adopting rewritten bytes without that record would break the ledger.
 //
 // Only an embedded-file-ONLY marker qualifies. Encryption and JavaScript are
 // left alone deliberately: removing them would be a different rewrite with a
@@ -4487,51 +4523,54 @@ func DeliveryReconciliationActionDetail(existing *delivery.Request) string {
 // will actually be adopted, or papio would file a document it never checked.
 func (s *Service) sanitizeEmbeddedFiles(
 	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, report pdf.ValidationReport,
-) (fetch.Result, pdf.ValidationReport, bool) {
+) (fetch.Result, pdf.ValidationReport, bool, error) {
 	if s.Sanitize == nil || !report.Structural.HasEmbeddedFiles ||
 		report.Structural.Encrypted || report.Structural.HasJavaScript {
-		return result, report, false
+		return result, report, false, nil
 	}
 	dest := result.TempPath + ".sanitized"
 	structural, err := s.Sanitize(ctx, result.TempPath, dest)
 	if err != nil || !structural.Valid || structural.Encrypted ||
 		structural.HasJavaScript || structural.HasEmbeddedFiles {
 		_ = os.Remove(dest)
-		return result, report, false
+		return result, report, false, nil
 	}
 	info, err := os.Stat(dest)
 	if err != nil {
 		_ = os.Remove(dest)
-		return result, report, false
+		return result, report, false, nil
 	}
 	sum, err := fileSHA256(dest)
 	if err != nil {
 		_ = os.Remove(dest)
-		return result, report, false
+		return result, report, false, nil
 	}
 	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
 	if err != nil {
 		_ = os.Remove(dest)
-		return result, report, false
+		return result, report, false, nil
 	}
 	rewritten, err := s.Validate(ctx, dest, result.ContentType, validationTarget(anchor, row))
 	if err != nil || rewritten.Structural.HasEmbeddedFiles || rewritten.Structural.HasJavaScript ||
 		rewritten.Structural.Encrypted || !rewritten.Structural.Valid {
 		_ = os.Remove(dest)
-		return result, report, false
+		return result, report, false, nil
 	}
 	// The original digest is the durable record of what the publisher served;
 	// the sanitized one names the bytes papio adopts. Both are recorded because
 	// neither alone describes the artifact honestly.
-	_ = s.Jobs.RecordEvent(ctx, row.ID, "job.pdf_sanitized", map[string]any{
+	if err := s.Jobs.RecordEvent(ctx, row.ID, "job.pdf_sanitized", map[string]any{
 		"candidate_id":   stored.ID,
 		"removed":        "embedded_files",
 		"source_sha256":  result.SHA256,
 		"adopted_sha256": sum,
-	})
+	}); err != nil {
+		_ = os.Remove(dest)
+		return result, report, false, fmt.Errorf("recording pdf sanitization provenance: %w", err)
+	}
 	_ = os.Remove(result.TempPath)
 	result.TempPath, result.SHA256, result.SizeBytes = dest, sum, info.Size()
-	return result, rewritten, true
+	return result, rewritten, true, nil
 }
 
 func fileSHA256(path string) (string, error) {
@@ -4691,7 +4730,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		// A partial report is the most useful thing anyone will ever have about
 		// a validation that could not finish: it names the stage that stopped.
 		s.recordValidation(ctx, row.ID, stored.ID, result.SHA256, validationIncomplete, report)
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, safeType(validateErr))
+		s.settleRejectedValidationAttempt(ctx, row.ID, attempt, "needs_review", safeType(validateErr))
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 			return false, false, err
 		}
@@ -4711,7 +4750,12 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	// attachment. Strip it and re-validate the rewrite: that removes the risk
 	// instead of asking a human to accept it, and the review below still fires
 	// whenever the rewrite fails or the file carries anything else.
-	if sanitized, sanitizedReport, ok := s.sanitizeEmbeddedFiles(ctx, row, stored, result, report); ok {
+	sanitized, sanitizedReport, sanitizedOK, sanitizeErr := s.sanitizeEmbeddedFiles(ctx, row, stored, result, report)
+	if sanitizeErr != nil {
+		_ = s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "error", 0, safeType(sanitizeErr))
+		return false, false, sanitizeErr
+	}
+	if sanitizedOK {
 		// The rewrite is what will be adopted, so the repository binding is
 		// applied to ITS text, not carried over from the original's.
 		result, report = sanitized, s.applyISBNBinding(sanitizedReport, anchor, row, binding)
@@ -4741,7 +4785,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		validationVerdict(report, active, needsIdentityReview, conclusiveVeto.Blocks()), report)
 	switch {
 	case report.Structural.Encrypted || active:
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
+		s.settleRejectedValidationAttempt(ctx, row.ID, attempt, "needs_review", "encrypted_or_active_content")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 		if err := s.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			"unsafe_pdf", "PDF is encrypted or contains active/embedded content",
@@ -4755,7 +4799,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
 		return false, true, nil
 	case !report.Payload.OK || !report.Structural.Valid:
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "payload_or_structure_rejected")
+		s.settleRejectedValidationAttempt(ctx, row.ID, attempt, "invalid", "payload_or_structure_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
 		_ = os.Remove(result.TempPath)
 		return false, false, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateFetching,
@@ -4766,7 +4810,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		// escape a legitimately mismatched document (a chapter DOI against a
 		// book job) could never be accepted at all. A job selection never
 		// sets ReviewOverride, so picks stay gated.
-		finishErr := s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "needs_review", 0, "conclusive_doi_mismatch")
+		s.settleRejectedValidationAttempt(context.WithoutCancel(ctx), row.ID, attempt, "needs_review", "conclusive_doi_mismatch")
 		identityDetail := fmt.Sprintf("Document front matter DOI %s does not match this job", strings.Join(conclusiveVeto.DOIs, ", "))
 		if conclusiveVeto.Verdict == pdf.VetoAmbiguous {
 			identityDetail = fmt.Sprintf("Document front matter DOI evidence is ambiguous (%s); check which DOI identifies the requested work", strings.Join(conclusiveVeto.DOIs, ", "))
@@ -4779,9 +4823,9 @@ func (s *Service) validateCandidateWithConclusiveReview(
 			},
 		}
 		parked, reviewErr := onConclusiveReview(ctx, row, review)
-		return false, parked, errors.Join(finishErr, reviewErr)
+		return false, parked, reviewErr
 	case needsIdentityReview && !stored.ReviewOverride:
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
+		s.settleRejectedValidationAttempt(ctx, row.ID, attempt, "needs_review", "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 		if err := s.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateValidating, job.StateNeedsReview, "verify_identity",
 			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath),
@@ -4795,7 +4839,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
 		return false, true, nil
 	case !foreignDOIOverride && report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "identity_rejected")
+		s.settleRejectedValidationAttempt(ctx, row.ID, attempt, "invalid", "identity_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
 		_ = os.Remove(result.TempPath)
 		return false, false, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateFetching,
@@ -5423,6 +5467,11 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 		switch {
 		case destExists:
 			_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
+				// The crashed Promote may have exposed this name before its
+				// flushes ran; make it durable before the journal is consumed.
+				if syncErr := s.Artifacts.SyncPublished(publication.SHA256); syncErr != nil {
+					return job.PromotionResult{}, syncErr
+				}
 				return job.PromotionResult{Path: dest}, nil
 			})
 		default:
@@ -5658,16 +5707,20 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
-	// The ready transition already committed; this marker is the durable fact
-	// that one automatic attempt was queued. It must commit before the
-	// detached launch: if it fails, nothing proves an attempt was queued, so
-	// return without launching and let the job stay undispatched for the next
-	// recovery instead of risking a hook whose launch no marker describes.
-	if err := s.Jobs.RecordEvent(context.WithoutCancel(ctx), row.ID, "hook.on_ready_dispatched", map[string]any{"trigger": "ready"}); err != nil {
-		log.Printf("papio: recording on_ready dispatch for job %s: %v", row.ID, err)
+	// The ready transition already committed; this marker records that one
+	// automatic attempt was queued. It is NOT proof of a launch: recovery treats
+	// a marker with no hook.on_ready outcome and no live in-process run as
+	// undispatched (see readyHookDispatched), so a crash between the marker and
+	// the launch re-dispatches. Admission is claimed BEFORE the marker so a
+	// refused admission (shutdown, or a run already in flight) writes nothing.
+	// If the marker fails to commit, release the admission and return without
+	// launching, leaving the job undispatched for the next recovery.
+	if !s.beginReadyHook(row.ID) {
 		return
 	}
-	if !s.beginReadyHook(row.ID) {
+	if err := s.Jobs.RecordEvent(context.WithoutCancel(ctx), row.ID, "hook.on_ready_dispatched", map[string]any{"trigger": "ready"}); err != nil {
+		log.Printf("papio: recording on_ready dispatch for job %s: %v", row.ID, err)
+		s.endReadyHook(row.ID)
 		return
 	}
 	execCtx := s.readyHookContext()
@@ -5677,21 +5730,38 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	}()
 }
 
-// readyHookDispatched reports whether the ready transition already recorded an
-// automatic on_ready attempt for this job: one dispatched event or any
-// hook.on_ready outcome means the crash window between the ready commit and
-// the detached hook launch is closed. Imported jobs reviewed the same evidence
-// on the ready path before leaving it, so they are covered too.
-func (s *Service) readyHookDispatched(ctx context.Context, jobID string) bool {
+// readyHookDispatched reports whether the automatic on_ready attempt for this
+// job is accounted for: a non-manual hook.on_ready outcome exists, or a
+// dispatch marker exists and this process still runs the hook. A marker with
+// neither is the crash window between the marker commit and the hook's
+// outcome, so it reads as NOT dispatched and recovery re-dispatches it: the
+// hook runs at least once. An unreadable event stream is an error: it proves
+// neither a dispatch nor its absence.
+func (s *Service) readyHookDispatched(ctx context.Context, jobID string) (bool, error) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
-		return true
+		return true, nil
 	}
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
-		return true
+		return false, fmt.Errorf("reading on_ready dispatch events for job %s: %w", jobID, err)
 	}
+	marked := false
+	// A hook process can outlive the daemon: an unresolved filing reservation
+	// (reserved, never released) fences replay so a second copy cannot run
+	// beside it. Startup releases dead owners' reservations before recovery.
+	reservations := map[string]struct{}{}
 	for _, event := range events {
 		kind, _ := event["kind"].(string)
+		if kind == "hook.filing_reserved" || kind == "hook.filing_released" {
+			detail, _ := event["detail"].(map[string]any)
+			id, _ := detail["reservation_id"].(string)
+			if kind == "hook.filing_reserved" {
+				reservations[id] = struct{}{}
+			} else {
+				delete(reservations, id)
+			}
+			continue
+		}
 		if kind != "hook.on_ready" && kind != "hook.on_ready_dispatched" {
 			continue
 		}
@@ -5699,29 +5769,41 @@ func (s *Service) readyHookDispatched(ctx context.Context, jobID string) bool {
 		if trigger, _ := detail["trigger"].(string); trigger == "manual" {
 			continue
 		}
-		return true
+		if kind == "hook.on_ready" {
+			return true, nil
+		}
+		marked = true
 	}
-	return false
+	if !marked {
+		return false, nil
+	}
+	if len(reservations) > 0 {
+		return true, nil
+	}
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	_, running := s.hookInFlight[jobID]
+	return running, nil
 }
 
-// recoverMissingReadyHook dispatches one settled job whose ready commit has no
-// automatic attempt marker. runReadyHook writes that marker itself, so this
-// path writes nothing first: a crash between the marker and the launch still
-// leaves a launch of unknown status, and jobs unfiled surfaces it as missing
-// with no outcome (never as a proven launch or failure). No blind replay
-// happens here: a crash after the launch but before the outcome is not
-// redispatched while its marker stands.
-func (s *Service) recoverMissingReadyHook(ctx context.Context, row *job.Row) {
+// recoverMissingReadyHook dispatches one settled job whose automatic on_ready
+// attempt is not accounted for: no hook.on_ready outcome and no live
+// in-process run (a bare dispatch marker left by a crash counts as neither).
+// The hook therefore runs at least once per ready transition; a hook that ran
+// but lost its outcome event runs again.
+func (s *Service) recoverMissingReadyHook(ctx context.Context, row *job.Row) error {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
-		return
+		return nil
 	}
 	if strings.TrimSpace(row.ArtifactSHA256) == "" || s.Artifacts.Verify(row.ArtifactSHA256) != nil {
-		return
+		return nil
 	}
-	if s.readyHookDispatched(ctx, row.ID) {
-		return
+	dispatched, err := s.readyHookDispatched(ctx, row.ID)
+	if err != nil || dispatched {
+		return err
 	}
 	s.runReadyHook(ctx, row, row.ArtifactSHA256)
+	return nil
 }
 
 // recoverMissingReadyHookForSettled replays the detached hook launch for
@@ -5751,14 +5833,14 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 		  AND j.acquisition_disposition = 'active'
 		  AND COALESCE((SELECT t.at FROM events t
 			WHERE t.job_id = j.id AND t.kind = 'job.transition'
-			  AND json_extract(t.detail_json, '$.to') = 'ready'
+			  AND CASE WHEN json_valid(t.detail_json) THEN json_extract(t.detail_json, '$.to') END = 'ready'
 			ORDER BY t.seq DESC LIMIT 1), '') >
 			(SELECT MIN(x.at) FROM events x WHERE x.kind = 'hook.on_ready_epoch')
 		  AND NOT EXISTS (
 			SELECT 1 FROM events e
 			WHERE e.job_id = j.id
-			  AND e.kind IN ('hook.on_ready', 'hook.on_ready_dispatched')
-			  AND COALESCE(json_extract(e.detail_json, '$.trigger'), '') <> 'manual'
+			  AND e.kind = 'hook.on_ready'
+			  AND COALESCE(CASE WHEN json_valid(e.detail_json) THEN json_extract(e.detail_json, '$.trigger') END, '') <> 'manual'
 		)
 		LIMIT 101`)
 	if err != nil {
@@ -5786,9 +5868,14 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 		}
 		row, err := s.Jobs.Get(ctx, id)
 		if err != nil {
-			return err
+			log.Printf("papio: on_ready recovery skipped job %s: %v", id, err)
+			continue
 		}
-		s.recoverMissingReadyHook(ctx, row)
+		if err := s.recoverMissingReadyHook(ctx, row); err != nil {
+			// One job's unreadable history must not stop the scan or fail
+			// startup: log it and let every other job file.
+			log.Printf("papio: on_ready recovery skipped job %s: %v", id, err)
+		}
 	}
 	return nil
 }

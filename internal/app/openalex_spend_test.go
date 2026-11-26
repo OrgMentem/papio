@@ -1058,36 +1058,53 @@ func TestUnreadableHistoryIsNoPermitForTheExpensiveSearch(t *testing.T) {
 	}
 }
 
-// Jobs.Events decodes each detail with `_ = json.Unmarshal(...)`, so a corrupt
-// row yields a nil detail rather than an error. A marker of the right kind is
-// proof a search happened; an illegible one must not buy the ten-credit query
-// again, least of all when storage is already misbehaving.
+// A marker of the right kind is proof a search happened; an illegible one must
+// not buy the ten-credit query again, least of all when storage is already
+// misbehaving. Jobs.Events refuses a row whose detail_json does not decode, so
+// corruption aborts the pass with an error before any search is bought. A
+// marker whose detail decodes to nothing ("null") still reads as proof.
 func TestUnreadableSiblingMarkerFailsClosed(t *testing.T) {
-	svc, jobs := newTestService(t)
-	ctx := context.Background()
-	sibling := &siblingFake{name: "fixture"}
-	svc.Resolvers = []ResolverEntry{{Adapter: sibling, Policy: config.Source{Enabled: true}}}
-	id, err := svc.Submit(ctx, doiRequest("wr_marker_corrupt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	row, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
-		id, store.FormatTime(svc.Now()), siblingSearchEventKind, `{"basis":`,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, plan, _, err := svc.resolveSiblings(ctx, row, true); err != nil {
-		t.Fatal(err)
-	} else if !plan.empty() {
-		t.Fatalf("plan = %+v, want no observation: an illegible marker must not buy another search", plan)
-	}
-	if sibling.siblings != 0 {
-		t.Fatalf("sibling calls = %d, want none against an unreadable marker", sibling.siblings)
+	for _, tc := range []struct {
+		name, detail string
+		wantErr      bool
+	}{
+		{name: "corrupt detail aborts the pass", detail: `{"basis":`, wantErr: true},
+		{name: "empty detail counts as the recorded search", detail: `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			ctx := context.Background()
+			sibling := &siblingFake{name: "fixture"}
+			svc.Resolvers = []ResolverEntry{{Adapter: sibling, Policy: config.Source{Enabled: true}}}
+			id, err := svc.Submit(ctx, doiRequest("wr_marker_unreadable"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.S.DB().ExecContext(ctx,
+				`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
+				id, store.FormatTime(svc.Now()), siblingSearchEventKind, tc.detail,
+			); err != nil {
+				t.Fatal(err)
+			}
+			_, plan, _, err := svc.resolveSiblings(ctx, row, true)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "corrupt detail_json") {
+					t.Fatalf("resolveSiblings error = %v, want the corrupt event refusal", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if !plan.empty() {
+				t.Fatalf("plan = %+v, want no observation: an illegible marker must not buy another search", plan)
+			}
+			if sibling.siblings != 0 {
+				t.Fatalf("sibling calls = %d, want none against an unreadable marker", sibling.siblings)
+			}
+		})
 	}
 }
 
