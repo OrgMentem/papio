@@ -242,6 +242,29 @@ func TestSemanticScholarRejectsUnsupportedOrMultipleSnowballs(t *testing.T) {
 	}
 }
 
+func TestSemanticScholarRejectsDotSegmentSnowballDOI(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+	client := NewSemanticScholarWithOptions(SemanticScholarOptions{Client: http.DefaultClient, BaseURL: server.URL})
+	for _, params := range []SearchParams{
+		{Cites: "10.1000/../../author/1"},
+		{CitedBy: "10.1000/./x"},
+		{Cites: "10.1000/%2e%2e/x"},
+	} {
+		_, err := client.Search(context.Background(), params)
+		if err == nil || !strings.Contains(err.Error(), "dot path segment") {
+			t.Fatalf("Search(%+v) error = %v, want dot-segment rejection", params, err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("server saw %d requests, want 0", requests)
+	}
+}
+
 func TestSemanticScholarRejectsTextQueryWithSnowball(t *testing.T) {
 	client := NewSemanticScholarWithOptions(SemanticScholarOptions{Client: http.DefaultClient})
 	_, err := client.Search(context.Background(), SearchParams{

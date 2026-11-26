@@ -100,7 +100,10 @@ func bodyChallenge(prefix []byte) string {
 
 // challengeTitle extracts the document title, capped the way the scan needs.
 func challengeTitle(html string) string {
-	lower := strings.ToLower(html)
+	// Offsets found in lower are used to slice html, so lower must keep html's
+	// byte length. strings.ToLower does not: invalid UTF-8 (a Latin-1 page)
+	// becomes the 3-byte U+FFFD and some runes change width.
+	lower := asciiLower(html)
 	i := strings.Index(lower, "<title")
 	if i < 0 {
 		return ""
@@ -118,6 +121,17 @@ func challengeTitle(html string) string {
 		title = title[:256]
 	}
 	return strings.TrimSpace(title)
+}
+
+// asciiLower lowercases A-Z only, so the result has exactly the bytes of s.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // challengeText strips tags and script bodies to visible text, capped. It

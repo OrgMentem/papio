@@ -309,3 +309,21 @@ func TestRateLimitOutranksChallengeHeader(t *testing.T) {
 		t.Fatalf("challenge-labelled 429 kind = %q, want http-429", kind)
 	}
 }
+
+// challengeTitle once sliced the original string with offsets found in
+// strings.ToLower of it, which grows each invalid UTF-8 byte to three bytes: a
+// Latin-1 head misplaced the title and could index past the end.
+func TestChallengeTitleSurvivesNonUTF8Bytes(t *testing.T) {
+	html := strings.Repeat("\xe9", 40) + "<TITLE>x</title>"
+	if got := challengeTitle(html); got != "x" {
+		t.Fatalf("challengeTitle = %q, want %q", got, "x")
+	}
+	// Length-changing valid rune (U+0130 lowers to 3 bytes) before the title.
+	html = "\u0130\u0130\u0130<title> Just a moment </title>"
+	if got := challengeTitle(html); got != "Just a moment" {
+		t.Fatalf("challengeTitle = %q, want %q", got, "Just a moment")
+	}
+	if got := bodyChallenge([]byte(strings.Repeat("\xe9", 40) + "<title>x</title>")); got != "" {
+		t.Fatalf("bodyChallenge = %q, want no rule", got)
+	}
+}

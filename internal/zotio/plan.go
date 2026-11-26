@@ -835,7 +835,13 @@ func (s *Service) stageAttachment(plan *Plan, w work.Work) (string, error) {
 // that reports one unresolved entry still returns that entry, whose note
 // names the cause (unresolvedEntryReport).
 func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (json.RawMessage, importManifest, error) {
-	stagingDir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256)
+	// The resolve directory is a child of the job/artifact directory, not the
+	// directory itself. zotio scans every PDF in the directory it is given, and
+	// an earlier papio named the staged DOI file differently (a ':' that is
+	// invalid on Windows); a leftover from a run that staged but never recorded
+	// a plan would otherwise sit beside the new name and yield a two-entry
+	// manifest. Files an earlier plan may still reference are left in place.
+	stagingDir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256, "import")
 	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
 		return nil, importManifest{}, err
 	}

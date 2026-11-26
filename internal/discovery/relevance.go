@@ -112,7 +112,13 @@ func scoreNormalized(normalizedQuery string, queryTokens []string, title string)
 	if strings.Contains(" "+normalizedTitle+" ", " "+normalizedQuery+" ") {
 		return phraseScore(len(normalizedQuery), len(normalizedTitle)), MatchTitlePhrase
 	}
-	if strings.Contains(" "+normalizedQuery+" ", " "+normalizedTitle+" ") {
+	// A title contained in a longer query is only evidence of identity when
+	// the title is itself long enough to be distinctive: the same floor that
+	// keeps a short query a keyword search. Without it a generic one- or
+	// two-word title ("Introduction", "Deep Learning") is a whole-word
+	// substring of almost any long query and scores as a confident match.
+	if len(strings.Fields(normalizedTitle)) >= minQueryTokens &&
+		strings.Contains(" "+normalizedQuery+" ", " "+normalizedTitle+" ") {
 		return phraseScore(len(normalizedTitle), len(normalizedQuery)), MatchTitlePhrase
 	}
 	// Out-of-order overlap is scaled into the band below phraseFloor. Contiguity
@@ -123,7 +129,10 @@ func scoreNormalized(normalizedQuery string, queryTokens []string, title string)
 	// reported score is banded, which is what makes score order and kind
 	// strength agree.
 	overlap := tokenOverlap(queryTokens, strings.Fields(normalizedTitle))
-	if overlap >= confidentOverlap {
+	// The same floor as the containment branch: a title shorter than a
+	// queryable phrase shares most of a long query's words by accident
+	// ("deep learning methods" vs "Deep Learning"), which is not identity.
+	if overlap >= confidentOverlap && len(strings.Fields(normalizedTitle)) >= minQueryTokens {
 		return overlap * phraseFloor, MatchTitleTokens
 	}
 	return overlap * phraseFloor, MatchWeak

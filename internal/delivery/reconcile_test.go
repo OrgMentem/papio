@@ -185,6 +185,71 @@ func TestReconcileRejectsContradictoryMetadata(t *testing.T) {
 	}
 }
 
+// A provider that echoes the same DOI or PMID in another spelling (case,
+// URL prefix, zero padding) still names the same work and must be adopted.
+func TestReconcileAdoptsEquivalentIdentifierSpellings(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity ReconciliationIdentity
+		tx       func(*illiad.Transaction)
+	}{
+		{
+			name:     "case-variant DOI",
+			identity: ReconciliationIdentity{DOI: "10.1000/reconcile"},
+			tx:       func(tx *illiad.Transaction) { tx.DOI = "10.1000/RECONCILE" },
+		},
+		{
+			name:     "URL-prefixed DOI",
+			identity: ReconciliationIdentity{DOI: "10.1000/reconcile"},
+			tx:       func(tx *illiad.Transaction) { tx.DOI = "https://doi.org/10.1000/Reconcile" },
+		},
+		{
+			name:     "zero-padded PMID",
+			identity: ReconciliationIdentity{PMID: "12345678"},
+			tx:       func(tx *illiad.Transaction) { tx.PMID = "012345678" },
+		},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := testService(t, time.Now())
+			req := newReconcileRequest(t, svc, fmt.Sprintf("job_reconcile_spelling_%d", i))
+			transaction := illiad.Transaction{
+				TransactionNumber: 31, TransactionStatus: "Awaiting Request Processing",
+				RequestType: "Article", ItemInfo4: req.IdempotencyKey,
+			}
+			tc.tx(&transaction)
+			deps := reconcileDeps(&reconcileFakeClient{transactions: []illiad.Transaction{transaction}})
+			deps.Identity = tc.identity
+			deps.Identity.RequestClass = "digital_journal_article"
+			result, err := svc.Reconcile(context.Background(), req, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != ReconciliationAdopted || result.ProviderReference != "31" {
+				t.Fatalf("result = %+v, want adopted reference 31", result)
+			}
+		})
+	}
+}
+
+func TestReconcileStillRejectsDifferentPMID(t *testing.T) {
+	svc := testService(t, time.Now())
+	req := newReconcileRequest(t, svc, "job_reconcile_pmid_other")
+	client := &reconcileFakeClient{transactions: []illiad.Transaction{{
+		TransactionNumber: 32, TransactionStatus: "Awaiting Request Processing",
+		PMID: "0123456789", ItemInfo4: req.IdempotencyKey,
+	}}}
+	deps := reconcileDeps(client)
+	deps.Identity = ReconciliationIdentity{PMID: "12345678", RequestClass: "digital_journal_article"}
+	result, err := svc.Reconcile(context.Background(), req, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonIdentityMismatch {
+		t.Fatalf("result = %+v, want NEEDS_HUMAN/strong_identity_mismatch", result)
+	}
+}
+
 func TestReconcileDoesNotAdoptTitleAuthorWithoutToken(t *testing.T) {
 	svc := testService(t, time.Now())
 	req := newReconcileRequest(t, svc, "job_reconcile_title_only")

@@ -146,6 +146,28 @@ func TestTokenScoresStayBelowEveryPhraseMatch(t *testing.T) {
 	}
 }
 
+// A short generic title that is a whole-word substring of a longer query is
+// not evidence the query named that work.
+func TestScoreShortTitleInsideLongerQueryIsNotConfident(t *testing.T) {
+	for _, tc := range []struct{ query, title string }{
+		{"introduction to quantum field theory lecture notes", "Introduction"},
+		{"deep learning for protein structure prediction", "Deep Learning"},
+		{"deep learning methods", "Deep Learning"},
+	} {
+		normalized := normalizeText(tc.query)
+		got, kind := scoreNormalized(normalized, strings.Fields(normalized), tc.title)
+		if Confident(kind) {
+			t.Fatalf("scoreNormalized(%q, %q) = %.3f, %q — short title scored confident", tc.query, tc.title, got, kind)
+		}
+	}
+	// A distinctive title (at least minQueryTokens words) pasted with
+	// trailing context still matches.
+	query := normalizeText("Trust Asymmetries in Human-AI Collaboration (2026 preprint)")
+	if _, kind := scoreNormalized(query, strings.Fields(query), "Trust Asymmetries in Human-AI Collaboration"); kind != MatchTitlePhrase {
+		t.Fatalf("kind = %q, want %q", kind, MatchTitlePhrase)
+	}
+}
+
 // P1 regression: phrase containment must fire only on whole-word boundaries.
 // Without padding, strings.Contains treats a short title as a match merely
 // because its letters appear inside a longer query word — "trust" is a

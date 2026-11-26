@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"papio/internal/illiad"
+	"papio/internal/work"
 )
 
 // ReconciliationDisposition is the closed result vocabulary for an ambiguous
@@ -212,10 +213,10 @@ func validateReconciledTransaction(tx illiad.Transaction, field, token string, i
 	if !ok || ref != token {
 		return ReconciliationReasonIdentityMismatch
 	}
-	if identity.DOI != "" && tx.DOI != "" && tx.DOI != identity.DOI {
+	if identity.DOI != "" && tx.DOI != "" && !sameStrongID(work.NormalizeDOI, tx.DOI, identity.DOI) {
 		return ReconciliationReasonIdentityMismatch
 	}
-	if identity.PMID != "" && tx.PMID != "" && tx.PMID != identity.PMID {
+	if identity.PMID != "" && tx.PMID != "" && !sameStrongID(work.NormalizePMID, tx.PMID, identity.PMID) {
 		return ReconciliationReasonIdentityMismatch
 	}
 	if identity.RequestClass == "digital_journal_article" && tx.RequestType != "" && tx.RequestType != "Article" {
@@ -233,6 +234,19 @@ func validateReconciledTransaction(tx illiad.Transaction, field, token string, i
 		return ReconciliationReasonStateUnrepresentable
 	}
 	return ""
+}
+
+// sameStrongID compares two spellings of one identifier through the
+// acquisition normalizer, so a case-variant DOI or a zero-padded PMID the
+// provider echoes back is not read as a different work. A value that does not
+// normalize can only match its own exact text.
+func sameStrongID(normalize func(string) (string, error), got, want string) bool {
+	g, gotErr := normalize(got)
+	w, wantErr := normalize(want)
+	if gotErr != nil || wantErr != nil {
+		return got == want
+	}
+	return g == w
 }
 
 func titleAuthorCorroborates(tx illiad.Transaction, identity ReconciliationIdentity) bool {

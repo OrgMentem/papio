@@ -114,13 +114,13 @@ func importStagingBasename(w work.Work) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("normalizing DOI for import staging: %w", err)
 		}
-		return url.PathEscape(strings.ToLower(doi)) + ".pdf", nil
+		return stagingEscape(strings.ToLower(doi)) + ".pdf", nil
 	case strings.TrimSpace(w.ArXiv) != "":
 		arxiv, err := work.NormalizeArXiv(w.ArXiv)
 		if err != nil {
 			return "", fmt.Errorf("normalizing arXiv ID for import staging: %w", err)
 		}
-		return "arxiv-" + url.PathEscape(strings.ToLower(arxiv)) + ".pdf", nil
+		return "arxiv-" + stagingEscape(strings.ToLower(arxiv)) + ".pdf", nil
 	case strings.TrimSpace(w.PMID) != "":
 		pmid, err := work.NormalizePMID(w.PMID)
 		if err != nil {
@@ -133,6 +133,15 @@ func importStagingBasename(w work.Work) (string, error) {
 		}
 		return "", errors.New(newItemRoutingRefusal)
 	}
+}
+
+// stagingEscape percent-encodes an identifier into one file-name component
+// zotio decodes back. url.PathEscape is URL-segment escaping and leaves ':'
+// alone, but a DOI suffix can carry one (every SICI DOI does), and on Windows a
+// colon in a path component is the NTFS stream separator, so os.Rename of the
+// staged PDF fails. Its other unescaped bytes ($ & + = @) are valid names.
+func stagingEscape(id string) string {
+	return strings.ReplaceAll(url.PathEscape(id), ":", "%3A")
 }
 
 // attachStagingBasename names the file papio hands to "attachments add". The

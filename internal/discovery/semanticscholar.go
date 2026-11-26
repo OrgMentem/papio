@@ -272,6 +272,12 @@ func semanticScholarSnowball(params SearchParams) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("semanticscholar: invalid DOI for %s: %w", selected.kind, err)
 	}
+	// The DOI is concatenated into the request path, and doiCoreRE admits any
+	// non-whitespace suffix: 10.1000/../../x would resolve to a different API
+	// route once the server cleans the path. No real DOI names a dot segment.
+	if work.HasDotSegment(doi) {
+		return "", "", fmt.Errorf("semanticscholar: DOI for %s names a dot path segment", selected.kind)
+	}
 	return selected.kind, doi, nil
 }
 
