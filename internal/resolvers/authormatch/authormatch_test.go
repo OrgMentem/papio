@@ -51,3 +51,41 @@ func TestSameListsPairsAuthorsInAnyOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestCanonicalSurnameFirstReadsCompactInitials(t *testing.T) {
+	for _, name := range []string{"Smith AB", "Smith A.B.", "Smith J. A.", "Smith, Alan B"} {
+		surname, initial, ok := CanonicalSurnameFirst(name)
+		want := 'a'
+		if name == "Smith J. A." {
+			want = 'j'
+		}
+		if !ok || surname != "smith" || initial != want {
+			t.Errorf("CanonicalSurnameFirst(%q) = %q, %q, %v", name, surname, initial, ok)
+		}
+	}
+	if !SameListsSurnameFirst([]string{"Smith AB"}, []string{"Alan Smith"}) {
+		t.Fatal("surname-first record did not match full name")
+	}
+}
+
+func TestCanonicalSurnameFirstKeepsMultiWordSurnames(t *testing.T) {
+	for name, want := range map[string]string{"DE WIT J": "de wit", "van der Berg JA": "van der berg", "van der Berg J. A.": "van der berg"} {
+		surname, _, ok := CanonicalSurnameFirst(name)
+		if !ok || surname != want {
+			t.Errorf("CanonicalSurnameFirst(%q) surname = %q, want %q", name, surname, want)
+		}
+	}
+	if !SameListsSurnameFirst([]string{"DE WIT J"}, []string{"de Wit, John"}) {
+		t.Fatal("DE WIT J did not match de Wit, John")
+	}
+}
+
+func TestCanonicalKeepsFullNameReading(t *testing.T) {
+	surname, initial, ok := Canonical("Wei LI")
+	if !ok || surname != "li" || initial != 'w' {
+		t.Fatalf("Canonical(Wei LI) = %q, %q, %v", surname, initial, ok)
+	}
+	if !Same("Wei LI", "Wei Li") {
+		t.Fatal("Wei LI should match Wei Li")
+	}
+}

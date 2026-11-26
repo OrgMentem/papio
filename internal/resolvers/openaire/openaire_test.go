@@ -140,6 +140,51 @@ func TestResolveCapsInstancesAndDeduplicatesURLs(t *testing.T) {
 	}
 }
 
+func TestResolveDeduplicatesURLsBelowTheCap(t *testing.T) {
+	// Two distinct URLs plus a duplicate stay under the cap of three, so only
+	// duplicate removal can make the count two.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [{"scheme": "doi", "value": "10.1371/journal.pone.0262026"}],
+			"instances": [
+				{"license": "cc0", "urls": ["https://a.example/p"]},
+				{"license": "cc0", "urls": ["https://a.example/p"]},
+				{"license": "cc0", "urls": ["https://b.example/p"]}
+			]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.1371/journal.pone.0262026"})
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("Resolve = (%v, %v), want the duplicate URL removed", cands, err)
+	}
+}
+
+func TestResolveAcceptsInstanceLevelOpenWithoutLicense(t *testing.T) {
+	// An instance marked OPEN is an acquisition route even with no license;
+	// its reuse license is reported as unknown. A closed unlicensed instance
+	// is not.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [{"scheme": "doi", "value": "10.1371/journal.pone.0262026"}],
+			"instances": [
+				{"accessRight": {"label": "CLOSED"}, "urls": ["https://closed.example/p"]},
+				{"accessRight": {"label": "OPEN"}, "urls": ["https://open.example/p"]}
+			]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.1371/journal.pone.0262026"})
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("Resolve = (%v, %v), want only the OPEN instance", cands, err)
+	}
+	if cands[0].URL != "https://open.example/p" || cands[0].ReuseLicense != "unknown" {
+		t.Fatalf("candidate = %+v", cands[0])
+	}
+}
+
 func TestResolveWithoutDOIOrPMIDMakesNoRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("a work without DOI or PMID must not reach the network")
@@ -223,6 +268,28 @@ func TestResolveByPMIDUsesThePIDFilter(t *testing.T) {
 	}
 }
 
+func TestResolveByPMIDDoesNotGuessAmongMultipleDOIs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [
+				{"scheme": "doi", "value": "10.1038/s41586-020-2649-2"},
+				{"scheme": "doi", "value": "10.17863/cam.62701"},
+				{"scheme": "pmid", "value": "35051190"}
+			],
+			"instances": [{"license": "CC BY", "urls": ["https://example.org/p"]}]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{PMID: "35051190"})
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("Resolve = (%v, %v)", cands, err)
+	}
+	if got := cands[0].ResolvedWork; got.DOI != "" || got.PMID != "35051190" {
+		t.Fatalf("ResolvedWork = %+v, want no DOI among several and the requested PMID", got)
+	}
+}
+
 func TestResolveRejectsRestrictedLicensesAsOpenAccess(t *testing.T) {
 	// Live-observed shape: a dedup'd OPEN record carrying the publisher's
 	// paywalled instance under a contractual "Springer TDM" license beside
@@ -266,6 +333,9 @@ func TestResolveAcceptsDedupRecordsMatchedByANonFirstDOI(t *testing.T) {
 		Resolve(context.Background(), work.Work{DOI: "10.17863/cam.62701"})
 	if err != nil || len(cands) != 1 {
 		t.Fatalf("Resolve = (%v, %v), want the record accepted via its non-first DOI", cands, err)
+	}
+	if got := cands[0].ResolvedWork.DOI; got != "10.17863/cam.62701" {
+		t.Fatalf("ResolvedWork.DOI = %q, want the requested DOI, not the first listed", got)
 	}
 }
 

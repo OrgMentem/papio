@@ -271,7 +271,7 @@ const (
 func buildQuery(requested work.Work) (string, matchMode) {
 	if doi := strings.TrimSpace(requested.DOI); doi != "" {
 		if normalized, err := work.NormalizeDOI(doi); err == nil {
-			return `DOI:"` + normalized + `"`, matchDOI
+			return `DOI:"` + luceneQuoted(normalized) + `"`, matchDOI
 		}
 	}
 	if pmid := strings.TrimSpace(requested.PMID); pmid != "" {
@@ -283,6 +283,12 @@ func buildQuery(requested work.Work) (string, matchMode) {
 		return `TITLE:"` + sanitizeTitle(title) + `"`, matchTitle
 	}
 	return "", ""
+}
+
+// luceneQuoted escapes the characters that end or alter a Lucene phrase, so a
+// DOI containing a quote or backslash stays one literal term.
+func luceneQuoted(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
 }
 
 // selectResult picks the result that matches the requested identity, rejecting
@@ -301,7 +307,7 @@ func selectResult(results []epmcResult, requested work.Work, mode matchMode) *ep
 			// An identifier-scoped query must confirm the requested identity;
 			// a record whose DOI field is absent cannot be verified as the
 			// requested work, so it is never selected.
-			if strings.EqualFold(strings.TrimSpace(results[i].DOI), want) {
+			if got, err := work.NormalizeDOI(results[i].DOI); err == nil && got == want {
 				return &results[i]
 			}
 		}
@@ -312,7 +318,7 @@ func selectResult(results []epmcResult, requested work.Work, mode matchMode) *ep
 			return nil
 		}
 		for i := range results {
-			if strings.TrimSpace(results[i].PMID) == want {
+			if got, err := work.NormalizePMID(results[i].PMID); err == nil && got == want {
 				return &results[i]
 			}
 		}
@@ -381,7 +387,7 @@ func matchesTitleSearch(recordTitle string, recordAuthors []string, recordYear i
 	if requested.Year != 0 && recordYear != requested.Year {
 		return false
 	}
-	return authormatch.SameLists(recordAuthors, requested.Authors)
+	return authormatch.SameListsSurnameFirst(recordAuthors, requested.Authors)
 }
 
 func authorNames(value string) []string {

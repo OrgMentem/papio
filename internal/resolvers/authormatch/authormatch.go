@@ -16,6 +16,17 @@ import (
 // any order. An empty request matches anything; otherwise the lists must have
 // the same length and pair off one-to-one under Same.
 func SameLists(recordAuthors, requestedAuthors []string) bool {
+	return sameLists(recordAuthors, requestedAuthors, Canonical)
+}
+
+// SameListsSurnameFirst is SameLists for a record whose names are surname
+// first with compact initials (MEDLINE, Europe PMC authorString). Requested
+// names read as Canonical does.
+func SameListsSurnameFirst(recordAuthors, requestedAuthors []string) bool {
+	return sameLists(recordAuthors, requestedAuthors, CanonicalSurnameFirst)
+}
+
+func sameLists(recordAuthors, requestedAuthors []string, recordCanonical func(string) (string, rune, bool)) bool {
 	if len(requestedAuthors) == 0 {
 		return true
 	}
@@ -24,9 +35,14 @@ func SameLists(recordAuthors, requestedAuthors []string) bool {
 	}
 	matched := make([]bool, len(recordAuthors))
 	for _, requestedAuthor := range requestedAuthors {
+		requestedSurname, requestedInitial, requestedOK := Canonical(requestedAuthor)
 		found := false
 		for i, recordAuthor := range recordAuthors {
-			if !matched[i] && Same(recordAuthor, requestedAuthor) {
+			if matched[i] || !requestedOK {
+				continue
+			}
+			surname, initial, ok := recordCanonical(recordAuthor)
+			if ok && surname == requestedSurname && initial == requestedInitial {
 				matched[i], found = true, true
 				break
 			}
@@ -83,10 +99,61 @@ func fold(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }
 
+func single(token string) bool {
+	return utf8.RuneCountInString(strings.ReplaceAll(token, ".", "")) == 1
+}
+
 func isInitial(value string) bool {
 	value = strings.Trim(value, ".")
 	_, size := utf8.DecodeRuneInString(value)
 	return size > 0 && size == len(value)
+}
+
+// isCompactInitials reports whether a token is a MEDLINE run of given-name
+// initials: capitals only, with optional dots ("J", "AB", "A.B.").
+func isCompactInitials(token string) bool {
+	letters := strings.ReplaceAll(token, ".", "")
+	count := utf8.RuneCountInString(letters)
+	if count < 1 || count > 3 {
+		return false
+	}
+	for _, r := range letters {
+		if !unicode.IsUpper(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// CanonicalSurnameFirst reads a name known to be written surname first with
+// compact initials, the MEDLINE / Europe PMC form: "Smith AB", "Smith A.B.",
+// "Smith J. A.", "van der Berg JK". Trailing initials runs are stripped and
+// the first one gives the initial. A name without such a run reads as
+// Canonical does, so "Smith, John" and mononyms still work. Full-name sources
+// must not use it: "Wei LI" there is a given name and an upper-case surname.
+func CanonicalSurnameFirst(value string) (surname string, initial rune, ok bool) {
+	value = strings.TrimSpace(value)
+	if strings.ContainsRune(value, ',') {
+		return Canonical(value)
+	}
+	tokens := strings.Fields(value)
+	end := len(tokens)
+	// One token of up to three initials ("AB"), or a run of single-letter
+	// tokens ("J. A."). A longer capitalised word before the final initial
+	// ("DE WIT J") is part of the surname.
+	if end > 1 && isCompactInitials(tokens[end-1]) {
+		end--
+		if single(tokens[end]) {
+			for end > 1 && single(tokens[end-1]) {
+				end--
+			}
+		}
+	}
+	if end == len(tokens) || end == 0 {
+		return Canonical(value)
+	}
+	initial, ok = firstRune(tokens[end])
+	return fold(strings.Join(tokens[:end], " ")), initial, ok
 }
 
 func firstRune(value string) (rune, bool) {

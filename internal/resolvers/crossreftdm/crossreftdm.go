@@ -302,7 +302,7 @@ func (r *Resolver) candidates(payload response, requestedDOI string) []resolver.
 		candidates = append(candidates, resolver.Candidate{
 			Source:             "crossref_tdm",
 			URL:                address,
-			Landing:            "https://doi.org/" + url.PathEscape(doi),
+			Landing:            doiLanding(doi),
 			Version:            mapVersion(link.version()),
 			AccessBasis:        resolver.AccessLicensedAPI,
 			ReuseLicense:       metadata.licenseFor(link.version()),
@@ -438,4 +438,14 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 		return time.Until(when)
 	}
 	return 0
+}
+
+// doiLanding is the doi.org URL for a DOI, or "" when the DOI has a dot
+// segment: the slash stays unescaped, so "10.1000/a/../b" would otherwise
+// resolve to a different path.
+func doiLanding(doi string) string {
+	if work.HasDotSegment(doi) {
+		return ""
+	}
+	return (&url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}).String()
 }

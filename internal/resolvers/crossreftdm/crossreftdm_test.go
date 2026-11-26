@@ -264,3 +264,20 @@ func TestResolveRequiresTextMiningMarkerAndLeavesUnknownVersionUnknown(t *testin
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
+
+func TestLandingKeepsTheDOISlash(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"message":{"DOI":"10.1000/a/b","link":[{"URL":"https://publisher.example/a.pdf","content-type":"application/pdf","intended-application":"text-mining"}]}}`))
+	}))
+	defer server.Close()
+	got, err := NewWithOptions(Options{Client: server.Client(), APIKey: "k", BaseURL: server.URL + "/works"}).Resolve(context.Background(), work.Work{DOI: "10.1000/a/b"})
+	if err != nil || len(got) != 1 || got[0].Landing != "https://doi.org/10.1000/a/b" {
+		t.Fatalf("Resolve = %+v, %v", got, err)
+	}
+}
+
+func TestLandingOmittedForDotSegmentDOI(t *testing.T) {
+	if got := doiLanding("10.1000/a/../b"); got != "" {
+		t.Fatalf("doiLanding = %q, want none", got)
+	}
+}

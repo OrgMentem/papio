@@ -414,3 +414,31 @@ func TestSelectResultRequiresPositiveIdentity(t *testing.T) {
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
+
+func TestBuildQueryEscapesLuceneQuotesInDOI(t *testing.T) {
+	query, mode := buildQuery(work.Work{DOI: `10.1000/a"b\c`})
+	if mode != matchDOI || query != `DOI:"10.1000/a\"b\\c"` {
+		t.Fatalf("buildQuery = %q, %q", query, mode)
+	}
+}
+
+func TestSelectResultNormalizesRecordIdentifiers(t *testing.T) {
+	results := []epmcResult{{DOI: "https://doi.org/10.1000/ABC.", PMID: " 0012345 "}}
+	if selectResult(results, work.Work{DOI: "10.1000/abc"}, matchDOI) == nil {
+		t.Fatal("DOI with resolver prefix and trailing punctuation was not matched")
+	}
+	if selectResult(results, work.Work{PMID: "12345"}, matchPMID) == nil {
+		t.Fatal("PMID 0012345 did not match 12345")
+	}
+	if selectResult([]epmcResult{{PMID: "12345"}}, work.Work{PMID: "12345"}, matchPMID) == nil {
+		t.Fatal("plain PMID was not matched")
+	}
+}
+
+func TestMatchesTitleSearchReadsMEDLINEAuthors(t *testing.T) {
+	record := []string{"Smith AB", "Jones J. A.", "Wei LI"}
+	requested := work.Work{Title: "T", Authors: []string{"Alan Smith", "Jane Jones", "Li Wei"}}
+	if !matchesTitleSearch("T", record, 0, requested) {
+		t.Fatal("MEDLINE-style authors did not match full names")
+	}
+}

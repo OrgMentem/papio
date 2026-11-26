@@ -174,7 +174,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		return nil, nil
 	}
 
-	resolved := resolvedWork(record)
+	resolved := resolvedWork(record, requested)
 	candidates := make([]resolver.Candidate, 0, maxInstanceCandidates)
 	seen := map[string]bool{}
 	for _, instance := range record.Instances {
@@ -387,7 +387,13 @@ func isDOIResolverURL(value string) bool {
 	return false
 }
 
-func resolvedWork(rec record) work.Work {
+// resolvedWork reports the record's identity. A dedup record lists every DOI
+// the work is registered under in an order unrelated to the query, so the
+// requested identifier is echoed only when the record confirms it. Without
+// that confirmation a single listed identifier is the record's own, but
+// several distinct ones are ambiguous and none is reported: the first listed
+// DOI would present another registration as the exact echo of the request.
+func resolvedWork(rec record, requested work.Work) work.Work {
 	authors := make([]string, 0, len(rec.Authors))
 	for _, author := range rec.Authors {
 		if name := strings.TrimSpace(author.FullName); name != "" {
@@ -402,19 +408,36 @@ func resolvedWork(rec record) work.Work {
 	if rec.Container != nil {
 		resolved.Container = strings.TrimSpace(rec.Container.Name)
 	}
+	var dois, pmids []string
 	for _, pid := range rec.PIDs {
 		switch strings.ToLower(strings.TrimSpace(pid.Scheme)) {
 		case "doi":
-			if v, err := work.NormalizeDOI(pid.Value); err == nil && resolved.DOI == "" {
-				resolved.DOI = v
+			if v, err := work.NormalizeDOI(pid.Value); err == nil && !slices.Contains(dois, v) {
+				dois = append(dois, v)
 			}
 		case "pmid":
-			if v, err := work.NormalizePMID(pid.Value); err == nil && resolved.PMID == "" {
-				resolved.PMID = v
+			if v, err := work.NormalizePMID(pid.Value); err == nil && !slices.Contains(pmids, v) {
+				pmids = append(pmids, v)
 			}
 		}
 	}
+	reqDOI, _ := work.NormalizeDOI(requested.DOI)
+	reqPMID, _ := work.NormalizePMID(requested.PMID)
+	resolved.DOI = confirmedID(dois, reqDOI)
+	resolved.PMID = confirmedID(pmids, reqPMID)
 	return resolved
+}
+
+// confirmedID returns the requested identifier when the record lists it, the
+// record's only identifier when it lists exactly one, and "" otherwise.
+func confirmedID(listed []string, requested string) string {
+	if requested != "" && slices.Contains(listed, requested) {
+		return requested
+	}
+	if len(listed) == 1 {
+		return listed[0]
+	}
+	return ""
 }
 
 func yearOf(date string) int {

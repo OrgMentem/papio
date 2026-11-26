@@ -18,6 +18,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/fetch"
 	"papio/internal/resolver"
+	"papio/internal/resolvers/authormatch"
 	"papio/internal/work"
 )
 
@@ -232,7 +233,7 @@ func (r *Resolver) candidates(records []record, requested work.Work, requestedDO
 			}
 			seen[link.URL] = struct{}{}
 			landing := doiLanding(recordDOI)
-			if landing == "" && validHTTPURL(record.LandingPageURL) {
+			if landing == "" && validHTTPURL(record.LandingPageURL) && !hasDotSegment(record.LandingPageURL) {
 				landing = record.LandingPageURL
 			}
 			candidates = append(candidates, resolver.Candidate{
@@ -311,10 +312,11 @@ func canonicalDOI(value string) string {
 	return doi
 }
 func doiLanding(doi string) string {
-	if doi == "" {
+	// An unescaped slash would let a DOI with dot segments rewrite the path.
+	if doi == "" || work.HasDotSegment(doi) {
 		return ""
 	}
-	return "https://doi.org/" + url.PathEscape(doi)
+	return (&url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}).String()
 }
 func sameTitle(left, right string) bool {
 	return normalizeTitle(left) != "" && normalizeTitle(left) == normalizeTitle(right)
@@ -326,46 +328,9 @@ func matchesTitleSearch(recordTitle string, recordAuthors []string, recordYear i
 	if requested.Year != 0 && recordYear != requested.Year {
 		return false
 	}
-	return sameAuthorLists(recordAuthors, requested.Authors)
+	return authormatch.SameLists(recordAuthors, requested.Authors)
 }
 
-func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
-	if len(requestedAuthors) == 0 {
-		return true
-	}
-	if len(recordAuthors) != len(requestedAuthors) {
-		return false
-	}
-	matched := make([]bool, len(recordAuthors))
-	for _, requestedAuthor := range requestedAuthors {
-		found := false
-		for i, recordAuthor := range recordAuthors {
-			if !matched[i] && sameAuthor(recordAuthor, requestedAuthor) {
-				matched[i], found = true, true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-func sameAuthor(left, right string) bool {
-	left, right = normalizeTitle(left), normalizeTitle(right)
-	if left == "" || right == "" {
-		return false
-	}
-	if left == right {
-		return true
-	}
-	leftParts, rightParts := strings.Fields(left), strings.Fields(right)
-	if len(leftParts) == 0 || len(rightParts) == 0 || leftParts[len(leftParts)-1] != rightParts[len(rightParts)-1] {
-		return false
-	}
-	// A shared surname alone is not enough to accept a title-only result.
-	return leftParts[0][0] == rightParts[0][0]
-}
 func normalizeTitle(value string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
 }
@@ -501,4 +466,11 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 		return time.Until(when)
 	}
 	return 0
+}
+
+// hasDotSegment reports whether a URL path contains a "." or ".." segment,
+// plain or percent-encoded, which a consumer could resolve to another path.
+func hasDotSegment(value string) bool {
+	parsed, err := url.Parse(value)
+	return err != nil || work.HasDotSegment(parsed.EscapedPath())
 }

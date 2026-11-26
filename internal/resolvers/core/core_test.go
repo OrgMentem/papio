@@ -226,3 +226,46 @@ func TestResolveClassifiesNetworkAndDeadlineFailuresAsTemporary(t *testing.T) {
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
+
+func TestDOILandingOmittedForDotSegments(t *testing.T) {
+	if got := doiLanding("10.1000/a/../b"); got != "" {
+		t.Fatalf("doiLanding = %q, want none", got)
+	}
+}
+
+func TestFullNameAuthorsKeepUppercaseSurname(t *testing.T) {
+	if !matchesTitleSearch("T", []string{"Wei Li"}, 0, work.Work{Title: "T", Authors: []string{"Wei LI"}}) {
+		t.Fatal("'Wei LI' did not match 'Wei Li'")
+	}
+}
+
+func TestDOILandingKeepsTheSlash(t *testing.T) {
+	if got := doiLanding("10.1000/a/b"); got != "https://doi.org/10.1000/a/b" {
+		t.Fatalf("doiLanding = %q", got)
+	}
+}
+
+func TestSameAuthorListsReadsSurnameCommaGiven(t *testing.T) {
+	if !matchesTitleSearch("T", []string{"Smith, John"}, 0, work.Work{Title: "T", Authors: []string{"John Smith"}}) {
+		t.Fatal("'Smith, John' did not match 'John Smith'")
+	}
+}
+
+func TestLandingPageURLWithDotSegmentsIsNotUsedAsLanding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results":[{"doi":"10.1000/a/../b","title":"T","landingPageUrl":"https://doi.org/10.1000/a/../b","downloadUrl":"https://core.example/p.pdf"}]}`))
+	}))
+	defer server.Close()
+	got, err := NewWithOptions(Options{Client: server.Client(), APIKey: "k", BaseURL: server.URL}).Resolve(context.Background(), work.Work{DOI: "10.1000/a/../b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("no candidates")
+	}
+	for _, c := range got {
+		if c.Landing != "" {
+			t.Fatalf("Landing = %q, want none", c.Landing)
+		}
+	}
+}
