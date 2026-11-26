@@ -368,6 +368,11 @@ func mergeWebhookPayload(stored, incoming string, mergedCount int) string {
 	if err := json.Unmarshal([]byte(incoming), &b); err != nil {
 		return incoming
 	}
+	// A JSON null decodes to a nil map without an error. It is not an object
+	// either, so the incoming payload wins, as json_patch does.
+	if a == nil || b == nil {
+		return incoming
+	}
 	deepPatchWebhookPayload(a, b)
 	a["count"] = mergedCount
 	out, err := json.Marshal(a)
@@ -402,16 +407,24 @@ func isPureReplay(current, rec NotificationRecord) bool {
 	return true
 }
 
-// deepPatchWebhookPayload merges src into dst key by key, recursing into
-// nested objects so per-event detail entries accumulate instead of
-// replacing each other.
+// deepPatchWebhookPayload merges src into dst with RFC 7396 merge-patch
+// semantics, as SQLite json_patch does for the plain upsert path: nested
+// objects merge key by key so per-event detail entries accumulate, a null
+// value deletes the key, and an object patched over a non-object replaces
+// it with the patch stripped of its nulls.
 func deepPatchWebhookPayload(dst, src map[string]any) {
 	for key, value := range src {
-		srcMap, srcIsMap := value.(map[string]any)
-		dstValue, dstHas := dst[key]
-		dstMap, dstIsMap := dstValue.(map[string]any)
-		if srcIsMap && dstHas && dstIsMap {
+		if value == nil {
+			delete(dst, key)
+			continue
+		}
+		if srcMap, ok := value.(map[string]any); ok {
+			dstMap, isMap := dst[key].(map[string]any)
+			if !isMap {
+				dstMap = map[string]any{}
+			}
 			deepPatchWebhookPayload(dstMap, srcMap)
+			dst[key] = dstMap
 			continue
 		}
 		dst[key] = value

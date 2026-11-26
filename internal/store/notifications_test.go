@@ -1086,3 +1086,94 @@ func TestMergeWebhookPayloadFallsBackToIncomingWhenEitherSideIsNotAnObject(t *te
 		}
 	}
 }
+
+// The recursion arm descends through every shared object level, replaces a
+// value when either side is not an object, and adds keys only the incoming
+// payload has.
+func TestDeepPatchWebhookPayloadRecursesAndReplacesOnShapeMismatch(t *testing.T) {
+	t.Parallel()
+	dst := map[string]any{
+		"a": map[string]any{"b": map[string]any{"x": 1.0, "y": 2.0}},
+		"c": map[string]any{"k": 1.0},
+		"d": 5.0,
+	}
+	src := map[string]any{
+		"a": map[string]any{"b": map[string]any{"y": 3.0, "z": 4.0}},
+		"c": 5.0,
+		"d": map[string]any{"m": 1.0},
+		"e": map[string]any{"n": 1.0},
+	}
+	deepPatchWebhookPayload(dst, src)
+	want := map[string]any{
+		"a": map[string]any{"b": map[string]any{"x": 1.0, "y": 3.0, "z": 4.0}},
+		"c": 5.0,
+		"d": map[string]any{"m": 1.0},
+		"e": map[string]any{"n": 1.0},
+	}
+	if !reflect.DeepEqual(dst, want) {
+		t.Fatalf("patched = %v, want %v", dst, want)
+	}
+}
+
+// json_patch (the plain upsert) follows RFC 7396: a null deletes the key and a
+// nested object patched in where none existed is stripped of its nulls. The
+// generation path merges in Go and must produce the same payload.
+func TestNotificationLedgerWebhookMergeNullDeletesKeyLikeJSONPatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := Open(ctx, seededDataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	payloads := []string{
+		`{"count":1,"keep":1,"drop":2,"events":{"a":{"x":1,"y":2}}}`,
+		`{"count":1,"drop":null,"events":{"a":{"x":null},"b":{"n":null,"m":1}}}`,
+	}
+	record := func(key string, last time.Time, payload string) NotificationRecord {
+		return NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: key, Phase: "opened", WindowStart: now, FirstAt: now, LastAt: last, AvailableAt: last, Count: 1, PayloadJSON: payload}
+	}
+	var generation, desktop NotificationRecord
+	for i, payload := range payloads {
+		last := now.Add(time.Duration(i) * time.Minute)
+		if generation, err = ledger.UpsertWebhookGeneration(ctx, record("decision:null-webhook", last, payload)); err != nil {
+			t.Fatal(err)
+		}
+		if desktop, err = ledger.Upsert(ctx, record("decision:null-desktop", last, payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := map[string]any{
+		"count": float64(2),
+		"keep":  float64(1),
+		"events": map[string]any{
+			"a": map[string]any{"y": float64(2)},
+			"b": map[string]any{"m": float64(1)},
+		},
+	}
+	for name, row := range map[string]NotificationRecord{"webhook generation": generation, "desktop upsert": desktop} {
+		var got map[string]any
+		if err := json.Unmarshal([]byte(row.PayloadJSON), &got); err != nil {
+			t.Fatalf("%s payload %q: %v", name, row.PayloadJSON, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s payload = %s, want %v", name, row.PayloadJSON, want)
+		}
+	}
+}
+
+// A stored or incoming JSON null decodes to a nil map without an error; merging
+// must fall back to the incoming payload rather than write into a nil map.
+func TestMergeWebhookPayloadTopLevelNullFallsBackToIncoming(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct{ stored, incoming string }{
+		"stored null":   {`null`, `{"count":1,"message":"b"}`},
+		"incoming null": {`{"count":1,"message":"a"}`, `null`},
+	} {
+		if got := mergeWebhookPayload(tc.stored, tc.incoming, 2); got != tc.incoming {
+			t.Fatalf("%s: merged = %q, want the incoming payload %q", name, got, tc.incoming)
+		}
+	}
+}
