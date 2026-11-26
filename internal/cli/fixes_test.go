@@ -120,7 +120,7 @@ func TestWriteSearchSnapshotInterruptedBeforePublishLeavesNoFinalFile(t *testing
 	hits := []discovery.DiscoveredWork{{Work: work.Work{DOI: "10.1000/a", Title: "A"}}}
 	snapshotBeforePublish = func() { panic("simulated kill") }
 	func() {
-		defer func() { recover() }()
+		defer func() { _ = recover() }()
 		_ = writeSearchSnapshot(path, discovery.SearchParams{Query: "q"}, hits)
 	}()
 	snapshotBeforePublish = nil
@@ -258,11 +258,11 @@ func TestCampaignRunReportsReceiptWhenManifestPersistenceFails(t *testing.T) {
 	if id == "" {
 		t.Fatal("no campaign manifest written")
 	}
-	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	call := func(ctx context.Context, method string, params, result any) error {
 		err := d.call(ctx, method, params, result)
 		if strings.HasPrefix(method, "acquire.submit") {
-			os.Chmod(dir, 0o500) // the post-submit manifest write now fails
+			_ = os.Chmod(dir, 0o500) // the post-submit manifest write now fails
 		}
 		return err
 	}
@@ -279,7 +279,9 @@ func TestCampaignRunReportsReceiptWhenManifestPersistenceFails(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, "inflight") || !strings.Contains(msg, "campaign report "+id) {
 		t.Fatalf("error lacks reconcile guidance: %v", err)
 	}
-	os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	var persisted struct {
 		Chunks []campaignChunk `json:"chunks"`
 	}

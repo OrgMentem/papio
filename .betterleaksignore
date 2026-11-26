@@ -11,3 +11,5 @@
 197924d76b97a2c846470bba1b3c84f812376ca0:extension/test/popup.test.ts:generic-credential-uri:2202
 # Protocol fixture: a route carrying credentials must be rejected.
 21e58b29620504396eafea21373eb5c6b6daa34e:testdata/protocol/invalid/acquisition-bundle-v2-route-with-credentials.json:generic-credential-uri:17
+# Ledger finding id in a test comment, not a key.
+757378ed6e86fa8b1489afc1a26cfc977fb29e09:internal/browser/bridge_test.go:generic-api-key:483

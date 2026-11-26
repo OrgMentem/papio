@@ -309,7 +309,7 @@ func (i *Instance) recordStoreWork(next Status) error {
 	// #nosec G703 -- statusPath is in the data directory AcquireInstance was
 	// given, as the lock file is.
 	if err := removeStatusFile(i.statusPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("daemon phase %s cannot be recorded (%w) or its stale status cleared (%v); waiting commands could not tell it from a hung start", next.Phase, writeErr, err)
+		return fmt.Errorf("daemon phase %s cannot be recorded (%w) or its stale status cleared (%w); waiting commands could not tell it from a hung start", next.Phase, writeErr, err)
 	}
 	return nil
 }

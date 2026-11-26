@@ -29,15 +29,6 @@ type boundsCase struct {
 // what separates a rune count from a byte count.
 func cjk(n int) string { return strings.Repeat("字", n) }
 
-func objectAt(t *testing.T, doc map[string]any, key string) map[string]any {
-	t.Helper()
-	obj, ok := doc[key].(map[string]any)
-	if !ok {
-		t.Fatalf("fixture has no object %q", key)
-	}
-	return obj
-}
-
 func stringList(n int, entry string) []any {
 	out := make([]any, n)
 	for i := range out {

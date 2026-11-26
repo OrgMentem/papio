@@ -270,7 +270,7 @@ func TestWindowsOccupiedPipeErrorClassifiesProbeFailures(t *testing.T) {
 			if tc.wantExtra != nil && !errors.Is(got, tc.wantExtra) {
 				t.Fatalf("occupiedPipeError = %v, want it to wrap %v", got, tc.wantExtra)
 			}
-			if tc.want == ErrSocketInUse && errors.Is(got, ErrUntrustedPipeServer) {
+			if errors.Is(tc.want, ErrSocketInUse) && errors.Is(got, ErrUntrustedPipeServer) {
 				t.Fatalf("occupiedPipeError = %v, a busy pipe is not known to be hostile", got)
 			}
 		})

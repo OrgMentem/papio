@@ -4395,7 +4395,9 @@ func TestRecoverMissingReadyHookDispatchesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The ready transition committed; the detached launch never ran.
-	svc.recoverMissingReadyHook(ctx, row)
+	if err := svc.recoverMissingReadyHook(ctx, row); err != nil {
+		t.Fatal(err)
+	}
 	if !svc.DrainHooks(5 * time.Second) {
 		t.Fatal("recovered hook did not drain")
 	}
@@ -4408,7 +4410,9 @@ func TestRecoverMissingReadyHookDispatchesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.recoverMissingReadyHook(ctx, row)
+	if err := svc.recoverMissingReadyHook(ctx, row); err != nil {
+		t.Fatal(err)
+	}
 	if !svc.DrainHooks(100 * time.Millisecond) {
 		t.Fatal("second recovery queued unexpected hook work")
 	}
