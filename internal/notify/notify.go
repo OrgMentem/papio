@@ -114,7 +114,18 @@ func powershellLiteral(value string) string {
 		}
 		return r
 	}, value)
-	return `'` + strings.ReplaceAll(value, `'`, `''`) + `'`
+	// PowerShell treats U+2018-U+201B as single quotes too; double each one.
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range value {
+		switch r {
+		case '\'', '\u2018', '\u2019', '\u201A', '\u201B':
+			b.WriteRune(r)
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 func appleScript(message string) string {

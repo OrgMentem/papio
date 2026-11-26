@@ -37,6 +37,12 @@ Contract:
 - **Shell semantics.** The command runs via `/bin/sh -c` (on Windows,
   `cmd /d /s /c "<command>"`, which keeps your quotes as written). The
   recipes below are POSIX-shell.
+- **Windows variable access.** Do not write `%PAPIO_TITLE%` (or any
+  `%PAPIO_*%`) in `hooks.on_ready`: `cmd.exe` pastes the value into the command
+  line before it parses it, so a hostile title or DOI would run as commands.
+  *papio* refuses such a command when it loads the config. Read the values
+  inside a script instead: PowerShell `$env:PAPIO_TITLE`, or a batch file that
+  starts with `setlocal EnableDelayedExpansion` and uses `!PAPIO_TITLE!`.
 - **Concurrency.** Concurrent ready jobs may run hooks concurrently; if your
   command needs serialization, own it (e.g. `flock`).
 

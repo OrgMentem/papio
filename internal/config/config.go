@@ -1531,6 +1531,9 @@ func (c *Config) validate() error {
 	if c.Hooks.OnReady != "" && (c.Hooks.TimeoutSeconds < 5 || c.Hooks.TimeoutSeconds > 600) {
 		return fmt.Errorf("hooks.timeout_seconds must be in 5..600")
 	}
+	if err := validateOnReadyShell(c.Hooks.OnReady, runtime.GOOS); err != nil {
+		return err
+	}
 	if err := validateOpenBooks(c.OpenBooks); err != nil {
 		return err
 	}
@@ -1613,9 +1616,14 @@ func parseQuietHours(value string) (time.Duration, time.Duration, error) {
 		return 0, 0, fmt.Errorf("must use HH:MM-HH:MM")
 	}
 	parse := func(text string) (time.Duration, error) {
-		hour, err1 := strconv.Atoi(text[:2])
-		minute, err2 := strconv.Atoi(text[3:5])
-		if err1 != nil || err2 != nil || hour > 23 || minute > 59 {
+		for _, i := range [...]int{0, 1, 3, 4} {
+			if text[i] < '0' || text[i] > '9' {
+				return 0, fmt.Errorf("must use valid local times")
+			}
+		}
+		hour := int(text[0]-'0')*10 + int(text[1]-'0')
+		minute := int(text[3]-'0')*10 + int(text[4]-'0')
+		if hour > 23 || minute > 59 {
 			return 0, fmt.Errorf("must use valid local times")
 		}
 		return time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute, nil
@@ -2325,4 +2333,17 @@ func resolverProfileName(name string) string {
 		return "default"
 	}
 	return name
+}
+
+var cmdPapioPercentRef = regexp.MustCompile(`(?i)%PAPIO_`)
+
+// validateOnReadyShell refuses, on Windows, an on_ready command that expands a
+// PAPIO_* variable with %NAME%. cmd.exe substitutes the value into the command
+// line before parsing it, so remote metadata such as a title would be read as
+// command syntax.
+func validateOnReadyShell(command, goos string) error {
+	if goos == "windows" && cmdPapioPercentRef.MatchString(command) {
+		return fmt.Errorf("hooks.on_ready must not reference %%PAPIO_*%% on Windows: cmd.exe expands it before parsing, so job metadata would run as commands; read the values inside a script instead (PowerShell $env:PAPIO_TITLE, or a batch file using setlocal EnableDelayedExpansion and !PAPIO_TITLE!)")
+	}
+	return nil
 }

@@ -20,6 +20,8 @@ type StoreLedger struct {
 	store  *store.Store
 }
 
+// NewStoreLedger adapts s. A nil store yields a ledger whose every method
+// returns an "unavailable" error, which the router surfaces without panicking.
 func NewStoreLedger(s *store.Store) *StoreLedger {
 	if s == nil {
 		return &StoreLedger{}
@@ -27,7 +29,17 @@ func NewStoreLedger(s *store.Store) *StoreLedger {
 	return &StoreLedger{ledger: s.Notifications(), store: s}
 }
 
+func (l *StoreLedger) check() error {
+	if l == nil || l.ledger == nil || l.store == nil {
+		return fmt.Errorf("notification ledger is unavailable")
+	}
+	return nil
+}
+
 func (l *StoreLedger) Upsert(ctx context.Context, rec Record) (Record, error) {
+	if err := l.check(); err != nil {
+		return Record{}, err
+	}
 	payload, err := json.Marshal(rec.Intent.Detail)
 	if err != nil {
 		return Record{}, err
@@ -269,6 +281,9 @@ func scanPendingRow(scanner pendingRowScanner) (store.NotificationRecord, error)
 }
 
 func (l *StoreLedger) DueDesktop(ctx context.Context, now time.Time, limit int) ([]Record, error) {
+	if err := l.check(); err != nil {
+		return nil, err
+	}
 	rows, err := l.ledger.DueDesktop(ctx, now, limit)
 	if err != nil {
 		return nil, err
@@ -284,6 +299,9 @@ func (l *StoreLedger) DueDesktop(ctx context.Context, now time.Time, limit int) 
 	return out, nil
 }
 func (l *StoreLedger) DueWebhook(ctx context.Context, now time.Time, limit int) ([]Record, error) {
+	if err := l.check(); err != nil {
+		return nil, err
+	}
 	rows, err := l.ledger.DueWebhook(ctx, now, limit)
 	if err != nil {
 		return nil, err
@@ -300,9 +318,15 @@ func (l *StoreLedger) DueWebhook(ctx context.Context, now time.Time, limit int) 
 }
 
 func (l *StoreLedger) ReserveDesktop(ctx context.Context, id int64, now time.Time, maxPerHour int) (bool, error) {
+	if err := l.check(); err != nil {
+		return false, err
+	}
 	return l.ledger.ReserveDesktop(ctx, id, now, maxPerHour)
 }
 func (l *StoreLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) (bool, error) {
+	if err := l.check(); err != nil {
+		return false, err
+	}
 	return l.ledger.SetDesktopState(ctx, id, state, now)
 }
 func (l *StoreLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (Record, bool, error) {
@@ -375,6 +399,9 @@ func parseNotifyTime(rowID int64, column string, text sql.NullString) (time.Time
 	return t, nil
 }
 func (l *StoreLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
+	if err := l.check(); err != nil {
+		return err
+	}
 	return l.ledger.SetWebhookState(ctx, id, state, now)
 }
 
@@ -390,9 +417,15 @@ func (l *StoreLedger) DeferWebhook(ctx context.Context, id int64, failedAt, retr
 }
 
 func (l *StoreLedger) SupersedeCheckpoints(ctx context.Context, aggregateKey string, now time.Time) (int, error) {
+	if err := l.check(); err != nil {
+		return 0, err
+	}
 	return l.ledger.SupersedeCheckpoints(ctx, aggregateKey, now)
 }
 func (l *StoreLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, aggregateKey string, now time.Time, rec Record) (Record, error) {
+	if err := l.check(); err != nil {
+		return Record{}, err
+	}
 	payload, err := json.Marshal(rec.Intent.Detail)
 	if err != nil {
 		return Record{}, err
@@ -415,6 +448,9 @@ func (l *StoreLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, aggregat
 }
 
 func (l *StoreLedger) LatestCheckpoint(ctx context.Context, aggregateKey string) (Record, bool, error) {
+	if err := l.check(); err != nil {
+		return Record{}, false, err
+	}
 	row, ok, err := l.ledger.LatestCheckpoint(ctx, aggregateKey)
 	if err != nil || !ok {
 		return Record{}, ok, err
@@ -443,5 +479,8 @@ func fromStoreRecord(row store.NotificationRecord) (Record, error) {
 }
 
 func (l *StoreLedger) SetDesktopAvailable(ctx context.Context, id int64, available time.Time) error {
+	if err := l.check(); err != nil {
+		return err
+	}
 	return l.ledger.SetDesktopAvailable(ctx, id, available)
 }

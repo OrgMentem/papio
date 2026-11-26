@@ -285,3 +285,20 @@ func TestLinuxSenderBoundsExecutionToFiveSeconds(t *testing.T) {
 
 // Coalescing is durable and is tested through Router and its ledger; no
 // process-local Coalescer remains.
+
+func TestPowershellLiteralDoublesUnicodeSingleQuotes(t *testing.T) {
+	got := powershellLiteral("a'b\u2018c\u2019d\u201Ae\u201Bf")
+	want := "'a''b\u2018\u2018c\u2019\u2019d\u201A\u201Ae\u201B\u201Bf'"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestRouteWithNilStoreLedgerReturnsErrorWithoutPanic(t *testing.T) {
+	now := time.Now().UTC()
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(nil), Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	intent := Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "a", Phase: PhaseTerminal, WindowStart: now, HappenedAt: now, Message: "ready"}
+	if err := router.Route(context.Background(), intent); err == nil {
+		t.Fatal("expected an unavailable-ledger error")
+	}
+}

@@ -1641,3 +1641,23 @@ func TestHostSuppressionDefaultsOverlayAndBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateOnReadyShellRefusesPercentPapioOnWindows(t *testing.T) {
+	cases := []struct {
+		cmd, goos string
+		wantErr   bool
+	}{
+		{`file.bat %PAPIO_TITLE%`, "windows", true},
+		{`echo %papio_doi%`, "windows", true},
+		{`echo %PAPIO_PDF:~0,3%`, "windows", true},
+		{`powershell -File hook.ps1`, "windows", false},
+		{`hook.bat`, "windows", false},
+		{`echo %PAPIO_TITLE%`, "linux", false},
+	}
+	for _, tc := range cases {
+		err := validateOnReadyShell(tc.cmd, tc.goos)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%q on %s: err = %v, wantErr %v", tc.cmd, tc.goos, err, tc.wantErr)
+		}
+	}
+}

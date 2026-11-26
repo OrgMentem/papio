@@ -33,6 +33,12 @@ func TestNotifyQuietHoursValidation(t *testing.T) {
 	if err := cfg.validate(); err == nil {
 		t.Fatal("invalid quiet hours accepted")
 	}
+	for _, bad := range []string{"+1:00-06:00", "22:+5-06:00", "-1:00-06:00", "22:30-22:30"} {
+		cfg.Notify.QuietHours = bad
+		if err := cfg.validate(); err == nil {
+			t.Fatalf("quiet hours %q accepted", bad)
+		}
+	}
 }
 
 // TestNotifyValidationRejectsUnknownEnumsAndOutOfRangeBounds walks every rule
