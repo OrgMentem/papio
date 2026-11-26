@@ -601,3 +601,68 @@ func TestLegacyHostsKeepLastHelloWins(t *testing.T) {
 		t.Fatalf("holder after displacement = %q", version)
 	}
 }
+
+// TestSessionStatusTracksArbitrationWithoutTheBridgeLock pins the diagnostic
+// snapshot the status ping reads. SessionStatus must (a) answer before any
+// hello, (b) follow the holder, the pending sessions and the denied-hello
+// count as arbitration changes them, and (c) never take b.mu: the ping exists
+// to answer while a browser handler holds the lock and stalls.
+func TestSessionStatusTracksArbitrationWithoutTheBridgeLock(t *testing.T) {
+	type status struct {
+		version   string
+		connected bool
+		pending   int
+		denied    int
+	}
+	read := func(b *Bridge) status {
+		version, connected, pending, denied := b.SessionStatus()
+		return status{version, connected, pending, denied}
+	}
+	b, _, _, _ := newBridge(t)
+
+	if got, want := read(b), (status{}); got != want {
+		t.Fatalf("status before any hello = %+v, want %+v", got, want)
+	}
+
+	runSyncAs(t, b, sessA, helloAs("0.6.0"))
+	if got, want := read(b), (status{"0.6.0", true, 0, 0}); got != want {
+		t.Fatalf("status after the holder's hello = %+v, want %+v", got, want)
+	}
+
+	runSyncAs(t, b, sessB, helloAs("0.5.1"))
+	want := status{"0.6.0", true, 1, 1}
+	if got := read(b); got != want {
+		t.Fatalf("status after a denied hello = %+v, want %+v: the holder stays, one pending, one denial", got, want)
+	}
+
+	// The snapshot is the last committed state: it must stay readable while
+	// the bridge lock is held by a stalled handler.
+	b.mu.Lock()
+	locked := make(chan status, 1)
+	go func() { locked <- read(b) }()
+	select {
+	case got := <-locked:
+		if got != want {
+			b.mu.Unlock()
+			t.Fatalf("status under a held bridge lock = %+v, want %+v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		b.mu.Unlock()
+		t.Fatal("SessionStatus blocked on the bridge lock")
+	}
+	b.mu.Unlock()
+
+	if _, err := b.Sync(context.Background(), sessB, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := read(b), (status{"0.6.0", true, 0, 1}); got != want {
+		t.Fatalf("status after the pending session left = %+v, want %+v: the denial count is cumulative", got, want)
+	}
+
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := read(b), (status{"", false, 0, 1}); got != want {
+		t.Fatalf("status after the holder left = %+v, want %+v", got, want)
+	}
+}

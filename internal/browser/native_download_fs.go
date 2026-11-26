@@ -17,6 +17,10 @@ import (
 
 var errNativeSource = errors.New("native download source rejected")
 
+// syncNativeDir flushes a pinned directory's entries to stable storage. It is a
+// variable only so tests can observe the publish ordering and fail the flush.
+var syncNativeDir = syncNativeRootDir
+
 const nativeBaselineLimit = 4096
 
 // Private memory only: the persistent reservation survives losing this
@@ -253,6 +257,11 @@ func (r *nativeDownloadRoot) publish(ctx context.Context, jobID, filename string
 	if err != nil || !os.SameFile(info, pinned) {
 		return errNativeSource
 	}
+	// The job directory's own entry in the landing directory must be durable
+	// before a file inside it is: a flushed file in a lost directory is lost.
+	if err := syncNativeDir(r.landing); err != nil {
+		return errNativeSource
+	}
 	// A pinned job directory prevents an ancestor swap from redirecting
 	// publication into another job. Partial copy blocks the ordinary sweep.
 	part := filename + ".part"
@@ -309,6 +318,26 @@ func (r *nativeDownloadRoot) publish(ctx context.Context, jobID, filename string
 	}
 	// Link is exclusive; Rename would overwrite an existing name on Unix.
 	if err := jobRoot.Link(part, filename); err != nil {
+		return errNativeSource
+	}
+	// The partial name goes before the flush, not after: scanAdoptionDir
+	// treats any .part as a browser still writing and defers the whole
+	// directory, so a crash that kept both names would block adoption of the
+	// finished file. One flush then makes the link and the removal durable
+	// together. The deferred Remove above stays for the paths that fail earlier.
+	//
+	// The link is a directory entry; syncing only the copy's data leaves the
+	// name itself volatile. Admission and the ingest that follows this return
+	// are durable records of bytes that must still be there after power loss,
+	// so the entry is flushed before publication counts as done. A failure
+	// here withdraws the name: nothing may rely on a link that was never made
+	// durable, and a retry from the retained staging must be able to link anew.
+	if err := jobRoot.Remove(part); err != nil {
+		_ = jobRoot.Remove(filename)
+		return errNativeSource
+	}
+	if err := syncNativeDir(jobRoot); err != nil {
+		_ = jobRoot.Remove(filename)
 		return errNativeSource
 	}
 	return nil

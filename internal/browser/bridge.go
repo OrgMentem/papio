@@ -823,7 +823,14 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 			focusableAction[action.JobID] = action
 		}
 	}
+	// The open request is a set: a job named twice is focused, and counted,
+	// once, so queued never exceeds the number of distinct jobs surfaced.
+	seen := make(map[string]bool, len(jobIDs))
 	for _, jobID := range jobIDs {
+		if seen[jobID] {
+			continue
+		}
+		seen[jobID] = true
 		kind, ok := focusable[jobID]
 		if jobID == "" || !ok {
 			continue
@@ -1449,32 +1456,42 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 	case result := <-pending.result:
 		return result
 	case <-ctx.Done():
-		// The result and the timeout can become ready in the same instant:
-		// pending.result is buffered (cap 1), and a deliverer (handle's
-		// page_capture_request_result case, release, or promote) may have
-		// already sent into it right as ctx expires. Go's select then
-		// chooses pseudo-randomly between the two ready cases, so this arm
-		// can run even though a result is already sitting in the channel —
-		// reporting "timeout" for a capture that actually succeeded, while
-		// the file it already stored is silently orphaned (on disk, never
-		// reported). Re-check the channel in the same b.mu critical section
-		// that would otherwise clear the pending entry: whichever side (the
-		// deliverer's delete+send, or this recheck) reaches the lock first
-		// wins outright, so a delivered result is never dropped and the
-		// pending/busy entry is still cleared exactly once on every path.
-		b.mu.Lock()
-		select {
-		case result := <-pending.result:
-			b.mu.Unlock()
-			return result
-		default:
-		}
-		if b.pendingCaptures[sessionID] == pending {
-			delete(b.pendingCaptures, sessionID)
-		}
-		b.mu.Unlock()
-		return CaptureResult{RequestID: requestID, Outcome: "timeout", Detail: "browser page capture timed out"}
+		return b.settleCancelledCapture(sessionID, pending)
 	}
+}
+
+// settleCancelledCapture resolves a Capture whose context ended: the delivered
+// result if one is already buffered, otherwise a timeout, and in both cases the
+// pending entry is left cleared.
+//
+// The result and the timeout can become ready in the same instant:
+// pending.result is buffered (cap 1), and a deliverer (handle's
+// page_capture_request_result case, release, or promote) may have
+// already sent into it right as ctx expires. Go's select then
+// chooses pseudo-randomly between the two ready cases, so the ctx arm
+// can run even though a result is already sitting in the channel —
+// reporting "timeout" for a capture that actually succeeded, while
+// the file it already stored is silently orphaned (on disk, never
+// reported). Re-check the channel in the same b.mu critical section
+// that would otherwise clear the pending entry: whichever side (the
+// deliverer's delete+send, or this recheck) reaches the lock first
+// wins outright, so a delivered result is never dropped and the
+// pending/busy entry is still cleared exactly once on every path.
+//
+// It is its own method so a test can enter this arm with a result already
+// buffered: the select in Capture cannot be steered into the ctx arm.
+func (b *Bridge) settleCancelledCapture(sessionID string, pending *pendingPageCapture) CaptureResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case result := <-pending.result:
+		return result
+	default:
+	}
+	if b.pendingCaptures[sessionID] == pending {
+		delete(b.pendingCaptures, sessionID)
+	}
+	return CaptureResult{RequestID: pending.payload.RequestID, Outcome: "timeout", Detail: "browser page capture timed out"}
 }
 
 // release forgets a departing session. The caller holds b.mu.
@@ -3600,12 +3617,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		// drain (2026-09-23). The job keeps its open handoff and its route; only
 		// this holder's offer bookkeeping is dropped so a later poll offers it
 		// again through the ordinary offer gates.
-		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", map[string]any{"disposition": "requeued"}); err != nil {
-			log.Printf("papio: recording browser.job_reject: %v", err)
-			return nil, nil
-		}
+		// The bookkeeping is the behavior; the event is its audit trail. A
+		// failed write must not leave the offer latched for the rest of this
+		// holder session, so the drop comes first and the failure is only logged.
 		delete(b.offered, msg.JobID)
 		delete(b.queuedOffers, msg.JobID)
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", map[string]any{"disposition": "requeued"}); err != nil {
+			log.Printf("papio: recording browser.job_reject: %v", err)
+		}
 		return nil, nil
 
 	case protocol.MsgAuthPending, protocol.MsgAuthReturned:

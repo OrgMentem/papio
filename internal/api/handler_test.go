@@ -26,6 +26,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/drive"
 	"papio/internal/grab"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -1053,6 +1054,84 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 	msg, err := protocol.DecodeBrowserMessage(polled.Outbound[0])
 	if err != nil || msg.Type != protocol.MsgHandoffFocus || msg.JobID != id {
 		t.Fatalf("focus outbound = %+v, %v", msg, err)
+	}
+}
+
+// TestRouterActionsOpenCountsRepeatedJobIDsOnce pins the actions.open entry
+// contract: job_ids is a set. A job named more than once is focused once,
+// counted once and audited once, and the audit batch_size is the number of
+// distinct jobs, so neither the CLI's accounting nor the drain trail is
+// inflated by a repeated id (ledger finding papio-057aab03e0b0d461).
+func TestRouterActionsOpenCountsRepeatedJobIDsOnce(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeDelegated
+	cfg.DataDir = storetest.DataDir(t)
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
+	system, err := bootstrap.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	park := func(requestID, doi string) string {
+		id, err := system.Jobs.CreateRequest(ctx, requestID, work.Work{DOI: doi}, "", "", job.Policy{
+			AccessMode: config.ModeDelegated, DesiredVersion: "any",
+		}, nil, job.PrincipalUnknown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, edge := range [][2]string{
+			{job.StateQueued, job.StateResolving},
+			{job.StateResolving, job.StateFetching},
+			{job.StateFetching, job.StateAwaitingHuman},
+		} {
+			if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", app.OABrowserHandoffActionDetail("https://oa.example.test/"+requestID+".pdf"), job.Access(false, "")); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	first := park("request_api_dup_first", "10.1000/dup-first")
+	second := park("request_api_dup_second", "10.1000/dup-second")
+	router := Router(system)
+
+	const sessionID = "aaaabbbbccccddddeeeeffff00002222"
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-dup-001","seq":0,"payload":{"extension_version":"0.8.0"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync",
+		map[string]any{"session_id": sessionID, "messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+
+	var opened ActionsOpenResult
+	if rpcErr := callMethod(t, router, "actions.open",
+		map[string]any{"job_ids": []string{second, first, second, second, first}}, &opened); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !opened.SessionLive || opened.Queued != 2 {
+		t.Fatalf("actions.open = %+v, want queued:2 session_live:true for two distinct jobs", opened)
+	}
+	for _, id := range []string{first, second} {
+		events, err := system.Jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		audits := 0
+		for _, event := range events {
+			if event["kind"] != drive.HandoffOpenedEvent {
+				continue
+			}
+			audits++
+			detail, _ := event["detail"].(map[string]any)
+			if fmt.Sprint(detail["batch_size"]) != "2" {
+				t.Fatalf("%s detail = %+v, want batch_size 2, the distinct job count", id, detail)
+			}
+		}
+		if audits != 1 {
+			t.Fatalf("job %s recorded %d %s events, want 1", id, audits, drive.HandoffOpenedEvent)
+		}
 	}
 }
 

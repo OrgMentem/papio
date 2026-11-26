@@ -476,77 +476,84 @@ func TestPageCaptureRequestDeliveredCorrelatedStoredAndBusy(t *testing.T) {
 	}
 }
 
-// TestCaptureLateResultWinsOverConcurrentTimeout covers the outcome side of
-// ledger finding papio-373ff6c00ec87dbc: Capture's select race could pick the
-// ctx.Done() arm even though a result already sat in the buffered
-// pending.result channel, reporting "timeout" for a capture that actually
-// succeeded — and silently orphaning the stored file (on disk, never
-// reported).
-//
-// Scope, stated honestly: this test does NOT force the racing arm. Sending on
-// pending.result wakes Capture's select immediately, before the cancel below
-// is reached, so the result arm is what actually runs here and the recheck
-// added inside the ctx.Done() arm is not exercised. Forcing the other arm
-// would need both cases ready at the instant the select evaluates, which is
-// not reachable from outside Capture — and even then Go chooses between two
-// ready cases pseudo-randomly. So treat this as pinning the delivered-result
-// OUTCOME, with the sibling test pinning the genuine-timeout outcome; the
-// recheck itself is verified by reading, not by this test. Removing the
-// recheck does not make either test fail.
-func TestCaptureLateResultWinsOverConcurrentTimeout(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	runSync(t, b, hello())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	resultCh := make(chan CaptureResult, 1)
-	go func() {
-		resultCh <- b.Capture(ctx, CaptureRequest{
-			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
-		})
-	}()
-
-	deadline := time.Now().Add(time.Second)
-	var pending *pendingPageCapture
-	for {
+// TestSettleCancelledCapture enters Capture's ctx.Done arm directly. The
+// select in Capture cannot be steered into that arm from outside — a result
+// sent before the cancel wakes the result arm first, and when both cases are
+// ready Go chooses between them pseudo-randomly — so the arm's body is the
+// method under test. Ledger findings papio-373ff6c00ec87dbc, papio-154f24da6afc0264
+// and papio-3ddb5ce14ca4f2b1: a result already buffered when the context ends
+// must be returned rather than reported as a timeout, or the file it stored is
+// orphaned on disk and never reported.
+func TestSettleCancelledCapture(t *testing.T) {
+	newPending := func(requestID string) *pendingPageCapture {
+		return &pendingPageCapture{
+			payload:   protocol.PageCaptureRequestPayload{RequestID: requestID},
+			sessionID: testSessionID,
+			result:    make(chan CaptureResult, 1),
+		}
+	}
+	pendingCount := func(b *Bridge) int {
 		b.mu.Lock()
-		pending = b.pendingCaptures[testSessionID]
+		defer b.mu.Unlock()
+		return len(b.pendingCaptures)
+	}
+
+	t.Run("buffered result wins over the cancelled context", func(t *testing.T) {
+		b, _, _, _ := newBridge(t)
+		pending := newPending("req-late")
+		delivered := CaptureResult{RequestID: "req-late", Outcome: "captured", Path: "/tmp/papio-late-capture.html"}
+		// A deliverer's half of the race: under b.mu it removes the entry and
+		// sends into the buffered channel, all before the cancelled caller
+		// reaches the lock.
+		b.mu.Lock()
+		delete(b.pendingCaptures, testSessionID)
+		pending.result <- delivered
 		b.mu.Unlock()
-		if pending != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("capture request was not queued")
-		}
-		time.Sleep(time.Millisecond)
-	}
 
-	const storedPath = "/tmp/papio-late-capture.html"
-	b.mu.Lock()
-	delete(b.pendingCaptures, testSessionID)
-	pending.result <- CaptureResult{
-		RequestID: pending.payload.RequestID,
-		Outcome:   "captured",
-		Path:      storedPath,
-	}
-	b.mu.Unlock()
-	cancel()
-
-	select {
-	case result := <-resultCh:
-		if result.Outcome != "captured" || result.RequestID != pending.payload.RequestID || result.Path != storedPath {
-			t.Fatalf("capture result = %#v, want the delivered success rather than a timeout", result)
+		if got := b.settleCancelledCapture(testSessionID, pending); got != delivered {
+			t.Fatalf("settled capture = %#v, want the delivered result %#v rather than a timeout", got, delivered)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("capture did not return")
-	}
+		if n := pendingCount(b); n != 0 {
+			t.Fatalf("pendingCaptures = %d after a delivered result, want 0", n)
+		}
+		if len(pending.result) != 0 {
+			t.Fatal("the delivered result was left in the channel instead of consumed")
+		}
+	})
 
-	b.mu.Lock()
-	leaked := b.pendingCaptures[testSessionID] != nil
-	b.mu.Unlock()
-	if leaked {
-		t.Fatal("pending capture entry survived a resolved request, leaking the busy flag")
-	}
+	t.Run("undelivered capture times out and clears its entry", func(t *testing.T) {
+		b, _, _, _ := newBridge(t)
+		pending := newPending("req-none")
+		b.mu.Lock()
+		b.pendingCaptures[testSessionID] = pending
+		b.mu.Unlock()
+
+		got := b.settleCancelledCapture(testSessionID, pending)
+		if got.Outcome != "timeout" || got.RequestID != "req-none" {
+			t.Fatalf("settled capture = %#v, want a timeout for request req-none", got)
+		}
+		if n := pendingCount(b); n != 0 {
+			t.Fatalf("pendingCaptures = %d after a timeout, want 0 (leaked busy flag)", n)
+		}
+	})
+
+	t.Run("timeout leaves a newer request's entry alone", func(t *testing.T) {
+		b, _, _, _ := newBridge(t)
+		stale, newer := newPending("req-stale"), newPending("req-newer")
+		b.mu.Lock()
+		b.pendingCaptures[testSessionID] = newer
+		b.mu.Unlock()
+
+		if got := b.settleCancelledCapture(testSessionID, stale); got.Outcome != "timeout" {
+			t.Fatalf("settled capture = %#v, want a timeout", got)
+		}
+		b.mu.Lock()
+		kept := b.pendingCaptures[testSessionID]
+		b.mu.Unlock()
+		if kept != newer {
+			t.Fatal("a stale request's timeout cleared the entry of the request that replaced it")
+		}
+	})
 }
 
 // TestCaptureGenuineTimeoutClearsPendingState pins the other half of the
@@ -2583,6 +2590,28 @@ func TestHandoffJobOfferedExactlyOncePerHelloSession(t *testing.T) {
 	msgs3, _ := runSync(t, b, hello())
 	if got := countType(msgs3, protocol.MsgJobOffer); got != 1 {
 		t.Fatalf("job_offer after new hello = %d, want 1", got)
+	}
+}
+
+// TestFocusHandoffsCountsRepeatedJobIDOnce pins that the open request is a set:
+// a job named twice is focused once and counted once, so queued never exceeds
+// the distinct jobs surfaced (ledger finding papio-057aab03e0b0d461).
+func TestFocusHandoffsCountsRepeatedJobIDOnce(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	first := park(t, jobs, "wr_focus_dup_a", handoffWork())
+	second := park(t, jobs, "wr_focus_dup_b", work.Work{DOI: "10.1002/example.43", Title: "Another Institutional Paper", Authors: []string{"Hopper, Grace"}, Year: 2024})
+	runSyncAs(t, b, sessA, helloAs(HandoffFocusMinExtensionVersion))
+
+	queued, sessionLive, err := b.FocusHandoffs(context.Background(), []string{first, second, first, first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive || queued != 2 {
+		t.Fatalf("focus result = queued:%d live:%t, want 2,true: two distinct jobs, each named more than once", queued, sessionLive)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if got := countType(msgs, protocol.MsgHandoffFocus); got != 2 {
+		t.Fatalf("handoff_focus frames = %d, want one per distinct job (2)", got)
 	}
 }
 
@@ -6703,6 +6732,37 @@ func TestEmptyJobRejectKeepsHandoffOpenForReoffer(t *testing.T) {
 	offer := firstOfType(append(msgs, later...), protocol.MsgJobOffer)
 	if offer == nil || offer.JobID != id {
 		t.Fatalf("rejected handoff was not offered again: %+v %+v", msgs, later)
+	}
+}
+
+// TestJobRejectDropsOfferLatchWhenAuditWriteFails pins that the in-memory offer
+// bookkeeping is the behavior of an empty job_reject and its event only the
+// audit trail: a failed event write must not leave the handoff latched as
+// already offered for the rest of the holder session, where no later poll
+// would offer it again (ledger finding papio-c433f87ec3f0a5c3).
+func TestJobRejectDropsOfferLatchWhenAuditWriteFails(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_reject_audit_fail", handoffWork())
+	runSync(t, b, hello())
+	if !b.offered[id] {
+		t.Fatal("handoff was not offered on first sync")
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_job_reject_event BEFORE INSERT ON events
+		WHEN NEW.kind = 'browser.job_reject'
+		BEGIN SELECT RAISE(ABORT, 'injected job_reject audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The poll that carries the reject also re-offers a handoff whose latch was
+	// dropped, so the offer is the evidence; the latch map alone would already
+	// be set again by then.
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgJobReject, id, map[string]any{}))
+	later, _ := runSync(t, b)
+	offers := countType(msgs, protocol.MsgJobOffer) + countType(later, protocol.MsgJobOffer)
+	if offers != 1 {
+		t.Fatalf("job_offer frames after a reject whose audit write failed = %d, want 1: the offer stayed latched", offers)
 	}
 }
 

@@ -1797,11 +1797,14 @@ func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	if system == nil {
 		return marshal(ActionsOpenResult{})
 	}
+	// The request is a set. A job named twice is rediscovered, focused,
+	// counted and audited once, so Queued and the audit batch_size never
+	// exceed the distinct jobs; first-seen order is kept.
+	jobIDs := uniqueJobIDs(params.JobIDs)
 	// A manual download whose route is not the library's goes back to
 	// resolving before anything is focused; focusing it would open the
 	// library link. This does not need a browser: resolving re-derives the
 	// open-access handoff, which the bridge offers once one is connected.
-	jobIDs := params.JobIDs
 	if system.Jobs != nil {
 		var err error
 		if jobIDs, err = drive.RediscoverManualDownloads(ctx, system.Jobs, system.Config.OpenURLBaseFor, jobIDs); err != nil {
@@ -1816,6 +1819,20 @@ func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return failure(err)
 	}
 	return marshal(ActionsOpenResult{Queued: queued, SessionLive: sessionLive})
+}
+
+// uniqueJobIDs returns ids without repeats, in first-seen order.
+func uniqueJobIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
 }
 
 // planOpenActions answers, without changing anything, which of the named

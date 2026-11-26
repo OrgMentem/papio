@@ -198,3 +198,47 @@ func TestSuggestSurfacesDocumentIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyMetadataIdentifier pins every arm of the classifier that backs
+// DocumentIdentifiers: DOI first, then arXiv, then PMID, and nothing for a
+// value that is none of them. Fixture-driven adoption tests only ever carry a
+// DOI, so a regression in the arXiv or PMID normalizers' reach here would
+// otherwise pass CI while those identifiers silently stop being surfaced.
+func TestClassifyMetadataIdentifier(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, wantKind, wantValue string
+	}{
+		{"doi is lowercased", "10.1234/ABC.5", "doi", "10.1234/abc.5"},
+		{"doi prefix is stripped", "doi:10.1234/abc", "doi", "10.1234/abc"},
+		{"doi url loses trailing punctuation", "https://doi.org/10.1234/abc.", "doi", "10.1234/abc"},
+		{"arxiv doi is a doi, because doi is tried first", "10.48550/arXiv.2101.01234", "doi", "10.48550/arxiv.2101.01234"},
+		{"arxiv with a prefix", "arXiv:2101.01234", "arxiv", "2101.01234"},
+		{"arxiv keeps an explicit version", "arXiv:2101.01234v2", "arxiv", "2101.01234v2"},
+		{"arxiv abs url", "https://arxiv.org/abs/2101.01234", "arxiv", "2101.01234"},
+		{"arxiv old style", "hep-th/9901001", "arxiv", "hep-th/9901001"},
+		{"pmid", "12345678", "pmid", "12345678"},
+		{"pmid with a prefix", "PMID: 12345678", "pmid", "12345678"},
+		{"pmid loses leading zeros", "0000123", "pmid", "123"},
+		// Nine and ten digits are the width bounds of a PMID in practice. A
+		// bare ten-digit value that is also a valid ISBN-10 is a PMID here:
+		// the classifier does not know the field's scheme, and NormalizePMID
+		// accepts any 1-10 digit string. Pinned so a change is deliberate.
+		{"nine digit pmid", "123456789", "pmid", "123456789"},
+		{"ten digit pmid", "1234567890", "pmid", "1234567890"},
+		{"ten digit isbn-10 shaped value is a pmid", "0306406152", "pmid", "306406152"},
+		{"zero is not a pmid", "0", "", ""},
+		{"all zeros is not a pmid", "0000000000", "", ""},
+		{"eleven digits is not a pmid", "12345678901", "", ""},
+		{"empty", "", "", ""},
+		{"free text", "not an identifier", "", ""},
+		{"isbn with a scheme", "isbn:978-0-306-40615-7", "", ""},
+		{"malformed doi", "10.12/abc", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, value := classifyMetadataIdentifier(tc.raw)
+			if kind != tc.wantKind || value != tc.wantValue {
+				t.Fatalf("classifyMetadataIdentifier(%q) = (%q, %q), want (%q, %q)", tc.raw, kind, value, tc.wantKind, tc.wantValue)
+			}
+		})
+	}
+}

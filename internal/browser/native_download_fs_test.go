@@ -139,3 +139,93 @@ func TestNativeDownloadPublishRejectsSymlinkJobAndExistingFile(t *testing.T) {
 		})
 	}
 }
+
+// stubNativeDirSync replaces the directory flush for one test. observe, when
+// non-nil, runs on every flush with the flushed directory's base name; fail,
+// when non-nil, decides per flush whether it errors.
+func stubNativeDirSync(t *testing.T, observe func(dir string), fail func(dir string) bool) {
+	t.Helper()
+	previous := syncNativeDir
+	t.Cleanup(func() { syncNativeDir = previous })
+	syncNativeDir = func(root *os.Root) error {
+		dir := filepath.Base(root.Name())
+		if observe != nil {
+			observe(dir)
+		}
+		if fail != nil && fail(dir) {
+			return errors.New("injected directory flush failure")
+		}
+		return nil
+	}
+}
+
+// TestNativeDownloadPublishFlushesDirectoryEntries pins the durability order of
+// publish: the job directory's entry in the landing directory is flushed before
+// the file lands in it, and the job directory is flushed AFTER the final link
+// and AFTER the partial name is gone. The link is a directory entry the file's
+// own fsync does not cover, and a crash that kept both the final name and its
+// .part twin would make scanAdoptionDir defer the directory for good. Admission
+// and ingest are durable records that rely on that name surviving power loss
+// (ledger finding papio-9d536edcf322d81a).
+func TestNativeDownloadPublishFlushesDirectoryEntries(t *testing.T) {
+	r, source := nativeRootFixture(t, nil)
+	path := filepath.Join(source, "fresh.pdf")
+	writeAdoptionProbeFile(t, path, []byte("new"))
+	staged, err := r.stage(context.Background(), path, "native-test", 3, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(source, "papio", "job_test", "native-test.pdf")
+	type call struct {
+		dir                       string
+		finalPresent, partPresent bool
+	}
+	exists := func(path string) bool { _, err := os.Lstat(path); return err == nil }
+	var calls []call
+	stubNativeDirSync(t, func(dir string) {
+		calls = append(calls, call{dir, exists(final), exists(final + ".part")})
+	}, nil)
+	if err := r.publish(context.Background(), "job_test", "native-test.pdf", staged); err != nil {
+		t.Fatal(err)
+	}
+	want := []call{{"papio", false, false}, {"job_test", true, false}}
+	if len(calls) != len(want) || calls[0] != want[0] || calls[1] != want[1] {
+		t.Fatalf("directory flushes = %+v, want %+v: the landing entry before the file, the job directory after the link and after the .part is removed", calls, want)
+	}
+}
+
+// TestNativeDownloadPublishWithdrawsLinkWhenFlushFails pins the failure side:
+// a name whose directory entry could not be made durable must not stay behind
+// as a published file, and the retained staging must be republishable.
+func TestNativeDownloadPublishWithdrawsLinkWhenFlushFails(t *testing.T) {
+	for _, failing := range []string{"papio", "job_test"} {
+		t.Run(failing, func(t *testing.T) {
+			r, source := nativeRootFixture(t, nil)
+			path := filepath.Join(source, "fresh.pdf")
+			writeAdoptionProbeFile(t, path, []byte("new"))
+			staged, err := r.stage(context.Background(), path, "native-test", 3, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobDir := filepath.Join(source, "papio", "job_test")
+			final := filepath.Join(jobDir, "native-test.pdf")
+			stubNativeDirSync(t, nil, func(dir string) bool { return dir == failing })
+			if err := r.publish(context.Background(), "job_test", "native-test.pdf", staged); !errors.Is(err, errNativeSource) {
+				t.Fatalf("publish with a failing %s flush = %v, want errNativeSource", failing, err)
+			}
+			if _, err := os.Lstat(final); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("published name survived a failed flush: %v", err)
+			}
+			if _, err := os.Lstat(final + ".part"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial copy survived a failed publish: %v", err)
+			}
+			stubNativeDirSync(t, nil, nil)
+			if err := r.publish(context.Background(), "job_test", "native-test.pdf", staged); err != nil {
+				t.Fatalf("republish from retained staging: %v", err)
+			}
+			if got, err := os.ReadFile(final); err != nil || string(got) != "new" {
+				t.Fatalf("republished file = %q, %v", got, err)
+			}
+		})
+	}
+}
