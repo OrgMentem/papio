@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -142,5 +144,41 @@ func TestSignRefusesDocumentsTheDaemonWouldRefuse(t *testing.T) {
 	}
 	if _, _, err := runTool(t, "sign", "-key", keyPath, "-in", doc, "-sequence", "2"); err == nil {
 		t.Error("-in combined with -sequence was accepted")
+	}
+}
+
+// A failure after the exclusive create must not leave a file behind: the
+// leftover would be unusable as a key and would make a retry refuse to
+// overwrite it.
+func TestCreateKeyFileRemovesTheFileOnWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.pem")
+	boom := errors.New("disk full")
+	err := createKeyFile(path, func(w io.Writer) error {
+		_, _ = w.Write([]byte("partial"))
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("stat = %v, want the partial key file removed", statErr)
+	}
+	if err := createKeyFile(path, func(w io.Writer) error { _, err := w.Write([]byte("ok")); return err }); err != nil {
+		t.Fatalf("retry after failure: %v", err)
+	}
+}
+
+// The exclusive create must never delete a pre-existing file it refused to
+// overwrite.
+func TestCreateKeyFileKeepsAnExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.pem")
+	if err := os.WriteFile(path, []byte("precious"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := createKeyFile(path, func(io.Writer) error { return nil }); err == nil {
+		t.Fatal("createKeyFile overwrote an existing file")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "precious" {
+		t.Fatalf("existing file = %q, want untouched", data)
 	}
 }

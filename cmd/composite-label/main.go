@@ -123,10 +123,6 @@ func main() {
 		byKey[d.Key] = d
 	}
 
-	type target struct {
-		section string
-		entry   *identitycorpus.CompositeEntry
-	}
 	var queue []target
 	if *only != "audit" {
 		for i := range review.Proposals {
@@ -160,22 +156,34 @@ func main() {
 	fmt.Println("  ?  show this legend")
 	fmt.Println("  q  save and quit")
 
-	in := bufio.NewReader(os.Stdin)
+	runSession(bufio.NewReader(os.Stdin), queue, byKey, *labels, &review, *relabel, *excerpt, pending, save, open)
+}
+
+// target is one row awaiting a human judgement.
+type target struct {
+	section string
+	entry   *identitycorpus.CompositeEntry
+}
+
+// runSession walks the queue, reading one answer per row from in. Entries are
+// mutated in place and persisted through saveFn after every recorded label and
+// on q or EOF, so an abandoned session resumes where it stopped.
+func runSession(in *bufio.Reader, queue []target, byKey map[string]identitycorpus.Document, labels string, review *identitycorpus.CompositeReview, relabel bool, excerpt, pending int, saveFn func(string, identitycorpus.CompositeReview), openFn func(string) error) {
 	done := 0
 	for _, t := range queue {
-		if !*relabel && t.entry.Reviewed {
+		if !relabel && t.entry.Reviewed {
 			continue
 		}
 		done++
 		doc, haveDoc := byKey[t.entry.Key]
 
 		for {
-			printRow(t.section, done, pending, *t.entry, doc, haveDoc, *excerpt)
+			printRow(t.section, done, pending, *t.entry, doc, haveDoc, excerpt)
 			fmt.Print("label> ")
 			line, err := in.ReadString('\n')
 			if err != nil && line == "" {
 				fmt.Println()
-				save(*labels, review)
+				saveFn(labels, *review)
 				return
 			}
 			answer := strings.ToLower(strings.TrimSpace(line))
@@ -184,8 +192,8 @@ func main() {
 			case "":
 				fmt.Println("  (skipped, still unlabelled)")
 			case "q":
-				save(*labels, review)
-				printTally(review)
+				saveFn(labels, *review)
+				printTally(*review)
 				return
 			case "?":
 				for _, l := range labelKeys {
@@ -197,7 +205,7 @@ func main() {
 					fmt.Println("  no document loaded for this key; cannot open")
 					continue
 				}
-				if err := open(doc.Path); err != nil {
+				if err := openFn(doc.Path); err != nil {
 					fmt.Println("  could not open:", err)
 				}
 				continue
@@ -221,12 +229,12 @@ func main() {
 				fmt.Printf("  recorded: %s\n", class)
 				// Save after every row: an hour of judgement must not depend on
 				// this process exiting cleanly.
-				save(*labels, review)
+				saveFn(labels, *review)
 			}
 			break
 		}
 	}
-	printTally(review)
+	printTally(*review)
 }
 
 func classFor(key string) (identitycorpus.CompositeClass, bool) {

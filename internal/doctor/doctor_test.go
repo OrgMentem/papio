@@ -599,6 +599,49 @@ func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testin
 	}
 }
 
+func TestRunIntegrationFlagsExtensionBelowTheFloor(t *testing.T) {
+	cases := []struct {
+		version    string
+		wantStatus string
+		wantDetail string
+	}{
+		{browser.MinExtensionVersion, Pass, ""},
+		{"99.0.0", Pass, ""},
+		{"0.0.1", Warn, "below the daemon's minimum " + browser.MinExtensionVersion},
+	}
+	for _, tc := range cases {
+		t.Run(tc.version, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+			report := RunIntegration(context.Background(), IntegrationDependencies{
+				CLIVersion: "v",
+				LoadConfig: func() (config.Config, error) { return cfg, nil },
+				DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+					return DaemonStatus{Status: "ok", Version: "v", ExtensionConnected: true, ExtensionVersion: tc.version}, nil
+				},
+				ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+				FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+				ReadFile:    os.ReadFile,
+				ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+					return &zotio.PreflightResult{Version: "1.2.3"}, nil
+				},
+			})
+			var got *Check
+			for i := range report.Checks {
+				if report.Checks[i].Name == "extension" {
+					got = &report.Checks[i]
+				}
+			}
+			if got == nil {
+				t.Fatalf("no extension check in %+v", report.Checks)
+			}
+			if got.Status != tc.wantStatus || !strings.Contains(got.Detail, tc.wantDetail) {
+				t.Fatalf("extension %s check = %#v, want %s containing %q", tc.version, *got, tc.wantStatus, tc.wantDetail)
+			}
+		})
+	}
+}
+
 func TestRunIntegrationReportsConfiguredLibrarySourcesWithoutProbe(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")

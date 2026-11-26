@@ -73,20 +73,9 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	// O_CREATE honours the umask; the key must be 0600 whatever it is.
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		return err
-	}
-	if err := pem.Encode(file, &pem.Block{Type: "PRIVATE KEY", Bytes: der}); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
+	if err := createKeyFile(*out, func(w io.Writer) error {
+		return pem.Encode(w, &pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	}); err != nil {
 		return err
 	}
 	encoded := base64.StdEncoding.EncodeToString(public)
@@ -94,6 +83,31 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stderr, "Set the embedded public key in internal/adaptercontrol/trust.go to the value on stdout.\n")
 	fmt.Fprintln(stdout, encoded)
 	return nil
+}
+
+// createKeyFile creates path exclusively with mode 0600 and fills it with
+// write. Any failure after the create removes the file, because a partial or
+// empty key left behind would make the next keygen refuse to overwrite it.
+func createKeyFile(path string, write func(io.Writer) error) (err error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	// O_CREATE honours the umask; the key must be 0600 whatever it is.
+	if err = file.Chmod(0o600); err != nil {
+		file.Close()
+		return err
+	}
+	if err = write(file); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 type listFlag []string

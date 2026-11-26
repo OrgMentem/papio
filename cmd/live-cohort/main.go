@@ -193,7 +193,7 @@ func wireSafety(opts *livecohort.Options, dataDir, journalPath string, noStore b
 // probe fails fast when no daemon is listening, so a thirty-work run does
 // not discover that on its first submission and report thirty submit
 // failures as a measurement.
-func probe(ctx context.Context, caller *socketCaller) error {
+func probe(ctx context.Context, caller livecohort.Caller) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var result map[string]any

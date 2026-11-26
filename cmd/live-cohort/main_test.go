@@ -4,14 +4,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"papio/internal/bench"
+	"papio/internal/ipc"
 	"papio/internal/livecohort"
+	"papio/internal/store/storetest"
 )
 
 func writeStore(t *testing.T, dir string) {
@@ -64,14 +68,12 @@ func TestWireSafetyRefusesWithoutTheJournal(t *testing.T) {
 // -no-store drops the untried-candidate column, which is evidence. The
 // safety lookup is not evidence, so it stays wired.
 func TestWireSafetyKeepsTheLookupUnderNoStore(t *testing.T) {
-	dataDir := t.TempDir()
-	writeStore(t, dataDir)
+	dataDir := storetest.DataDir(t)
 	var opts livecohort.Options
 	closeSafety, err := wireSafety(&opts, dataDir, filepath.Join(t.TempDir(), "j.json"), true)
 	if err != nil {
 		t.Fatalf("wireSafety: %v", err)
 	}
-	defer closeSafety()
 	if opts.Lookup == nil {
 		t.Fatal("lookup is nil: -no-store must only drop the candidate column")
 	}
@@ -80,6 +82,49 @@ func TestWireSafetyKeepsTheLookupUnderNoStore(t *testing.T) {
 	}
 	if opts.Journal == nil {
 		t.Fatal("journal is nil: the safety record must always be wired")
+	}
+	// The inspector's handle must be released by the returned closer.
+	inspector, ok := opts.Lookup.(*livecohort.StoreInspector)
+	if !ok {
+		t.Fatalf("lookup is %T, want *livecohort.StoreInspector", opts.Lookup)
+	}
+	if _, _, err := inspector.UntriedCandidates(context.Background(), "job"); err != nil {
+		t.Fatalf("inspector query before close: %v", err)
+	}
+	closeSafety()
+	if _, _, err := inspector.UntriedCandidates(context.Background(), "job"); err == nil {
+		t.Fatal("inspector still usable after closeSafety: the handle leaked")
+	}
+}
+
+type probeCaller struct{ err error }
+
+func (c probeCaller) Call(context.Context, string, any, any) error { return c.err }
+
+// probe separates "no daemon" from "daemon answered with a complaint": a
+// remote error proves the daemon is up, a transport error does not.
+func TestProbeClassifiesDaemonReachability(t *testing.T) {
+	transport := errors.New("dial unix: connect: no such file")
+	cases := []struct {
+		name    string
+		err     error
+		wantErr bool
+	}{
+		{"success", nil, false},
+		{"remote error", &ipc.RemoteError{Code: "bad_request", Message: "no"}, false},
+		{"wrapped remote error", fmt.Errorf("stats: %w", &ipc.RemoteError{Code: "x"}), false},
+		{"transport error", transport, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := probe(context.Background(), probeCaller{err: tc.err})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("probe err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !errors.Is(err, transport) {
+				t.Fatalf("probe err = %v, want the transport error", err)
+			}
+		})
 	}
 }
 

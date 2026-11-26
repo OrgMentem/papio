@@ -890,3 +890,43 @@ func TestByJobID(t *testing.T) {
 		t.Fatalf("ByJobID duplicate job_id id = %q, want newest %q", latest.ID, newerGrabID)
 	}
 }
+
+// A request id already recorded on a settled grab for another source makes
+// the insert hit the unique effect_request_id index. With no active grab for
+// this source to return, the allocation must refuse with ErrBusy and leave no
+// partial rows, rather than surface a raw constraint error.
+func TestAllocateEffectRequestIDCollisionIsBusy(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	db := s.DB()
+	now := store.Now()
+	if _, err := db.ExecContext(ctx, `INSERT INTO pdf_grabs(id, url_host, title, effect_request_id, state, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`,
+		"grab-settled-001", "old.example.org", "Old", "req-collide", string(StateAbandoned), now, now); err != nil {
+		t.Fatalf("seed settled grab: %v", err)
+	}
+	svc := New(s, nil)
+	prepareCalled := false
+	_, err = svc.AllocateEffect(ctx, "pdf.example.org", "Paper", 1, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), func(string) error {
+		prepareCalled = true
+		return nil
+	}, "req-collide")
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("AllocateEffect err = %v, want ErrBusy on effect_request_id collision", err)
+	}
+	if prepareCalled {
+		t.Fatal("prepare must not run when the insert collides")
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM pdf_grabs`); n != 1 {
+		t.Fatalf("pdf_grabs = %d, want only the seeded row", n)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM effect_permits`); n != 0 {
+		t.Fatalf("effect_permits = %d, want 0", n)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM events WHERE kind='browser.pdf_grab_started'`); n != 0 {
+		t.Fatalf("events = %d, want 0", n)
+	}
+}
