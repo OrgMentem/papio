@@ -857,3 +857,109 @@ func TestPauseNoticeRetriesAfterACrashBetweenPauseAndRoute(t *testing.T) {
 		t.Fatalf("notices = %d after a second pass, want no duplicate", len(h.sink.intents))
 	}
 }
+
+// A route the pacer cannot name (a job that cannot be read, or a paper with
+// no DOI prefix) is not a second provider: it never satisfies the
+// two-provider predicate for the shared sign-in pause.
+func TestUnknownRoutesNeverCountAsTwoProvidersForTheSharedSignIn(t *testing.T) {
+	cases := []struct {
+		name         string
+		dois         [2]string
+		missingLater bool
+		want         bool
+	}{
+		{name: "two known prefixes", dois: [2]string{"10.1111/a", "10.2222/b"}, want: true},
+		{name: "two jobs without DOIs", dois: [2]string{"", ""}},
+		{name: "one empty and one known prefix", dois: [2]string{"", "10.2222/b"}},
+		{name: "known prefix and a job that cannot be read", dois: [2]string{"10.1111/a", ""}, missingLater: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, true)
+			ctx := context.Background()
+			earlier := h.park("wr_unk_a", tc.dois[0], "openurl_handoff")
+			later := h.park("wr_unk_b", tc.dois[1], "openurl_handoff")
+			if tc.missingLater {
+				later = "job_does_not_exist"
+			}
+			opens := []job.EventRecord{{Seq: 9002, JobID: later}, {Seq: 9001, JobID: earlier}}
+			for _, open := range opens {
+				if err := h.jobs.S.RecordSystemEvent(ctx, SignInStalledEvent, map[string]any{"paced_open_seq": float64(open.Seq)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, _, err := h.pacer.sharedSignInEvidence(ctx, opens)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got != nil) != tc.want {
+				t.Fatalf("evidence = %+v, want evidence=%t", got, tc.want)
+			}
+		})
+	}
+}
+
+// A failed route lookup is not evidence that the shared sign-in cleared: an
+// existing pause stays as it is, with no resume, no re-pause and no new
+// notice, and the drive opens nothing while the lookup fails.
+func TestAFailedRouteLookupLeavesAnExistingPauseUnchanged(t *testing.T) {
+	h := newHarness(t, true)
+	ctx := context.Background()
+	first := h.park("wr_lookup_a", "10.1111/a", "openurl_handoff")
+	second := h.park("wr_lookup_b", "10.2222/b", "openurl_handoff")
+	third := h.park("wr_lookup_c", "10.3333/c", "openurl_handoff")
+	h.run()
+	h.stallSignIn(first)
+	h.clock = h.clock.Add(11 * time.Minute)
+	h.run()
+	h.stallSignIn(second)
+	h.clock = h.clock.Add(11 * time.Minute)
+	h.run()
+	h.run()
+	if status := h.status(); !status.Paused || len(h.sink.intents) != 1 {
+		t.Fatalf("status = %+v with %d notices, want the shared sign-in pause", status, len(h.sink.intents))
+	}
+
+	// The pause owes its notice: drop the marker, as a Route failure would
+	// have left it.
+	if _, err := h.jobs.S.DB().ExecContext(ctx, "DELETE FROM events WHERE kind = ?", PausedNotifiedEvent); err != nil {
+		t.Fatal(err)
+	}
+	var policy string
+	if err := h.jobs.S.DB().QueryRowContext(ctx, "SELECT policy_json FROM jobs WHERE id = ?", second).Scan(&policy); err != nil {
+		t.Fatal(err)
+	}
+	setPolicy := func(value string) {
+		t.Helper()
+		if _, err := h.jobs.S.DB().ExecContext(ctx, "UPDATE jobs SET policy_json = ? WHERE id = ?", value, second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPolicy("not json")
+	h.run()
+	h.run()
+	resumes, err := h.jobs.EventsOfKind(ctx, ResumedEvent, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumes) != 0 || !h.status().Paused {
+		t.Fatalf("resumes = %d, status = %+v, want the pause unchanged by a failed lookup", len(resumes), h.status())
+	}
+	if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second}) {
+		t.Fatalf("opened %v, want no open (not %s) while the lookup fails", got, third)
+	}
+
+	if len(h.sink.intents) != 1 {
+		t.Fatalf("%d notices after a failed lookup, want none routed on that pass", len(h.sink.intents))
+	}
+
+	setPolicy(policy)
+	h.run()
+	h.run()
+	if status := h.status(); !status.Paused || len(h.sink.intents) != 2 {
+		t.Fatalf("status = %+v with %d notices after the lookup recovered, want the pause held and the owed notice routed once", status, len(h.sink.intents))
+	}
+	if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second}) {
+		t.Fatalf("opened %v, want the pause held", got)
+	}
+}

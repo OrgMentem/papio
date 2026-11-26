@@ -160,6 +160,9 @@ type evaluation struct {
 	// shared is evidence that the institution's shared sign-in, not one
 	// provider route, needs a person.
 	shared *sharedSignIn
+	// sharedIndeterminate is set when a route lookup failed, so the shared
+	// evidence is unknown this pass: an existing pause is left as it is.
+	sharedIndeterminate bool
 }
 
 // sharedSignIn names the paced papers whose stalls are the evidence.
@@ -246,7 +249,7 @@ func (p *Pacer) RunDue(ctx context.Context) error {
 	switch {
 	case eval.shared != nil && !eval.Paused:
 		return p.pauseForSignIn(ctx, now, *eval.shared)
-	case eval.shared == nil && eval.Paused && eval.PausedReason == PauseSignIn:
+	case eval.shared == nil && !eval.sharedIndeterminate && eval.Paused && eval.PausedReason == PauseSignIn:
 		if err := p.Jobs.S.RecordSystemEvent(ctx, ResumedEvent, map[string]any{"reason": "sign_in_cleared"}); err != nil {
 			return err
 		}
@@ -258,8 +261,10 @@ func (p *Pacer) RunDue(ctx context.Context) error {
 	// pause commit outlived the Route: a crash between them, or a Route
 	// failure, otherwise silences the episode forever because later passes see
 	// eval.Paused and never come back to pauseForSignIn. Pauses that just
-	// cleared resume above with no notice: the sign-in already returned.
-	if eval.Paused && eval.PausedReason == PauseSignIn {
+	// cleared resume above with no notice: the sign-in already returned. A
+	// pass whose route evidence is indeterminate changes nothing, notice
+	// included.
+	if eval.Paused && eval.PausedReason == PauseSignIn && !eval.sharedIndeterminate {
 		if err := p.ensurePauseNotified(ctx); err != nil {
 			return err
 		}
@@ -385,13 +390,13 @@ func (p *Pacer) signInStalled(ctx context.Context, now time.Time, open job.Event
 // Stalls through two profiles are two institutions' sign-ins, not one
 // shared sign-in. A sign-in that returned anywhere after the later stall,
 // or an operator resume after it, clears the evidence.
-func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecord) (*sharedSignIn, error) {
+func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecord) (evidence *sharedSignIn, indeterminate bool, err error) {
 	if len(opens) < 2 {
-		return nil, nil
+		return nil, false, nil
 	}
 	stalls, err := p.Jobs.EventsOfKind(ctx, SignInStalledEvent, 200)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	stalledOpen := map[int64]int64{}
 	for _, stall := range stalls {
@@ -403,36 +408,44 @@ func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecor
 	latestStall, latestOK := stalledOpen[latest.Seq]
 	earlierStall, earlierOK := stalledOpen[earlier.Seq]
 	if !latestOK || !earlierOK || latest.JobID == earlier.JobID {
-		return nil, nil
+		return nil, false, nil
 	}
-	latestRoute, earlierRoute := p.jobRoute(ctx, latest.JobID), p.jobRoute(ctx, earlier.JobID)
+	// Two different providers are positive evidence. A paper with no DOI
+	// prefix names no provider, so it never satisfies the two-prefix
+	// predicate. A failed route lookup is neither evidence nor its absence:
+	// it is reported as indeterminate so RunDue leaves an existing pause alone.
+	latestRoute, latestErr := p.jobRoute(ctx, latest.JobID)
+	earlierRoute, earlierErr := p.jobRoute(ctx, earlier.JobID)
+	if latestErr != nil || earlierErr != nil {
+		return nil, true, nil
+	}
+	if latestRoute.prefix == "" || earlierRoute.prefix == "" || latestRoute.prefix == earlierRoute.prefix {
+		return nil, false, nil
+	}
 	if latestRoute.institution != earlierRoute.institution {
-		return nil, nil
-	}
-	if latestRoute.prefix != "" && latestRoute.prefix == earlierRoute.prefix {
-		return nil, nil
+		return nil, false, nil
 	}
 	evidenceSeq := max(latestStall, earlierStall)
 	returned, err := p.Jobs.EventsOfKind(ctx, "browser.auth_returned", 1)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(returned) > 0 && returned[0].Seq > evidenceSeq {
-		return nil, nil
+		return nil, false, nil
 	}
 	resumes, err := p.Jobs.EventsOfKind(ctx, ResumedEvent, 50)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	for _, resume := range resumes {
 		if reason, _ := resume.Detail["reason"].(string); reason == PauseOperator {
 			if resume.Seq > evidenceSeq {
-				return nil, nil
+				return nil, false, nil
 			}
 			break
 		}
 	}
-	return &sharedSignIn{jobs: []string{latest.JobID, earlier.JobID}}, nil
+	return &sharedSignIn{jobs: []string{latest.JobID, earlier.JobID}}, false, nil
 }
 
 // pacedRoute names what a paced open went through: the institution (its
@@ -443,16 +456,18 @@ type pacedRoute struct {
 	prefix      string
 }
 
-func (p *Pacer) jobRoute(ctx context.Context, jobID string) pacedRoute {
+// jobRoute returns the job's route. The prefix is empty when the paper has
+// no DOI prefix, which names no provider. A lookup failure is the error.
+func (p *Pacer) jobRoute(ctx context.Context, jobID string) (pacedRoute, error) {
 	row, err := p.Jobs.Get(ctx, jobID)
 	if err != nil {
-		return pacedRoute{}
+		return pacedRoute{}, err
 	}
 	institution := row.Policy.Resolver
 	if institution == "default" {
 		institution = ""
 	}
-	return pacedRoute{institution: institution, prefix: doiPrefix(row.Work.DOI)}
+	return pacedRoute{institution: institution, prefix: doiPrefix(row.Work.DOI)}, nil
 }
 
 func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, shared sharedSignIn) error {
@@ -629,7 +644,7 @@ func (p *Pacer) evaluate(ctx context.Context, now time.Time) (evaluation, error)
 			eval.stalled = &opens[0]
 		}
 	}
-	if eval.shared, err = p.sharedSignInEvidence(ctx, opens); err != nil {
+	if eval.shared, eval.sharedIndeterminate, err = p.sharedSignInEvidence(ctx, opens); err != nil {
 		return eval, err
 	}
 	if eval.Paused || (eval.shared != nil && cfg.Enabled) {
