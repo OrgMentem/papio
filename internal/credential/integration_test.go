@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zalando/go-keyring"
 )
 
 // TestOSStoreRoundTrip requires both explicit opt-ins:
@@ -28,6 +30,7 @@ func TestOSStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewStore()
+	s.backend = backend{load: keyring.Get, save: keyring.Set, delete: keyring.Delete}
 	s.service = serviceName + ".test." + strings.TrimPrefix(ref, "keyring:")
 	ctx := context.Background()
 	if _, err := s.Load(ctx, ref); err != ErrNotFound {

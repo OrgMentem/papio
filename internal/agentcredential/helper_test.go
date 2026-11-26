@@ -3,7 +3,9 @@
 package agentcredential
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -96,14 +98,17 @@ func TestHelperStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHelperStoreFallsBackWhenTheHelperCannotStart pins that isolation is
-// hardening, not a dependency: after the executable is replaced on disk the
-// call still reaches the OS store, in process, and the gate is released.
-func TestHelperStoreFallsBackWhenTheHelperCannotStart(t *testing.T) {
-	s := testStore(backend{load: func(string, string) (string, error) { return "synthetic-key", nil }})
+// TestHelperStoreDoesNotFallBackWhenTheHelperCannotStart pins that a helper that
+// cannot start dispatches no OS call, in process or otherwise.
+func TestHelperStoreDoesNotFallBackWhenTheHelperCannotStart(t *testing.T) {
+	calls := 0
+	s := testStore(backend{load: func(string, string) (string, error) { calls++; return "synthetic-key", nil }})
 	s.helper = filepath.Join(t.TempDir(), "missing")
-	if key, err := s.Load(context.Background(), testProfile); key != "synthetic-key" || err != nil {
-		t.Fatalf("load with a missing helper = %q, %v, want the in-process call", key, err)
+	if key, err := s.Load(context.Background(), testProfile); key != "" || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("load with a missing helper = %q, %v, want ErrUnavailable", key, err)
+	}
+	if calls != 0 {
+		t.Fatal("the call ran in process")
 	}
 	if s.busy.Load() {
 		t.Fatal("the gate stayed held")
@@ -183,5 +188,34 @@ func TestServeHelperRejectsRequestsForOtherCredentials(t *testing.T) {
 		if err := serveHelper(strings.NewReader(request), &out, b); err == nil || out.Len() != 0 {
 			t.Errorf("%s: serveHelper = %v, output %q; want a refusal with no response", name, err, out.String())
 		}
+	}
+}
+
+// TestServeHelperPreservesInvalidUTF8 pins that values cross the helper
+// boundary byte for byte; JSON text would replace invalid UTF-8 with U+FFFD.
+func TestServeHelperPreservesInvalidUTF8(t *testing.T) {
+	const raw = "\xff\xfe\x80value"
+	ns := Namespace{Service: "test.service", ValidAccount: func(string) bool { return true }, ValidValue: func(string) bool { return true }}
+	var saved string
+	b := backend{
+		load: func(string, string) (string, error) { return raw, nil },
+		save: func(_, _, v string) error { saved = v; return nil },
+	}
+	req, err := json.Marshal(helperRequest{Op: OpSave, Service: ns.Service, Account: "a", Key: []byte(raw)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := serveHelper(bytes.NewReader(req), &out, b, ns); err != nil || saved != raw {
+		t.Fatalf("save through helper: err=%v saved=%q, want unchanged bytes", err, saved)
+	}
+	req, _ = json.Marshal(helperRequest{Op: OpLoad, Service: ns.Service, Account: "a"})
+	out.Reset()
+	if err := serveHelper(bytes.NewReader(req), &out, b, ns); err != nil {
+		t.Fatal(err)
+	}
+	var resp helperResponse
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil || string(resp.Key) != raw {
+		t.Fatalf("load through helper: err=%v key=%q, want unchanged bytes", err, resp.Key)
 	}
 }

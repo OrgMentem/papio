@@ -90,7 +90,7 @@ func ValidateKey(key string) error {
 // invalid stored content, and unavailable stores must not be treated as absence.
 func (s *Store) Load(ctx context.Context, profile string) (string, error) {
 	return s.run(ctx, profile, false, func(ctx context.Context) (string, error) {
-		key, err := s.dispatch(ctx, opLoad, profile, "")
+		key, err := s.dispatch(ctx, OpLoad, profile, "")
 		if err != nil {
 			return "", err
 		}
@@ -108,7 +108,7 @@ func (s *Store) Save(ctx context.Context, profile, key string) error {
 		return err
 	}
 	_, err := s.run(ctx, profile, true, func(ctx context.Context) (string, error) {
-		return s.dispatch(ctx, opSave, profile, key)
+		return s.dispatch(ctx, OpSave, profile, key)
 	})
 	return err
 }
@@ -117,7 +117,7 @@ func (s *Store) Save(ctx context.Context, profile, key string) error {
 // A timeout or cancellation after dispatch includes ErrUncertain.
 func (s *Store) Delete(ctx context.Context, profile string) error {
 	_, err := s.run(ctx, profile, true, func(ctx context.Context) (string, error) {
-		return s.dispatch(ctx, opDelete, profile, "")
+		return s.dispatch(ctx, OpDelete, profile, "")
 	})
 	return err
 }
@@ -126,21 +126,25 @@ func (s *Store) Delete(ctx context.Context, profile string) error {
 // the call ignores ctx and cannot be cancelled; through a helper, ctx kills it.
 func (s *Store) dispatch(ctx context.Context, op, profile, key string) (string, error) {
 	if s.helper != "" {
-		value, err := runHelperProcess(ctx, s.helper, helperRequest{Op: op, Service: s.service, Account: profile, Key: key})
-		// Isolation hardens the call; it is not a dependency. A helper that
-		// cannot start has dispatched nothing, so the call may run in process.
-		if !errors.Is(err, errHelperNotStarted) {
-			return value, err
+		value, err := runHelperProcess(ctx, s.helper, helperRequest{Op: op, Service: s.service, Account: profile, Key: []byte(key)})
+		// A helper that cannot start dispatched nothing. Never fall back to
+		// an in-process call that the deadline could not cancel.
+		if errors.Is(err, ErrHelperNotStarted) {
+			if cerr := ctx.Err(); cerr != nil {
+				return "", cerr
+			}
+			return "", ErrUnavailable
 		}
+		return value, err
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	switch op {
-	case opLoad:
+	case OpLoad:
 		value, err := s.backend.load(s.service, profile)
 		return value, sanitize(err)
-	case opSave:
+	case OpSave:
 		return "", sanitize(s.backend.save(s.service, profile, key))
 	default:
 		return "", sanitize(s.backend.delete(s.service, profile))

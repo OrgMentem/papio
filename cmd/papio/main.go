@@ -11,6 +11,7 @@ import (
 
 	"papio/internal/agentcredential"
 	"papio/internal/cli"
+	"papio/internal/credential"
 	"papio/internal/nativehost"
 	"papio/internal/pdf"
 )
@@ -35,7 +36,7 @@ func main() {
 		return
 	}
 	if len(os.Args) == 2 && os.Args[1] == agentcredential.HelperArgument {
-		if err := agentcredential.RunHelper(os.Stdin, os.Stdout); err != nil {
+		if err := agentcredential.RunHelper(os.Stdin, os.Stdout, credential.HelperNamespace()); err != nil {
 			fmt.Fprintln(os.Stderr, "credential helper:", err)
 			os.Exit(1)
 		}

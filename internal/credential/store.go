@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/zalando/go-keyring"
+
+	"papio/internal/agentcredential"
 )
 
 const (
@@ -30,6 +32,7 @@ type backend struct {
 
 // The library's API cannot cancel an OS call. Retain this process-wide gate
 // until the call actually completes, even after its caller stops waiting.
+// Through the helper process the deadline kills the call, which frees the gate.
 // The legacy agentcredential package keeps its own compatibility-store gate.
 var systemBusy atomic.Bool
 
@@ -38,33 +41,96 @@ var systemBusy atomic.Bool
 type Store struct {
 	service string
 	backend backend
+	// helper, when set, is the executable that runs each OS call in a process
+	// the deadline can kill. Empty means backend is called in this process; only
+	// tests and a process that never called agentcredential.UseHelperProcess do so.
+	helper  string
 	busy    *atomic.Bool
 	timeout time.Duration
 }
 
+// HelperNamespace describes this package's OS credential service for the shared
+// helper process. Pass it to agentcredential.RunHelper in helper mode.
+func HelperNamespace() agentcredential.Namespace {
+	return agentcredential.Namespace{
+		Service:      serviceName,
+		ValidAccount: keyringReference,
+		ValidValue:   func(v string) bool { _, err := Decode(v); return err == nil },
+	}
+}
+
 // NewStore selects the current user's macOS Keychain, Windows Credential
 // Manager or Linux Secret Service. Construction performs no OS store access.
+// After agentcredential.UseHelperProcess, each call runs in the shared helper
+// process that a timeout kills; a helper that cannot start yields ErrUnavailable.
+// With no helper configured the store has no backend and every call returns
+// ErrUnavailable: production never calls the OS in process.
 func NewStore() *Store {
-	return &Store{
+	s := &Store{
 		service: serviceName,
-		backend: backend{load: keyring.Get, save: keyring.Set, delete: keyring.Delete},
 		busy:    &systemBusy,
 		timeout: operationTimeout,
+	}
+	if binary, ok := agentcredential.HelperBinary(); ok {
+		s.helper = binary
+	}
+	return s
+}
+
+// dispatch runs one OS call. Through a helper, ctx kills it; in process it
+// cannot be cancelled. A helper that cannot start dispatched nothing and never
+// falls back to an in-process call.
+func (s *Store) dispatch(ctx context.Context, op, ref, value string) (string, error) {
+	if s.helper != "" {
+		out, err := agentcredential.CallHelper(ctx, s.helper, s.service, op, ref, value)
+		switch {
+		case err == nil:
+			return out, nil
+		case errors.Is(err, agentcredential.ErrNotFound):
+			return "", ErrNotFound
+		case errors.Is(err, agentcredential.ErrHelperNotStarted):
+			if cerr := ctx.Err(); cerr != nil {
+				return "", cerr
+			}
+			return "", ErrUnavailable
+		case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+			// The helper started, so a mutation may have reached the OS.
+			if op != agentcredential.OpLoad {
+				return "", errors.Join(ErrUncertain, err)
+			}
+			return "", err
+		default:
+			return "", ErrUnavailable
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	switch op {
+	case agentcredential.OpLoad:
+		if s.backend.load == nil {
+			return "", ErrUnavailable
+		}
+		v, err := s.backend.load(s.service, ref)
+		return v, sanitize(err)
+	case agentcredential.OpSave:
+		if s.backend.save == nil {
+			return "", ErrUnavailable
+		}
+		return "", sanitize(s.backend.save(s.service, ref, value))
+	default:
+		if s.backend.delete == nil {
+			return "", ErrUnavailable
+		}
+		return "", sanitize(s.backend.delete(s.service, ref))
 	}
 }
 
 // Load returns a validated record. An unavailable, busy or invalid store entry
 // must not be treated as absence or cause selection of a different credential.
 func (s *Store) Load(ctx context.Context, ref string) (Record, error) {
-	encoded, err := s.run(ctx, ref, false, func() (string, error) {
-		if s.backend.load == nil {
-			return "", ErrUnavailable
-		}
-		value, err := s.backend.load(s.service, ref)
-		if err != nil {
-			return "", sanitize(err)
-		}
-		return value, nil
+	encoded, err := s.run(ctx, ref, false, func(ctx context.Context) (string, error) {
+		return s.dispatch(ctx, agentcredential.OpLoad, ref, "")
 	})
 	if err != nil {
 		return Record{}, err
@@ -79,11 +145,8 @@ func (s *Store) Save(ctx context.Context, ref string, record Record) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.run(ctx, ref, true, func() (string, error) {
-		if s.backend.save == nil {
-			return "", ErrUnavailable
-		}
-		return "", sanitize(s.backend.save(s.service, ref, encoded))
+	_, err = s.run(ctx, ref, true, func(ctx context.Context) (string, error) {
+		return s.dispatch(ctx, agentcredential.OpSave, ref, encoded)
 	})
 	return err
 }
@@ -91,11 +154,8 @@ func (s *Store) Save(ctx context.Context, ref string, record Record) error {
 // Delete removes exactly the referenced record; a missing record is ErrNotFound.
 // A dispatched deletion may still finish after a caller receives ErrUncertain.
 func (s *Store) Delete(ctx context.Context, ref string) error {
-	_, err := s.run(ctx, ref, true, func() (string, error) {
-		if s.backend.delete == nil {
-			return "", ErrUnavailable
-		}
-		return "", sanitize(s.backend.delete(s.service, ref))
+	_, err := s.run(ctx, ref, true, func(ctx context.Context) (string, error) {
+		return s.dispatch(ctx, agentcredential.OpDelete, ref, "")
 	})
 	return err
 }
@@ -105,7 +165,7 @@ type result struct {
 	err   error
 }
 
-func (s *Store) run(ctx context.Context, ref string, mutation bool, call func() (string, error)) (string, error) {
+func (s *Store) run(ctx context.Context, ref string, mutation bool, call func(context.Context) (string, error)) (string, error) {
 	if !keyringReference(ref) {
 		return "", ErrInvalidReference
 	}
@@ -126,7 +186,7 @@ func (s *Store) run(ctx context.Context, ref string, mutation bool, call func() 
 	}
 	done := make(chan result, 1)
 	go func() {
-		value, err := call()
+		value, err := call(ctx)
 		s.busy.Store(false)
 		done <- result{value, err}
 	}()

@@ -298,7 +298,7 @@ func TestNewStoresShareOneGateWithoutOSAccess(t *testing.T) {
 }
 
 func TestDispatchCanceledHelperStartDoesNotFallBack(t *testing.T) {
-	for _, op := range []string{opLoad, opSave, opDelete} {
+	for _, op := range []string{OpLoad, OpSave, OpDelete} {
 		t.Run(op, func(t *testing.T) {
 			calls := 0
 			s := testStore(backend{
