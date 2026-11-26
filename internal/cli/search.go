@@ -30,7 +30,7 @@ func newSearchCommand(opt *options) *cobra.Command {
 			if (len(args) == 0 || strings.TrimSpace(args[0]) == "") &&
 				strings.TrimSpace(cites) == "" &&
 				strings.TrimSpace(citedBy) == "" && strings.TrimSpace(relatedTo) == "" {
-				return fmt.Errorf("query is required unless a citation snowball DOI is supplied")
+				return &usageError{err: fmt.Errorf("query is required unless a citation snowball DOI is supplied")}
 			}
 			return nil
 		},

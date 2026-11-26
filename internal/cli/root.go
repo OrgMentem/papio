@@ -550,10 +550,10 @@ func newConfigCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if replacing {
-				return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "replaced": "true", "backup_path": backup, "restart_required": true},
+				return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "replaced": true, "backup_path": backup, "restart_required": true},
 					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults%s. "+daemonStopStep, path, mode, backupNotice(path, backup, "; "))
 			}
-			return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "restart_required": true}, "Wrote %s (access_mode=%s). "+daemonStopStep, path, mode)
+			return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "replaced": false, "restart_required": true}, "Wrote %s (access_mode=%s). "+daemonStopStep, path, mode)
 		},
 	}
 	initCommand.Flags().StringVar(&mode, "access-mode", "", "required: conservative, assisted, or delegated")

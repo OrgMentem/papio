@@ -44,15 +44,15 @@ func newAcquireCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fromDigestRequested := cmd.Flags().Changed("from-digest")
 			if fromDigestRequested && cmd.Flags().Changed("batch") {
-				return fmt.Errorf("--from-digest cannot be combined with --batch")
+				return usagef("--from-digest cannot be combined with --batch")
 			}
 			if !fromDigestRequested && cmd.Flags().Changed("keys") {
-				return fmt.Errorf("--keys is supported only with --from-digest")
+				return usagef("--keys is supported only with --from-digest")
 			}
 			autoImportOverride := boolOverride(cmd, "auto-import", autoImport)
 			if cmd.Flags().Changed("batch") {
 				if batchPath == "" {
-					return fmt.Errorf("--batch requires a file path (JSONL, RIS, BibTeX, CSL-JSON, or NBIB) or - for standard input")
+					return usagef("--batch requires a file path (JSONL, RIS, BibTeX, CSL-JSON, or NBIB) or - for standard input")
 				}
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
@@ -61,31 +61,31 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			}
 			if fromDigestRequested {
 				if fromDigest <= 0 {
-					return fmt.Errorf("--from-digest requires a positive watch ID")
+					return usagef("--from-digest requires a positive watch ID")
 				}
 				if fromZotio {
-					return fmt.Errorf("--from-digest cannot be combined with --from-zotio")
+					return usagef("--from-digest cannot be combined with --from-zotio")
 				}
 				if len(args) != 0 {
-					return fmt.Errorf("--from-digest cannot be combined with a positional identifier")
+					return usagef("--from-digest cannot be combined with a positional identifier")
 				}
 				for _, name := range []string{
 					"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year", "request-id", "zotio-item-key",
 				} {
 					if cmd.Flags().Changed(name) {
-						return fmt.Errorf("--from-digest cannot be combined with one-work identity flags")
+						return usagef("--from-digest cannot be combined with one-work identity flags")
 					}
 				}
 				for _, name := range []string{
 					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label", "force", "consumer",
 				} {
 					if cmd.Flags().Changed(name) {
-						return fmt.Errorf("--%s is not supported with --from-digest", name)
+						return usagef("--%s is not supported with --from-digest", name)
 					}
 				}
 				keys := trimNonempty(digestKeys)
 				if cmd.Flags().Changed("keys") && len(keys) == 0 {
-					return fmt.Errorf("--keys requires at least one non-empty digest work key")
+					return usagef("--keys requires at least one non-empty digest work key")
 				}
 				params := struct {
 					ID   int64    `json:"id"`
@@ -105,22 +105,22 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if fromZotio {
 				if len(args) != 0 || doi != "" || pmid != "" || arxivID != "" || isbn != "" || openalex != "" ||
 					title != "" || requestID != "" || zotioKey != "" || len(authors) != 0 || year != 0 {
-					return fmt.Errorf("--from-zotio cannot be combined with one-work identity flags")
+					return usagef("--from-zotio cannot be combined with one-work identity flags")
 				}
 				if wait {
-					return fmt.Errorf("--wait is not supported with --from-zotio; inspect the returned job IDs")
+					return usagef("--wait is not supported with --from-zotio; inspect the returned job IDs")
 				}
 				if autoImportOverride != nil {
-					return fmt.Errorf("--auto-import is not supported with --from-zotio")
+					return usagef("--auto-import is not supported with --from-zotio")
 				}
 				if cmd.Flags().Changed("resolver") {
-					return fmt.Errorf("--resolver is not supported with --from-zotio")
+					return usagef("--resolver is not supported with --from-zotio")
 				}
 				if cmd.Flags().Changed("force") {
-					return fmt.Errorf("--force is not supported with --from-zotio")
+					return usagef("--force is not supported with --from-zotio")
 				}
 				if cmd.Flags().Changed("consumer") {
-					return fmt.Errorf("--consumer is not supported with --from-zotio")
+					return usagef("--consumer is not supported with --from-zotio")
 				}
 				options := zotio.QueueOptions{
 					Collection:         strings.TrimSpace(collection),
@@ -242,7 +242,7 @@ func normalizeIdentifiers(args []string, doi, pmid, arxivID, isbn, openalex stri
 		}
 	}
 	if len(args) != 0 && explicit {
-		return nil, fmt.Errorf("use either the positional identifier or identifier flags, not both")
+		return nil, usagef("use either the positional identifier or identifier flags, not both")
 	}
 	ids := &protocol.Identifiers{}
 	var err error
@@ -405,13 +405,13 @@ func boolOverride(cmd *cobra.Command, name string, value bool) *bool {
 
 func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool) error {
 	if len(args) != 0 {
-		return fmt.Errorf("--batch cannot be combined with a positional identifier")
+		return usagef("--batch cannot be combined with a positional identifier")
 	}
 	if fromZotio {
-		return fmt.Errorf("--batch cannot be combined with --from-zotio")
+		return usagef("--batch cannot be combined with --from-zotio")
 	}
 	if wait {
-		return fmt.Errorf("--wait is not supported with --batch")
+		return usagef("--wait is not supported with --batch")
 	}
 	// --request-id names ONE work's convergence key, and a batch has one key per
 	// work, derived from the batch identity and that work's identity
@@ -428,7 +428,7 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 	// different keys. Both qualifications are in the message, because a message
 	// that overstates its mechanism is the defect this refusal exists to fix.
 	if cmd.Flags().Changed("request-id") {
-		return fmt.Errorf("--request-id names a single work's convergence key and cannot key a batch; " +
+		return usagef("--request-id names a single work's convergence key and cannot key a batch; " +
 			"batch works get deterministic per-work request ids derived from the batch and the work, " +
 			"so resubmitting the same works on the same day reproduces them — see `papio batch report <batch-id>`")
 	}
@@ -436,11 +436,11 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year", "desired-version",
 	} {
 		if cmd.Flags().Changed(name) {
-			return fmt.Errorf("--batch cannot be combined with --%s; set %q on each work in the JSONL instead", name, batchWorkField(name))
+			return usagef("--batch cannot be combined with --%s; set %q on each work in the JSONL instead", name, batchWorkField(name))
 		}
 	}
 	if cmd.Flags().Changed("limit") {
-		return fmt.Errorf("--limit caps --from-zotio queueing and has no meaning with --batch")
+		return usagef("--limit caps --from-zotio queueing and has no meaning with --batch")
 	}
 	// These are per-request policy, and a batch work carries only identity and
 	// metadata: the strict JSONL decoder (batch.ParseWork) rejects any other
@@ -451,7 +451,7 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 		"zotio-item-key", "access-mode", "max-cost", "source", "deny-source", "force",
 	} {
 		if cmd.Flags().Changed(name) {
-			return fmt.Errorf("--batch cannot be combined with --%s, and batch JSONL has no field for it; "+
+			return usagef("--batch cannot be combined with --%s, and batch JSONL has no field for it; "+
 				"submit each work that needs it on its own with `papio acquire <identifier> --%s`", name, name)
 		}
 	}

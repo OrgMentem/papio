@@ -1660,7 +1660,7 @@ papio status [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--follow` | `bool` | `false` | refresh every 2 seconds |
+| `--follow` | `bool` | `false` | refresh every 2 seconds until interrupted; with --json, emit one compact JSON snapshot per line (NDJSON) and stop without a final aggregate |
 
 ## `papio version`
 

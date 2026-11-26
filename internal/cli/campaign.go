@@ -185,7 +185,7 @@ func newCampaignCommand(opt *options) *cobra.Command {
 		if err := writeCampaign(cfg.DataDir, &manifest); err != nil {
 			return err
 		}
-		return opt.printJSON(preview)
+		return opt.printResult(preview, "Staged campaign %s: %d source record(s), %d work(s), %d chunk(s). Run it with `papio campaign run %s`.", manifest.ID, len(manifest.Records), len(manifest.Works), len(manifest.Chunks), manifest.ID)
 	}}
 	create.Flags().StringVar(&collection, "collection", "", "destination collection; automatic Zotero import stays off")
 	create.Flags().StringVar(&resolver, "resolver", "", "institution resolver profile")
@@ -198,7 +198,26 @@ func newCampaignCommand(opt *options) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return printPage(opt, "campaigns", rows, false)
+		if opt.jsonOutput {
+			return printPage(opt, "campaigns", rows, false)
+		}
+		if len(rows) == 0 {
+			_, err := fmt.Fprintln(opt.out, "No campaigns.")
+			return err
+		}
+		for _, row := range rows {
+			state := ""
+			if row.Paused {
+				state = " | paused"
+			}
+			if row.Error != "" {
+				state += " | error: " + store.StripTerminalControls(row.Error)
+			}
+			if _, err := fmt.Fprintf(opt.out, "%s | %s | %d works | %d/%d chunks acknowledged%s\n", row.ID, row.CreatedAt, row.Works, row.ChunksAcknowledged, row.Chunks, state); err != nil {
+				return err
+			}
+		}
+		return nil
 	}}
 	command.AddCommand(create, list)
 	for _, verb := range []string{"preview", "run", "pause", "resume", "report"} {
@@ -237,19 +256,19 @@ func newCampaignCommand(opt *options) *cobra.Command {
 				if err := writeCampaign(cfg.DataDir, manifest); err != nil {
 					return err
 				}
-				return opt.printJSON(manifest)
+				return opt.printResult(manifest, "Campaign %s %s.", manifest.ID, map[bool]string{true: "paused", false: "resumed"}[manifest.Paused])
 			case "preview":
 				preview, err := campaignPreview(cmd.Context(), opt, cfg, manifest)
 				if err != nil {
 					return err
 				}
-				return opt.printJSON(preview)
+				return opt.printResult(preview, "Campaign %s: %d work(s) in %d chunk(s) classified; nothing submitted. Use --json for per-work detail.", manifest.ID, len(manifest.Works), len(manifest.Chunks))
 			case "report":
 				report, err := campaignReport(cmd.Context(), opt, cfg, manifest)
 				if err != nil {
 					return err
 				}
-				return opt.printJSON(report)
+				return opt.printResult(report, "Campaign %s report covers %d source record(s). Use --json for per-record outcomes.", manifest.ID, len(manifest.Records))
 			case "run":
 				if manifest.Paused {
 					return errors.New("campaign is paused; resume it before running")
@@ -280,21 +299,31 @@ func newCampaignCommand(opt *options) *cobra.Command {
 					if submitErr == nil {
 						chunk.State = "acknowledged"
 					}
-					if err := writeCampaign(cfg.DataDir, manifest); err != nil {
-						return err
-					}
+					persistErr := writeCampaign(cfg.DataDir, manifest)
 					result := struct {
 						CampaignID string              `json:"campaign_id"`
 						Chunk      int                 `json:"chunk"`
 						Window     int                 `json:"active_window"`
 						Result     *batch.SubmitOutput `json:"result"`
 					}{manifest.ID, i, campaignWindow, output}
-					if err := opt.printJSON(result); err != nil {
-						return err
+					// Jobs may already be submitted: always report them, even when the
+					// manifest write failed, so the operator can reconcile.
+					var prose string
+					switch {
+					case output != nil:
+						prose = fmt.Sprintf("Campaign %s chunk %d: %s", manifest.ID, i, searchAcquireProse(chunk.End-chunk.Start, output))
+					default:
+						prose = fmt.Sprintf("Campaign %s chunk %d: the daemon returned no submission receipt.", manifest.ID, i)
 					}
-					return submitErr
+					if persistErr != nil {
+						persistErr = fmt.Errorf("campaign %s chunk %d: jobs may already be accepted, but the manifest could not be saved and the chunk stays persisted as inflight; run `papio campaign report %s` to reconcile before retrying: %w", manifest.ID, i, manifest.ID, persistErr)
+					}
+					if err := opt.printResult(result, "%s", prose); err != nil {
+						return errors.Join(err, persistErr, submitErr)
+					}
+					return errors.Join(persistErr, submitErr)
 				}
-				return opt.printJSON(map[string]any{"campaign_id": manifest.ID, "complete": true, "detail": "all selected chunks acknowledged; use report for acquisition outcomes"})
+				return opt.printResult(map[string]any{"campaign_id": manifest.ID, "complete": true, "detail": "all selected chunks acknowledged; use report for acquisition outcomes"}, "Campaign %s complete: all selected chunks acknowledged; use report for acquisition outcomes.", manifest.ID)
 			}
 			return nil
 		}}

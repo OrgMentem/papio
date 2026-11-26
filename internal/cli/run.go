@@ -30,6 +30,11 @@ type usageError struct{ err error }
 func (e *usageError) Error() string { return e.err.Error() }
 func (e *usageError) Unwrap() error { return e.err }
 
+// usagef returns a usageError (exit 2, --json code invalid_argument).
+func usagef(format string, args ...any) error {
+	return &usageError{err: fmt.Errorf(format, args...)}
+}
+
 // cobraUsagePrefixes name the argument-validation errors cobra returns as bare
 // strings (cobra has no typed error for them).
 var cobraUsagePrefixes = []string{

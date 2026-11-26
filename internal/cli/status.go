@@ -50,6 +50,9 @@ type statusJob struct {
 	QuietReason  string `json:"quiet_reason,omitempty"`
 }
 
+// statusFollowInterval is the --follow refresh period; tests shorten it.
+var statusFollowInterval = 2 * time.Second
+
 func newStatusCommand(opt *options) *cobra.Command {
 	var follow bool
 	command := &cobra.Command{
@@ -78,7 +81,7 @@ func newStatusCommand(opt *options) *cobra.Command {
 			if err := refresh(); err != nil {
 				return err
 			}
-			ticker := time.NewTicker(2 * time.Second)
+			ticker := time.NewTicker(statusFollowInterval)
 			defer ticker.Stop()
 			for {
 				select {
@@ -92,7 +95,7 @@ func newStatusCommand(opt *options) *cobra.Command {
 			}
 		},
 	}
-	command.Flags().BoolVar(&follow, "follow", false, "refresh every 2 seconds")
+	command.Flags().BoolVar(&follow, "follow", false, "refresh every 2 seconds until interrupted; with --json, emit one compact JSON snapshot per line (NDJSON) and stop without a final aggregate")
 	return command
 }
 

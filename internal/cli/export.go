@@ -149,7 +149,7 @@ func newExportCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := strconv.ParseInt(args[0], 10, 64)
 			if err != nil {
-				return fmt.Errorf("invalid watch id %q", args[0])
+				return usagef("invalid watch id %q", args[0])
 			}
 			var digest api.WatchDigestResult
 			if err := opt.call(cmd.Context(), "watch.digest", map[string]any{"id": id, "limit": watch.DigestLimitMax}, &digest); err != nil {

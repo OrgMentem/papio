@@ -108,7 +108,13 @@ func (d *flowDaemon) count(method string) int {
 	return n
 }
 
+// runFlow runs with --json; runFlowText runs the human-readable form.
 func runFlow(t *testing.T, cfg config.Config, d *flowDaemon, args ...string) (string, error) {
+	t.Helper()
+	return runFlowText(t, cfg, d, append([]string{"--json"}, args...)...)
+}
+
+func runFlowText(t *testing.T, cfg config.Config, d *flowDaemon, args ...string) (string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, cfg, d.call)
