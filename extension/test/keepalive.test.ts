@@ -394,6 +394,22 @@ function makeHarness(
   };
 }
 
+test("a rejected ownership ledger write removes the freshly created pinned tab", async () => {
+  const h = makeHarness(4, undefined, { knownOrigins: ["https://resolver.example.edu"] });
+  h.configuredReady.value = true;
+  (h.manager as unknown as { options: { ownership: unknown } }).options.ownership = {
+    recover: async () => undefined,
+    record: async () => { throw new Error("ledger unavailable"); },
+    update: async () => {},
+    forget: async () => {},
+  };
+  await h.manager.init();
+  await flushMicrotasks();
+
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.removed).toEqual([1]);
+});
+
 test("creates one pinned resolver tab, reloads it, and closes it when jobs finish", async () => {
   const h = makeHarness();
   await h.manager.init();

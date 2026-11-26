@@ -418,6 +418,23 @@ test("unexpected capture failure remains diagnosable and does not block the next
     fixedNow("2026-09-20T10:00:00Z"))).toBe(true);
 });
 
+test("a failed reservation release is retried so a transient storage error does not burn quota", async () => {
+  const host = "example.org";
+  const fake = fakeChrome(pageFor(host));
+  fake.api.sendPageCapture = async () => false;
+  const realSet = fake.api.storage.local.set;
+  let sets = 0;
+  fake.api.storage.local.set = async (items) => {
+    sets += 1;
+    if (sets === 2) throw new Error("transient"); // first release attempt
+    return realSet(items);
+  };
+  expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+    fixedNow("2026-09-20T10:00:00Z"))).toBe(false);
+  expect(sets).toBe(3);
+  expect(fake.stored[RATE_KEY]).toEqual({ total: [], byShape: {}, digests: {} });
+});
+
 for (const reason of ["storage_unavailable", "injection_failed", "origin_changed", "invalid_page", "sanitizer_refused", "encoding_refused", "transport_unavailable"] as const) {
   test(`capture diagnostic reports ${reason} without leaking page or exception content`, async () => {
     const host = reason === "sanitizer_refused" ? "abcdefghijklmnopqrstuvwxyzabcdef.com" : "example.org";

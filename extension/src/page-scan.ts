@@ -60,10 +60,11 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   // Decision 3's "extension-injected nodes" exclusion. scanDocument has no
   // chrome.* dependency (file header) and so cannot compare against papio's
   // own extension id here; every chrome-extension:// or moz-extension://
-  // reference is therefore treated as foreign, papio's own included. That is
-  // safe today — papio injects no such URLs into any page — but is a known
-  // residual gap, not full "different id" generality, should that change.
+  // reference is therefore treated as foreign, papio's own included. Papio's
+  // own injected page UI (toast and action-ack hosts) carries a reserved
+  // `papio-extension-` id and is excluded by that prefix.
   const EXTENSION_URL_RE = /^(?:chrome|moz)-extension:\/\//i;
+  const PAPIO_INJECTED_ID_RE = /^papio-extension-/;
   // A DOI's own syntax (10.<registrant>/<suffix>) is self-labeling; arXiv and
   // PMID values are short and ambiguous, so only an explicit label counts
   // (Decision 3: an unlabeled bare integer is never a PMID).
@@ -252,9 +253,10 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   // which never surfaces a shadow root's content (open or closed) — an
   // element with an attached shadow root is walked for its own light-DOM
   // children only, so nothing another extension (or the page itself) mounts
-  // inside a shadow root is ever scanned. papio attaches no shadow roots of
-  // its own into pages today, so this exclusion costs no false negatives yet.
+  // inside a shadow root is ever scanned. papio's own toast and action-ack
+  // hosts attach shadow roots but are also skipped by their reserved id.
   function isExtensionInjected(el: Element): boolean {
+    if (PAPIO_INJECTED_ID_RE.test(el.id)) return true;
     const src = el.getAttribute("src");
     const href = el.getAttribute("href");
     return EXTENSION_URL_RE.test(src ?? "") || EXTENSION_URL_RE.test(href ?? "");

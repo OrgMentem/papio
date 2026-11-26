@@ -343,6 +343,18 @@ test("an extension-URL marker on one element does not suppress an unrelated sibl
   expect(identifiers(result.papers)).toEqual([{ kind: "doi", value: "10.1234/visible.sibling" }]);
 });
 
+test("papio's own injected page UI host is skipped along with its light-DOM contents", () => {
+  const result = scanDocument(
+    doc(`<div id="papio-extension-loss-toast-v1"><p>10.1234/papio.toast</p></div><p>10.1234/visible.sibling</p>`),
+  );
+  expect(identifiers(result.papers)).toEqual([{ kind: "doi", value: "10.1234/visible.sibling" }]);
+});
+
+test("accepted limit (ADR-0019 Decision 3): an unmarked light-DOM node is scanned even if another extension injected it", () => {
+  const result = scanDocument(doc(`<div class="other-extension-widget"><p>10.1234/unmarked.injected</p></div>`));
+  expect(identifiers(result.papers)).toEqual([{ kind: "doi", value: "10.1234/unmarked.injected" }]);
+});
+
 test("text placed only inside a Shadow DOM subtree is never scanned (childNodes never crosses a shadow boundary)", () => {
   const document = doc(`<div id="host"></div>`);
   const host = document.getElementById("host") as unknown as {

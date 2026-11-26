@@ -167,7 +167,13 @@ Other bounds:
   article metadata) is **excluded** from the bulk list — the popup's existing
   Acquire/Send-PDF action already owns acquiring the page being read (r3 §C,
   r4 §C).
-- `script`, `style`, hidden, and extension-injected nodes are ignored.
+- `script`, `style`, hidden, and extension-injected nodes are ignored. The
+  detector cannot prove who injected a node. It skips elements whose own
+  `src`/`href` is a `chrome-extension://` or `moz-extension://` URL and
+  elements with *papio*'s reserved `papio-extension-` id prefix; both are
+  heuristics. Unmarked light DOM from another extension can still supply
+  citations, and the citation walk does not enter shadow roots. This is an
+  accepted limit.
 - The **daemon's existing identifier normalizers are the canonical
   validators**. The browser performs only local trailing-punctuation cleanup
   before display; it does not implement a second canonicalizer (r3 §C, r4

@@ -2532,13 +2532,21 @@ export class KeepaliveManager {
         }
         return;
       }
-      if (this.options.ownership !== undefined &&
-          !await this.options.ownership.record(tab.id, resolver.origin, Date.now())) {
-        await this.api.tabs.remove(tab.id).catch(() => {});
-        return;
+      if (this.options.ownership !== undefined) {
+        let recorded = false;
+        try {
+          recorded = await this.options.ownership.record(tab.id, resolver.origin, Date.now());
+        } catch {
+          // A rejected ledger write leaves the tab unrecorded; fall through
+          // to the same removal as a refused record so no pinned tab leaks.
+        }
+        if (!recorded) {
+          await this.api.tabs.remove(tab.id).catch(() => {});
+          return;
+        }
       }
       if (intent === "automatic" && !this.shouldMaintainSession()) {
-        await this.options.ownership?.forget(tab.id);
+        await this.options.ownership?.forget(tab.id).catch(() => {});
         await this.api.tabs.remove(tab.id).catch(() => {});
         return;
       }

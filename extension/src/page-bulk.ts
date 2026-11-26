@@ -1,9 +1,10 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // ADR-0019 Decision 4: the on-page bulk selection workspace. One instance of
 // this module runs per `?scan=<id>` tab (Decision 4: one workspace per active
-// scan, never a singleton like the inbox). It never touches chrome.storage or
-// the daemon directly — every read and mutation is a finite, correlated
-// runtime message to the background broker (mirrors inbox.ts's own
+// scan, never a singleton like the inbox). It never writes chrome.storage or
+// talks to the daemon directly — it only reads the shared state key to watch
+// connection recovery. Every read and mutation of scan data is a finite,
+// correlated runtime message to the background broker (mirrors inbox.ts's own
 // discipline), and every dynamic label is written through textContent/
 // createTextNode, never innerHTML — labels in this page are untrusted page
 // text lifted off a site papio does not control.

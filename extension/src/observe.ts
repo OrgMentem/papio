@@ -42,6 +42,8 @@ const MULTI_LABEL_PUBLIC_SUFFIXES: Record<string, true> = {
 const DAY_MS = 24 * HOUR_MS;
 const MAX_PER_SHAPE = 1;
 const MAX_PER_DAY = 20;
+/** Bounded retries for releasing a failed-send reservation. */
+const RELEASE_ATTEMPTS = 3;
 // Bound retained digests per shape so a host that never stabilizes cannot
 // grow storage without limit; 3 is enough to catch A/B page variants without
 // needing to remember every sanitized snapshot ever seen for a shape.
@@ -305,15 +307,24 @@ export function observeUnknown(
       console.warn("papio: observed page capture was not sent; skipping", error);
     }
     refuse("transport_unavailable");
-    // The bridge reported no delivery, so release the reservation: a transient
-    // transport failure must not burn the day's and the shape's budget or mark
-    // the digest seen. Calls are serialized, so nothing else wrote the rate
-    // state since the reservation. A worker that dies mid-send never reaches
-    // this line and keeps the reservation, which is the fail-closed direction.
-    try {
-      await api.storage.local.set({ [RATE_STORAGE_KEY]: beforeReservation });
-    } catch (error) {
-      console.warn("papio: observed capture reservation could not be released", error);
+    // The bridge reported no delivery, so try to release the reservation on a
+    // best-effort basis. Three attempts recover a brief storage failure and
+    // keep a transient transport failure from burning the day's and the
+    // shape's budget or marking the digest seen. Calls are serialized, so
+    // nothing else wrote the rate state since the reservation. If every
+    // attempt fails, or a worker dies mid-send, the reservation stays: it
+    // keeps counting against quota and can suppress the same digest until it
+    // expires. That is the fail-closed direction. The reservation is written
+    // before the send so a restart cannot leave a sent capture uncounted.
+    for (let attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt += 1) {
+      try {
+        await api.storage.local.set({ [RATE_STORAGE_KEY]: beforeReservation });
+        return;
+      } catch (error) {
+        if (attempt === RELEASE_ATTEMPTS) {
+          console.warn("papio: observed capture reservation could not be released", error);
+        }
+      }
     }
   });
   const completed = run.catch(() => { refuse("capture_failed"); });
