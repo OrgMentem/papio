@@ -1779,3 +1779,107 @@ func TestSnapshotOmitsLinkForDotSegmentDOI(t *testing.T) {
 		t.Fatalf("ops = %+v, want no open op without a link", items[0].Ops)
 	}
 }
+
+func TestWriteCacheRefusesCacheReaderRejects(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	sentinel := New(Options{Policy: config.Source{Enabled: true}, DataDir: t.TempDir(), Now: func() time.Time { return now }})
+	good := Finding{DOI: "10.1000/a", Nature: NatureRetraction, NoticedAt: now}
+	sentinel.mu.Lock()
+	defer sentinel.mu.Unlock()
+	if err := sentinel.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: map[string]Finding{findingKey(good): good}}); err != nil {
+		t.Fatal(err)
+	}
+	huge := good
+	huge.Title = strings.Repeat("x", int(maxCacheBody))
+	if err := sentinel.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: map[string]Finding{findingKey(huge): huge}}); err == nil {
+		t.Fatal("oversized cache written")
+	}
+	many := make(map[string]Finding, maxNotices+1)
+	for i := range maxNotices + 1 {
+		f := Finding{DOI: fmt.Sprintf("10.1000/%d", i), Nature: good.Nature, NoticedAt: now}
+		many[findingKey(f)] = f
+	}
+	if err := sentinel.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: many}); err == nil {
+		t.Fatal("over-count cache written")
+	}
+	if cached, ok, err := sentinel.readCacheDetailed(); err != nil || !ok || len(cached.Notices) != 1 {
+		t.Fatalf("prior cache lost: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestIncompleteSweepWithFullCachePublishesAndNotifiesNewNotice(t *testing.T) {
+	ctx := context.Background()
+	client := &zotio.Client{Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		start, err := strconv.Atoi(args[len(args)-1])
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]map[string]any, 0, zotioPageSize)
+		for i := range zotioPageSize {
+			rows = append(rows, map[string]any{"data": map[string]any{"DOI": fmt.Sprintf("10.1234/z-%04d", start+i)}})
+		}
+		return json.Marshal(map[string]any{"results": rows})
+	}}
+	catalog := NewLibraryCatalog(nil, client)
+	catalog.maxPages = 2
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "T", noticeDOI: "10.2000/notice", workDOI: "10.1234/z-0001", nature: "Retraction",
+		})
+	}))
+	defer server.Close()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	notifier := &recordingNotifier{}
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
+		Scope: config.RetractionScopeLibrary, LibraryDOIs: catalog, Now: func() time.Time { return now },
+	})
+	old := make(map[string]Finding, maxNotices)
+	notified := make(map[string]bool, maxNotices)
+	for i := range maxNotices {
+		f := Finding{DOI: fmt.Sprintf("10.1000/old-%04d", i), Nature: NatureRetraction, NoticedAt: now.Add(-48 * time.Hour), Title: "old"}
+		old[findingKey(f)] = f
+		notified[findingKey(f)] = true
+	}
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{Version: cacheVersion, CheckedAt: now.Add(-48 * time.Hour), ScanID: "scan:1", Notices: old, Notified: notified})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	sentinel.mu.Lock()
+	cached, ok := sentinel.readCache()
+	sentinel.mu.Unlock()
+	if !ok || !cached.Truncated || len(cached.Notices) != maxNotices {
+		t.Fatalf("cache ok=%v truncated=%v notices=%d, want truncated cache of %d", ok, cached.Truncated, len(cached.Notices), maxNotices)
+	}
+	if _, found := cached.Notices[findingKey(Finding{DOI: "10.1234/z-0001", Nature: NatureRetraction, NoticeDOI: "10.2000/notice"})]; !found {
+		t.Fatal("new notice not published")
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("events = %d, want one for the new notice", len(notifier.events))
+	}
+}
+
+func TestFitNoticesTrimsTitlesBeforeDropping(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	notices := make(map[string]Finding)
+	var current []Finding
+	for i := range 40 {
+		f := Finding{DOI: fmt.Sprintf("10.1000/t-%04d", i), Nature: NatureRetraction, NoticedAt: now, Title: strings.Repeat("é", 40000)}
+		notices[findingKey(f)] = f
+		current = append(current, f)
+	}
+	out, truncated := fitNotices(notices, current)
+	if truncated || len(out) != 40 {
+		t.Fatalf("titles trimming should keep all notices: truncated=%v len=%d", truncated, len(out))
+	}
+	data, _ := json.Marshal(cache{Version: cacheVersion, Notices: out})
+	if int64(len(data)) > maxCacheBody {
+		t.Fatalf("fitted cache is %d bytes", len(data))
+	}
+}

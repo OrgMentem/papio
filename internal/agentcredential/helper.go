@@ -33,7 +33,9 @@ var helperBinary atomic.Pointer[string]
 // The OS credential library has no cancellation, so an in-process call that
 // never returns holds this package's gate for the life of the process. A
 // helper process can be killed at the deadline, which frees the gate and the
-// Store keeps working once the OS store recovers. Call it once at process
+// Store keeps working once the OS store recovers. Isolation is best effort: if
+// the helper cannot start (for example the binary was replaced on disk), no OS
+// call was dispatched and the call runs in process instead. Call it once at process
 // start, from the executable that dispatches HelperArgument to RunHelper.
 func UseHelperProcess(binary string) { helperBinary.Store(&binary) }
 

@@ -618,10 +618,19 @@ func saveHoldingsBaseline(dataDir, name string, count int, observation CollapseO
 		_ = tmp.Close()
 		return
 	}
+	// Flush before rename and sync the directory after, so power loss cannot
+	// leave an empty or missing baseline that disarms the collapse guard.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return
+	}
 	if err := tmp.Close(); err != nil {
 		return
 	}
-	_ = os.Rename(tmpName, holdingsBaselinePath(dataDir, name))
+	if err := os.Rename(tmpName, holdingsBaselinePath(dataDir, name)); err != nil {
+		return
+	}
+	_ = config.SyncDir(dataDir)
 }
 
 // entriesFromRecords indexes each record's DOI, arXiv, and PMID identifiers

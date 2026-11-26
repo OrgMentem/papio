@@ -403,3 +403,40 @@ func TestConfigSnapshotResolvesParentAliases(t *testing.T) {
 		t.Fatalf("alias snapshot disagrees: %v", err)
 	}
 }
+
+func TestFoldConfigPathCaseAliases(t *testing.T) {
+	if foldConfigPath(`C:\Cfg\CONFIG.TOML`) != foldConfigPath(`c:\cfg\config.toml`) {
+		t.Fatal("ASCII case aliases differ")
+	}
+	// ToLower expands U+0130 into two runes; a fold must keep one rune and
+	// must not merge it with plain "i".
+	if got := foldConfigPath("İ.toml"); len([]rune(got)) != len([]rune("İ.toml")) {
+		t.Fatalf("fold changed rune count: %q", got)
+	}
+	if foldConfigPath("İ.toml") == foldConfigPath("i.toml") {
+		t.Fatal("U+0130 merged with i")
+	}
+	if foldConfigPath("ǅ") != foldConfigPath("ǆ") {
+		t.Fatal("simple-fold orbit not canonical")
+	}
+}
+
+func TestSaveIfUnchangedIgnoresPathSpellingWhenTargetsAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := credentialConfig()
+	if err := Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := ReadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Whatever spelling the snapshot carries, an aliasing target must compare
+	// on content alone. On case-sensitive platforms the spelling is identical.
+	snapshot.path = normalizeConfigTarget(snapshot.path)
+	if err := SaveIfUnchanged(cfg, path, snapshot); err != nil && !errors.Is(err, ErrConfigChanged) {
+		t.Fatal(err)
+	} else if err != nil && normalizeConfigTarget(path) == normalizeConfigTarget(snapshot.path) {
+		t.Fatalf("unchanged save rejected for aliasing path: %v", err)
+	}
+}

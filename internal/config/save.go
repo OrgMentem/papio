@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"unicode"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -175,7 +177,7 @@ func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func(
 	if err != nil {
 		return "", err
 	}
-	if expected != nil && (expected.path == "" || expected.path != path) {
+	if expected != nil && (expected.path == "" || normalizeConfigTarget(expected.path) != normalizeConfigTarget(path)) {
 		return "", ErrConfigChanged
 	}
 	dir := filepath.Dir(path)
@@ -192,7 +194,7 @@ func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func(
 			return "", err
 		}
 	}
-	lock, err := lockConfig(filepath.Join(dir, "."+filepath.Base(path)+".lock"))
+	lock, err := lockConfig(filepath.Join(dir, "."+normalizeConfigTarget(filepath.Base(path))+".lock"))
 	if err != nil {
 		return "", err
 	}
@@ -201,7 +203,7 @@ func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func(
 	if err != nil {
 		return "", err
 	}
-	if expected != nil && initial != *expected {
+	if expected != nil && (initial.exists != expected.exists || initial.digest != expected.digest) {
 		return "", ErrConfigChanged
 	}
 	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
@@ -275,6 +277,21 @@ func isDefaultConfigDir(dir string) bool {
 	return os.SameFile(want, got)
 }
 
+// foldConfigPath maps every case alias of a path onto one canonical spelling by
+// replacing each rune with the smallest member of its Unicode simple-fold
+// orbit. Unlike strings.ToLower it never expands a rune ('İ' stays one rune).
+func foldConfigPath(path string) string {
+	return strings.Map(func(r rune) rune {
+		least := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < least {
+				least = f
+			}
+		}
+		return least
+	}, path)
+}
+
 // configTarget folds relative paths and symlinked parent-directory aliases onto
 // one lock path, while the final component must itself remain a regular file.
 func configTarget(path string) (string, error) {
@@ -293,7 +310,7 @@ func configTarget(path string) (string, error) {
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
-			return normalizeConfigTarget(filepath.Join(resolved, filepath.Base(absolute))), nil
+			return filepath.Join(resolved, filepath.Base(absolute)), nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", err

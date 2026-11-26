@@ -22,7 +22,10 @@ type FailureError struct {
 }
 
 func (e *FailureError) Error() string {
-	if e == nil || e.Err == nil {
+	if e == nil {
+		return "illiad: classified request failure"
+	}
+	if e.Err == nil {
 		return fmt.Sprintf("illiad: classified request failure (%s)", e.Class)
 	}
 	return e.Err.Error()

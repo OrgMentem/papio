@@ -6,7 +6,6 @@ package config
 import (
 	"errors"
 	"os"
-	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -15,7 +14,7 @@ import (
 // handle, and NTFS journals a rename's metadata.
 func SyncDir(string) error { return nil }
 
-func normalizeConfigTarget(path string) string { return strings.ToLower(path) }
+func normalizeConfigTarget(path string) string { return foldConfigPath(path) }
 
 func lockConfig(path string) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)

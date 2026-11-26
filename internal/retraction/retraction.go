@@ -314,6 +314,21 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		}
 	}
 
+	// Fit the merged set to what the cache reader accepts before publishing.
+	// An oversize cache would otherwise fail the write and drop every new notice.
+	var fitTruncated bool
+	notices, fitTruncated = fitNotices(notices, findings)
+	if fitTruncated {
+		truncated = true
+		kept := findings[:0:0]
+		for _, finding := range findings {
+			if _, exists := notices[findingKey(finding)]; exists {
+				kept = append(kept, finding)
+			}
+		}
+		findings = kept
+	}
+
 	s.mu.Lock()
 	seenNotices := make(map[string]bool, len(previous))
 	newFindings := make([]Finding, 0)
@@ -1292,12 +1307,85 @@ func (s *Sentinel) readCacheDetailed() (cache, bool, error) {
 	return cached, true, nil
 }
 
+// cacheReserve leaves room for the fields fitNotices does not model: scan id,
+// timestamps, fetch error, and collapse state.
+const cacheReserve = 16 << 10
+
+// fitNotices bounds notices to maxNotices entries and to a marshalled size the
+// cache reader accepts, with room for a delivery marker per notice. Current
+// findings are kept ahead of carried-over previous notices. It trims titles
+// before dropping anything and reports whether any notice was omitted.
+func fitNotices(notices map[string]Finding, current []Finding) (map[string]Finding, bool) {
+	protected := make(map[string]bool, len(current))
+	for _, finding := range current {
+		protected[findingKey(finding)] = true
+	}
+	keys := make([]string, 0, len(notices))
+	for key := range notices {
+		keys = append(keys, key)
+	}
+	// Drop order: carried-over first, then by descending DOI/key.
+	sort.Slice(keys, func(i, j int) bool {
+		if protected[keys[i]] != protected[keys[j]] {
+			return !protected[keys[i]]
+		}
+		return keys[i] > keys[j]
+	})
+	out := make(map[string]Finding, len(notices))
+	for key, finding := range notices {
+		out[key] = finding
+	}
+	truncated := false
+	drop := func() {
+		delete(out, keys[0])
+		keys = keys[1:]
+		truncated = true
+	}
+	for len(out) > maxNotices {
+		drop()
+	}
+	size := func() int64 {
+		notified := make(map[string]bool, len(out))
+		for key := range out {
+			notified[key] = true
+		}
+		data, err := json.Marshal(cache{Version: cacheVersion, Notices: out, Notified: notified})
+		if err != nil {
+			return maxCacheBody
+		}
+		return int64(len(data)) + cacheReserve
+	}
+	for _, limit := range []int{256, 0} {
+		if size() <= maxCacheBody {
+			break
+		}
+		for key, finding := range out {
+			if len(finding.Title) > limit {
+				finding.Title = strings.ToValidUTF8(finding.Title[:limit], "")
+				out[key] = finding
+			}
+		}
+	}
+	for len(out) > 0 && size() > maxCacheBody {
+		drop()
+	}
+	return out, truncated
+}
+
 // writeCache requires the caller to hold s.mu so replacement is atomic to
 // SnapshotItems readers.
 func (s *Sentinel) writeCache(cached cache) error {
 	data, err := json.Marshal(cached)
 	if err != nil {
 		return err
+	}
+	// Refuse a cache readCacheDetailed would reject: replacing a good cache
+	// with an unreadable one loses every published notice.
+	if int64(len(data)) > maxCacheBody {
+		return fmt.Errorf("retraction: notice cache would exceed %d bytes", maxCacheBody)
+	}
+	if len(cached.Notices) > maxNotices {
+		return fmt.Errorf("retraction: notice cache would hold %d notices, limit %d", len(cached.Notices), maxNotices)
 	}
 	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
 		return err
